@@ -662,6 +662,42 @@
                 </div>
                 <div class="result" id="sb-result"></div>
             </div>
+
+            <div class="panel" data-form="compose-short">
+                <h2>Compose short <span class="pill">/producer/short</span></h2>
+                <div class="desc">
+                    TTS → captions → 9:16 mp4. Reuses the script above (or paste a different one).
+                    Edge-TTS voice + placeholder gradient background; AI per-scene visuals land in PR-A3+.
+                </div>
+                <div class="form-grid">
+                    <label>Voice
+                        <select id="ps-voice"><option value="en-US-AriaNeural">en-US-AriaNeural · Aria · F</option></select>
+                    </label>
+                    <label>Style
+                        <select id="ps-style">
+                            <option value="violet-pink">violet-pink</option>
+                            <option value="sunset">sunset</option>
+                            <option value="ocean">ocean</option>
+                            <option value="mono">mono</option>
+                            <option value="matcha">matcha</option>
+                        </select>
+                    </label>
+                    <label>Output dir (blank = ~/.creator-forge/output/short-&lt;ts&gt;/)
+                        <input id="ps-output-dir" type="text" placeholder="auto" />
+                    </label>
+                    <label class="checkbox-row">
+                        <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
+                    </label>
+                    <label class="form-row-full">Script
+                        <textarea id="ps-script" rows="6" placeholder="paste narration script (or use the script above)"></textarea>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="ghost" data-action="copy-script-from-storyboard">Copy script from above</button>
+                    <button class="primary" data-run="compose-short">Compose short</button>
+                </div>
+                <div class="result" id="ps-result"></div>
+            </div>
         </section>
     </main>
     <script src="creator-forge.js"></script>

@@ -1,25 +1,29 @@
 """Producer route — port of pages/05_Producer.py.
 
-Two modes (only ``scene_breakdown`` is wired here; others remain shells):
+Two modes:
 
-* ``short`` — TTS + captions + 9:16 mp4 composite (uses ``core.pixelle.composer``).
+* ``short`` — TTS + captions + 9:16 mp4 composite. Wires
+  ``EdgeTTSAdapter.synthesize_with_timing`` → ``group_word_boundaries`` (or
+  the sentence fallback) → ``make_short``.
 * ``long_form`` / ``scene_breakdown`` — turn a long script into N scenes with
   paste-ready prompts for AutoGrok / Veo3 / Whisk. Once scenes are returned,
   the desktop's ``StoryboardBridge`` pipes them into ``ImageService.generateBatch``.
 
-Robust failure mode (matches PR-1/2/3/4/5):
+Robust failure mode (matches PR-1/2/3/4/5/6):
 
 * Missing ``DEEPSEEK_API_KEY`` → 200 with empty ``scenes[]`` + a friendly
   ``"DEEPSEEK_API_KEY not set"`` warning, never 500.
-* LLM raises / parser fails / unexpected payload → 200 with empty
-  ``scenes[]`` + the upstream message in ``warnings[]``.
+* TTS / composer / serializer raises → 200 with the upstream message in
+  ``warnings[]`` and any partial result still attached (e.g. audio survives
+  even if the composer dies).
 * Whitespace-only ``script`` is rejected as 422 via
-  ``field_validator(mode='before')`` strip — same pattern as the other
-  routes in the suite.
+  ``field_validator(mode='before')`` strip.
 """
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter
@@ -27,15 +31,26 @@ from pydantic import BaseModel, Field, field_validator
 
 from research.core import llm
 from research.core.pixelle import (
+    DEFAULT_PROVIDER_NAME,
     SCENE_TEMPLATES,
+    STYLES,
     TEMPLATE_KEYS,
+    Caption,
+    ComposerOptions,
+    EdgeTTSAdapter,
     LongFormScene,
+    captions_to_srt,
     count_words,
     estimate_scene_count,
     estimate_total_duration_s,
+    fallback_captions_from_text,
     generate_scene_breakdown,
+    group_word_boundaries,
+    list_provider_specs,
+    make_short,
     serialize_breakdown_md,
 )
+from research.core.pixelle.voices import VOICES, voice_short_names
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -216,31 +231,277 @@ def thumbnail_prompt(req: ThumbnailPromptRequest) -> dict:
     return {"prompt": "", "negative": "", "notes": "PR-0 shell. core.pixelle.prompting.build_thumbnail_prompt."}
 
 
+# ─── /producer/short — TTS + captions + ffmpeg compose ─────────────────────
+
+# Default placeholder provider name kept here for visibility; today
+# ``compose_short`` always uses the gradient/Ken Burns placeholder background
+# (real per-scene visuals land in PR-A3+ via ``visual_provider``).
+_DEFAULT_VOICE = "en-US-AriaNeural"
+_DEFAULT_STYLE = "violet-pink"
+
+
+def _default_output_dir() -> Path:
+    """Per-call output directory under ``~/.creator-forge/output/``.
+
+    Stable, predictable, and avoids ``/tmp`` (which is wiped between
+    machine restarts in some environments). Caller can override via
+    ``ShortRequest.output_dir``.
+    """
+    base = Path.home() / ".creator-forge" / "output"
+    return base / f"short-{int(time.time() * 1000)}"
+
+
 class ShortRequest(BaseModel):
-    script: str
-    voice: str = "en-US-AvaNeural"
-    visual_provider: str = "placeholder"
-    aspect: str = "9:16"
-    seed_image_path: str | None = None
+    script: str = Field(..., min_length=1, description="Full narration script (single voice).")
+    voice: str = Field(_DEFAULT_VOICE, description="Edge-TTS voice short name (e.g. 'en-US-AriaNeural').")
+    style: str = Field(_DEFAULT_STYLE, description=f"Background gradient style. One of {sorted(STYLES)}.")
+    output_dir: str | None = Field(None, description="Where to write voice.mp3 / captions.srt / short.mp4. Defaults to ~/.creator-forge/output/short-<ts>/.")
+    visual_provider: str = Field(DEFAULT_PROVIDER_NAME, description="Visual provider id (image source). Today only 'placeholder' is wired into the composer; other providers are reported via /producer/providers.")
+    aspect: Literal["9:16"] = Field("9:16", description="Output aspect. Composer currently hard-codes 1080×1920.")
+    write_srt: bool = Field(True, description="Write a sibling .srt next to the mp4.")
+
+    _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
+    _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
+    _strip_style = field_validator("style", mode="before")(classmethod(lambda cls, v: _strip(v)))
 
 
-@router.post("/short")
-def compose_short(req: ShortRequest) -> dict:
-    return {
-        "mp4_path": "",
-        "duration_s": 0.0,
-        "notes": (
-            "PR-0 shell. Wire into research.core.pixelle.composer.make_short with "
-            "EdgeTTSAdapter + visual provider selected by req.visual_provider."
-        ),
-    }
+class ShortResponse(BaseModel):
+    mp4_path: str
+    audio_path: str
+    srt_path: str | None = None
+    duration_s: float = 0.0
+    voice: str
+    engine: str
+    style: str
+    captions_count: int = 0
+    caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+    visual_provider: str
+    output_dir: str
+    warnings: list[str] = []
+    notes: str = ""
+
+
+# Indirection for tests: monkeypatch these names on the module to swap in
+# fakes without touching ``research.core.pixelle``.
+_tts_adapter_factory = EdgeTTSAdapter
+_make_short = make_short
+
+
+@router.post("/short", response_model=ShortResponse)
+def compose_short(req: ShortRequest) -> ShortResponse:
+    """Render ``script`` to a 9:16 mp4 with Edge-TTS voiceover + captions.
+
+    The flow is intentionally three independent stages so that a failure
+    in compositing still surfaces the audio + caption files we already
+    rendered:
+
+    1. **TTS**: ``EdgeTTSAdapter.synthesize_with_timing`` writes ``voice.mp3``
+       and (best-effort) per-word timing.
+    2. **Captions**: word boundaries → ``group_word_boundaries`` if any,
+       else ``fallback_captions_from_text`` over the audio duration.
+       Optionally serialised to ``captions.srt``.
+    3. **Compose**: ``make_short`` blends the audio + placeholder gradient
+       Ken-Burns background + caption layer into ``short.mp4``.
+    """
+    script = req.script.strip()
+    warnings: list[str] = []
+
+    if req.style not in STYLES:
+        warnings.append(
+            f"Unknown style {req.style!r}; falling back to default {_DEFAULT_STYLE!r}. "
+            f"Available: {sorted(STYLES)}."
+        )
+        style = _DEFAULT_STYLE
+    else:
+        style = req.style
+
+    if req.voice not in voice_short_names():
+        # Edge-TTS supports many voices outside our curated picker — pass
+        # the value through but flag it so the UI can show a hint.
+        warnings.append(
+            f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
+        )
+
+    output_dir = Path(req.output_dir).expanduser() if req.output_dir else _default_output_dir()
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warnings.append(f"Could not create output_dir {output_dir}: {exc}")
+        return ShortResponse(
+            mp4_path="",
+            audio_path="",
+            srt_path=None,
+            duration_s=0.0,
+            voice=req.voice,
+            engine=EdgeTTSAdapter.name,
+            style=style,
+            captions_count=0,
+            caption_source="none",
+            visual_provider=req.visual_provider,
+            output_dir=str(output_dir),
+            warnings=warnings,
+        )
+
+    audio_path = output_dir / "voice.mp3"
+    mp4_path = output_dir / "short.mp4"
+    srt_path = output_dir / "captions.srt"
+
+    # ─── Step 1: TTS ─────────────────────────────────────────────────────
+    audio_ok = False
+    duration_s = 0.0
+    captions: list[Caption] = []
+    caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+    engine_name = EdgeTTSAdapter.name
+
+    try:
+        adapter = _tts_adapter_factory()
+        engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+        tts_result = adapter.synthesize_with_timing(
+            script, output_path=audio_path, voice=req.voice
+        )
+        audio_ok = audio_path.exists()
+        duration_s = float(tts_result.duration_seconds or 0.0)
+
+        # Step 2: captions — word boundaries are best, sentence fallback is
+        # always available even when the engine doesn't surface them.
+        if tts_result.word_boundaries:
+            try:
+                captions = group_word_boundaries(tts_result.word_boundaries)
+                caption_source = "word_boundaries"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Caption grouping failed: {type(exc).__name__}: {exc}")
+                captions = []
+
+        if not captions:
+            try:
+                captions = fallback_captions_from_text(
+                    script, audio_duration_s=duration_s or 0.0
+                )
+                caption_source = "sentence_fallback" if captions else "none"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Caption fallback failed: {type(exc).__name__}: {exc}")
+                captions = []
+                caption_source = "none"
+    except Exception as exc:  # noqa: BLE001 — boundary catch.
+        msg = f"TTS failed: {type(exc).__name__}: {exc}"
+        logger.warning(msg)
+        warnings.append(msg)
+
+    # ─── Step 2b: optional SRT ───────────────────────────────────────────
+    written_srt: Path | None = None
+    if req.write_srt and captions:
+        try:
+            srt_path.write_text(captions_to_srt(captions), encoding="utf-8")
+            written_srt = srt_path
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"SRT write failed: {type(exc).__name__}: {exc}")
+
+    # ─── Step 3: compose mp4 ─────────────────────────────────────────────
+    composed_ok = False
+    if audio_ok and duration_s > 0:
+        try:
+            opts = ComposerOptions(style=style)
+            _make_short(
+                audio_path,
+                mp4_path,
+                captions=captions or None,
+                duration_hint=duration_s or None,
+                options=opts,
+            )
+            composed_ok = mp4_path.exists()
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Compose failed: {type(exc).__name__}: {exc}"
+            logger.warning(msg)
+            warnings.append(msg)
+    elif audio_ok and duration_s <= 0:
+        warnings.append(
+            "Audio rendered but duration probe returned 0 — install 'mutagen' for "
+            "MP3 duration probing or pass a non-zero duration upstream."
+        )
+
+    return ShortResponse(
+        mp4_path=str(mp4_path) if composed_ok else "",
+        audio_path=str(audio_path) if audio_ok else "",
+        srt_path=str(written_srt) if written_srt else None,
+        duration_s=round(duration_s, 3),
+        voice=req.voice,
+        engine=engine_name,
+        style=style,
+        captions_count=len(captions),
+        caption_source=caption_source,
+        visual_provider=req.visual_provider,
+        output_dir=str(output_dir),
+        warnings=warnings,
+    )
+
+
+# ─── /producer/voices — curated Edge-TTS voice picker ───────────────────────
+
+
+class VoiceOut(BaseModel):
+    short_name: str
+    label: str
+    locale: str
+    gender: str
 
 
 @router.get("/voices")
 def voices() -> dict:
-    return {"voices": [], "notes": "PR-0 shell. research.core.pixelle.voices.VOICES."}
+    return {
+        "voices": [
+            VoiceOut(short_name=v.short_name, label=v.label, locale=v.locale, gender=v.gender).model_dump()
+            for v in VOICES
+        ],
+        "default": _DEFAULT_VOICE,
+        "ready": True,
+        "notes": "Curated Edge-TTS voice list from research.core.pixelle.voices.",
+    }
+
+
+# ─── /producer/providers — visual provider registry + config status ─────────
+
+
+class ProviderOut(BaseModel):
+    name: str
+    label: str
+    kind: str
+    requires: list[str]
+    notes: str
+    is_configured: bool
+    missing_reason: str | None = None
 
 
 @router.get("/providers")
 def providers() -> dict:
-    return {"providers": [], "notes": "PR-0 shell. research.core.pixelle.visual_providers.list_provider_specs()."}
+    # ``get_provider`` instantiates so we can call ``is_configured()``;
+    # the call is read-only (env vars / config) — no network.
+    from research.core.pixelle.visual_providers import get_provider
+
+    out: list[ProviderOut] = []
+    warnings: list[str] = []
+    for spec in list_provider_specs():
+        try:
+            inst = get_provider(spec.name)
+            ok = bool(inst.is_configured())
+            reason = "" if ok else inst.missing_reason()
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            reason = f"{type(exc).__name__}: {exc}"
+            warnings.append(f"Provider {spec.name} probe failed: {reason}")
+        out.append(
+            ProviderOut(
+                name=spec.name,
+                label=spec.label,
+                kind=spec.kind,
+                requires=list(spec.requires),
+                notes=spec.notes,
+                is_configured=ok,
+                missing_reason=(reason or None),
+            ).model_dump()
+        )
+    return {
+        "providers": out,
+        "default": DEFAULT_PROVIDER_NAME,
+        "warnings": warnings,
+        "notes": "Provider config status comes from research.core.pixelle.visual_providers.",
+    }
