@@ -125,10 +125,12 @@ creator-forge/
 
 ### 1. Prerequisites
 
-- Node.js 18+ (the Electron shell)
-- Python 3.10+ (the sidecar)
-- ffmpeg in `PATH` (for the Producer compose step)
-- Chrome installed (Puppeteer can attach to it for Grok auth)
+- **Node.js 18+** (the Electron shell)
+- **Python 3.10+** (the sidecar)
+- **`ffmpeg` on `PATH`** — required for `/producer/short` (TTS → captions → 9:16 mp4 compose). On macOS: `brew install ffmpeg`. On Debian/Ubuntu: `sudo apt install ffmpeg`. Windows: download from https://ffmpeg.org/download.html and add to PATH. (`research/requirements.txt` also pulls `imageio-ffmpeg` as a fallback for moviepy, but the system binary is the primary path.)
+- **Chrome** installed (Puppeteer attaches to it for Grok auth)
+
+The compose pipeline also depends on `edge-tts`, `mutagen`, `Pillow`, `moviepy>=1.0.3,<2`, and `imageio-ffmpeg` — all already pinned in `research/requirements.txt`, so a single `pip install -r research/requirements.txt` covers everything.
 
 ### 2. Install
 
@@ -171,10 +173,16 @@ To run them separately for debugging:
 # terminal 1
 uvicorn research.api.main:app --host 127.0.0.1 --port 5050 --reload
 
-# terminal 2
+# terminal 2 (Electron alone — npm start, no concurrent sidecar spawn)
 cd desktop
 npm start
 ```
+
+`npm start` runs `electron .` directly. When the Electron shell starts it
+**probes `:5050/healthz` first** and reuses an external sidecar if it finds
+the `creator-forge.research` service tag — so the split-terminal workflow
+above just works without port conflicts. Set
+`CREATOR_FORGE_RESEARCH_PORT=<port>` to use a different port.
 
 The Electron shell still runs on its own if the sidecar fails — only the Research / Studio / Producer tabs go dark.
 
@@ -309,6 +317,66 @@ CI runs lint + API tests + node `--check` on every push (see [`.github/workflows
 
 ---
 
+## 🩺 Troubleshooting
+
+### Status dot stuck on `starting sidecar...`
+The header dot polls `/producer/voices` every 5 s. While the spawned uvicorn
+is booting, the route returns `{ "ready": false }` and the dot stays orange.
+First boot can take 5–15 s on a cold Python interpreter. If it stays orange
+for more than ~30 s, look at the Electron terminal output — the `[research]`
+log lines from `researchSidecar.js` will tell you whether uvicorn is actually
+running, and the `stderr` lines forwarded from the child are usually the
+quickest path to the root cause.
+
+### `Error: research sidecar is not running` / dot is red
+- **Electron terminal shows `port :5050 is taken by a non-creator-forge service`** —
+  another HTTP server is bound to 5050 (Streamlit, another FastAPI app, Jupyter).
+  Kill it, or set `CREATOR_FORGE_RESEARCH_PORT=5051 npm run dev`.
+- **Electron just exited / the sidecar crashed** — the spawned uvicorn
+  printed a Python traceback to stderr. Common causes:
+  - `ModuleNotFoundError: No module named 'edge_tts'` / `'moviepy'` / `'mutagen'` /
+    `'Pillow'` / `'imageio_ffmpeg'`. Run `pip install -r research/requirements.txt`
+    inside the same Python you launched Electron with. Set
+    `CREATOR_FORGE_PYTHON=/path/to/.venv/bin/python` if the auto-detected
+    `python3` is not your venv interpreter.
+- **You started uvicorn manually before launching Electron** — fine since
+  PR-10. Electron's `researchSidecar.start` probes `:5050/healthz` first and
+  reuses your external sidecar if it returns the `creator-forge.research`
+  service tag. (Pre-PR-10 builds would race-fail in this case.)
+
+### `/producer/short` produces a video but no per-word captions
+Check the response: `caption_source: "sentence_fallback"` is not a bug — it
+just means edge-tts returned an empty `word_boundaries` list this run (a
+known intermittent edge-tts behaviour). The route falls back to splitting on
+sentences, proportional to the audio duration. Per-word timing (`caption_source: "word_boundaries"`)
+will come back on the next call.
+
+### `/producer/short` returns `mp4_path: ""` with a warning
+Composer failed but TTS succeeded — `audio_path` and `srt_path` are
+preserved as a partial result. The most common cause is `ffmpeg` missing
+from `PATH`. Verify with `ffmpeg -version`. moviepy can fall back to
+`imageio-ffmpeg`'s bundled binary, but a system-installed `ffmpeg` is
+faster and more reliable.
+
+### `/research/niche` warning: `pytrends rate-limited (HTTP 429)`
+Google Trends throttles aggressively. The route degrades gracefully —
+`trends` field is empty but the rest of the niche pipeline still runs. Wait
+a few minutes and retry, or call with `include_trends: false` to skip the
+trends pulse entirely.
+
+### `/studio/*` warning about missing DeepSeek key
+All Studio routes depend on `DEEPSEEK_API_KEY`. Without it the routes still
+return 200 with empty results and a `warnings[]` entry — the UI surfaces
+this as a yellow box. Add the key to `.env` and restart the sidecar
+(Electron will pick it up on next launch).
+
+### Stale `desktop/dist` after editing `creator-forge.html` / `.js`
+The renderer is loaded directly from `desktop/dist/`, no bundler step.
+Just `Cmd/Ctrl+R` (View → Reload) inside the Electron window — no rebuild
+needed.
+
+---
+
 ## 🗺 Roadmap
 
 This repo's first commit is **PR-0: integration scaffold**. Each remaining FastAPI route returns a shell response with a `notes:` field telling you exactly which `research.core.*` function to wire in. Roadmap:
@@ -322,7 +390,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-7** — Electron renderer UI (`desktop/dist/creator-forge.html` + `.js`) with Research / Studio / Storyboard tabs, sidecar status dot, cross-tab handoff (**done**).
 - **PR-8** — port `05_Producer.py` short mode → `/producer/short` (Edge-TTS + captions + ffmpeg compose, real `/producer/voices` and `/producer/providers`) (**done**, see `research/api/routes/producer.py::compose_short` + `research/tests/test_api_producer.py`).
 - **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3.
-- **PR-10** — fresh React renderer (`desktop/renderer/`) with native tabs for each stage instead of the legacy `dist/` bundle.
+- **PR-10** — polish: probe-and-reuse for the sidecar (no port-conflict crashes when uvicorn is started in a separate terminal), expanded README setup, troubleshooting section.
 
 ---
 
