@@ -198,28 +198,37 @@ def keywords(req: KeywordRequest) -> KeywordResponse:
             warnings.append(f"vph compute failed: {type(exc).__name__}: {exc}")
 
     # ── Optional KGR per keyword (one YouTube call per keyword) ────────────
+    #
+    # On per-call exception we leave the row's default (competition=0,
+    # score=0.0, grade="medium") rather than stamping kgr_score(0, breadth)
+    # = (90.0, "easy"). Without that distinction a client sorting by score
+    # would float failed lookups to the top as "easiest to rank", actively
+    # misleading the user. comp==0 returned by a *successful* call (genuinely
+    # no YouTube results) is still treated as easy and scored normally.
     if req.compute_kgr and rows_raw:
         breadth = max(len(suggestions_raw), 1)
         sample = rows_raw[: req.max_kgr_keywords]
         kgr_failures = 0
         for row in sample:
-            comp = _safe(
-                f"kgr search_raw[{row['keyword']}]",
-                lambda kw_=row["keyword"]: int(
-                    yt.search_raw(kw_, max_results=1, region=req.region, order="relevance")
-                    .get("pageInfo", {})
-                    .get("totalResults", 0)
-                ),
-                warnings if kgr_failures < 3 else [],  # cap noise
-                0,
-            )
-            if comp == 0:
+            try:
+                resp = yt.search_raw(
+                    row["keyword"], max_results=1, region=req.region, order="relevance"
+                )
+                comp = int(resp.get("pageInfo", {}).get("totalResults", 0))
+            except Exception as exc:  # noqa: BLE001 — per-row resilience.
                 kgr_failures += 1
+                if kgr_failures <= 3:
+                    warnings.append(
+                        f"kgr search_raw[{row['keyword']}] failed: {type(exc).__name__}: {exc}"
+                    )
+                # Keep defaults from build_rows (competition=0, score=0.0,
+                # grade="medium") — do NOT call kgr_score for failed lookups.
+                continue
             row["competition"] = comp
             score, grade = kw.kgr_score(comp, breadth)
             row["score"] = score
             row["grade"] = grade
-        if kgr_failures >= 3:
+        if kgr_failures > 3:
             warnings.append(
                 f"kgr: {kgr_failures} of {len(sample)} keywords failed to fetch competition (rate-limit or missing key)."
             )

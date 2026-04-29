@@ -188,6 +188,66 @@ def test_keywords_all_upstreams_fail(monkeypatch):
     assert "youtube.search_raw" in joined
 
 
+def test_keywords_kgr_failed_lookup_does_not_stamp_easy_grade(
+    monkeypatch, stub_autocomplete
+):
+    """Regression: per-keyword KGR call that raises must NOT leave the row
+    looking like the easiest keyword in the response.
+
+    Before the fix, a failed call produced ``competition=0`` via _safe's
+    default, then ``kgr_score(0, breadth)`` returned ``(90.0, "easy")`` — so
+    a client sorting by score would surface broken keywords at the top.
+    Now we leave the row at its build_rows defaults (0.0 / "medium").
+    """
+    # First call (seed-level top-results) succeeds; every per-keyword KGR
+    # call after that raises.
+    seed_resp = {
+        "pageInfo": {"totalResults": 5000},
+        "items": [{"id": {"videoId": "v1"}, "snippet": {"title": "x", "publishedAt": _NOW_PUB}}],
+    }
+    call_count = {"n": 0}
+
+    def flaky_search(query, *a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return seed_resp  # seed-level call OK
+        raise RuntimeError("KGR upstream broken (e.g. rate-limited)")
+
+    monkeypatch.setattr(kw_route.yt, "search_raw", flaky_search)
+    monkeypatch.setattr(
+        kw_route.yt,
+        "videos_details",
+        lambda ids: [
+            {"id": "v1", "snippet": {"title": "x", "publishedAt": _NOW_PUB},
+             "statistics": {"viewCount": "100"}}
+        ],
+    )
+
+    r = client.post(
+        "/research/keywords",
+        json={
+            "seed": "ai art",
+            "compute_kgr": True,
+            "max_kgr_keywords": 4,
+            "include_questions": False,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert len(body["suggestions"]) == 4
+    # Each row should keep build_rows defaults — not be flagged as "easy".
+    for row in body["suggestions"]:
+        assert row["competition"] == 0
+        assert row["score"] == 0.0
+        assert row["grade"] == "medium", (
+            f"row {row['keyword']} got grade={row['grade']} — failed lookups must not "
+            f"stamp the easiest tier"
+        )
+    # Warnings should mention each failure (capped at 3 + summary line).
+    assert any("kgr search_raw" in w for w in body["warnings"])
+
+
 def test_keywords_skip_questions(monkeypatch, stub_autocomplete, stub_youtube_happy):
     """include_questions=false → question_buckets is never called."""
     monkeypatch.setattr(kw_route.kw, "question_buckets", lambda *a, **kw: pytest.fail("should not be called"))
