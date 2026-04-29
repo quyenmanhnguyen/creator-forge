@@ -194,15 +194,22 @@ def _llm_verdict(seed: str, region: str, language: str, payload: dict, warnings:
         warnings.append(f"AI verdict failed: {type(exc).__name__}: {exc}")
         return None
 
-    return Verdict(
-        verdict=str(data.get("verdict", "")).lower(),
-        score=int(data.get("score", 0) or 0),
-        competition=str(data.get("competition", "")),
-        summary=str(data.get("summary", "")),
-        opportunities=list(data.get("opportunities", []) or []),
-        risks=list(data.get("risks", []) or []),
-        content_gaps=list(data.get("content_gaps", []) or []),
-    )
+    # Construction can still raise if the LLM returns a non-numeric ``score``
+    # (e.g. ``"high"``) or a non-iterable ``opportunities`` — keep the partial
+    # 200 contract instead of letting it become a 500.
+    try:
+        return Verdict(
+            verdict=str(data.get("verdict", "")).lower(),
+            score=int(float(data.get("score", 0) or 0)),
+            competition=str(data.get("competition", "")),
+            summary=str(data.get("summary", "")),
+            opportunities=list(data.get("opportunities", []) or []),
+            risks=list(data.get("risks", []) or []),
+            content_gaps=list(data.get("content_gaps", []) or []),
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"AI verdict parse failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 # ─── Endpoint ───────────────────────────────────────────────────────────────
