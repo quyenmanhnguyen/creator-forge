@@ -319,8 +319,8 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner` (**done**, see `research/api/routes/cloner.py` + `research/tests/test_api_cloner.py`).
 - **PR-5** — port `04_Studio.py` (5 steps) → `/studio/{topics,titles,outline,script,humanize}` (**done**, see `research/api/routes/studio.py` + `research/tests/test_api_studio.py`).
 - **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown` (**done**, see `research/api/routes/producer.py` + `research/tests/test_api_producer.py`).
-- **PR-7** — wire `StoryboardBridge.generateImages` into `ImageService.generateBatch` end-to-end.
-- **PR-8** — port `05_Producer.py` short mode → `/producer/short` (TTS + captions + ffmpeg).
+- **PR-7** — Electron renderer UI (`desktop/dist/creator-forge.html` + `.js`) with Research / Studio / Storyboard tabs, sidecar status dot, cross-tab handoff (**done**).
+- **PR-8** — port `05_Producer.py` short mode → `/producer/short` (Edge-TTS + captions + ffmpeg compose, real `/producer/voices` and `/producer/providers`) (**done**, see `research/api/routes/producer.py::compose_short` + `research/tests/test_api_producer.py`).
 - **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3.
 - **PR-10** — fresh React renderer (`desktop/renderer/`) with native tabs for each stage instead of the legacy `dist/` bundle.
 

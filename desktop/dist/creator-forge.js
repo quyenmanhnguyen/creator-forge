@@ -726,6 +726,89 @@
         $('sb-result').innerHTML = html;
     }
 
+    // ─── Producer: compose short (TTS + captions + ffmpeg) ─────────────────
+    async function populateVoicePicker() {
+        if (!api) return;
+        const sel = $('ps-voice');
+        if (!sel) return;
+        try {
+            const data = await api.producer.listVoices();
+            if (!data || !Array.isArray(data.voices) || !data.voices.length) return;
+            const current = sel.value;
+            sel.innerHTML = data.voices
+                .map((v) => `<option value="${escapeHtml(v.short_name)}">${escapeHtml(v.label || v.short_name)}</option>`)
+                .join('');
+            const desired = current || data.default || data.voices[0].short_name;
+            const found = Array.from(sel.options).find((o) => o.value === desired);
+            if (found) sel.value = desired;
+        } catch (err) {
+            // Sidecar not ready yet — listVoices returns the soft sentinel.
+            // Leave the static placeholder option alone; refresh on next call.
+        }
+    }
+
+    async function runComposeShort() {
+        const script = asNonEmpty($('ps-script').value) || asNonEmpty($('sb-script').value);
+        if (!script) {
+            showError('ps-result', { status: 422, message: 'Paste a script (or copy from Storyboard above).' });
+            return;
+        }
+        const params = {
+            script,
+            voice: $('ps-voice').value || 'en-US-AriaNeural',
+            style: $('ps-style').value || 'violet-pink',
+            write_srt: !!$('ps-write-srt').checked,
+        };
+        const outDir = asNonEmpty($('ps-output-dir').value);
+        if (outDir) params.output_dir = outDir;
+        showLoading('ps-result', 'Rendering TTS + captions + 9:16 mp4 (this can take 10–60s)...');
+        try {
+            const data = await api.producer.composeShort(params);
+            renderComposeShort(data);
+        } catch (err) {
+            showError('ps-result', err);
+        }
+    }
+
+    function renderComposeShort(data) {
+        const d = data || {};
+        let html = '';
+        html += `<div class="stats-row">
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed ? d.duration_s.toFixed(2) : d.duration_s)}s</b></span>
+            <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
+            <span>Engine<b>${escapeHtml(d.engine || '')}</b></span>
+            <span>Style<b>${escapeHtml(d.style || '')}</b></span>
+            <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
+            <span>Caption source<b>${escapeHtml(d.caption_source || 'none')}</b></span>
+        </div>`;
+        const paths = [
+            ['mp4', d.mp4_path],
+            ['voice.mp3', d.audio_path],
+            ['captions.srt', d.srt_path],
+        ].filter(([, p]) => !!p);
+        if (paths.length) {
+            html += `<div class="scene-card"><div class="scene-title">Output files</div>`;
+            paths.forEach(([label, p]) => {
+                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code></div>`;
+            });
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
+        } else {
+            html += renderEmpty('No mp4 produced. Check warnings — Edge-TTS or moviepy may be missing.');
+        }
+        html += renderWarnings(d.warnings);
+        html += renderRawJson(d);
+        $('ps-result').innerHTML = html;
+    }
+
+    function copyScriptFromStoryboard() {
+        const script = asNonEmpty($('sb-script').value);
+        if (!script) {
+            showError('ps-result', { status: 422, message: 'Storyboard script is empty — paste one above first.' });
+            return;
+        }
+        $('ps-script').value = script;
+    }
+
     // ─── Studio reset & cross-tab handoff ──────────────────────────────────
     function resetStudio() {
         state.lastTopic = '';
@@ -764,6 +847,7 @@
         script: runScript,
         humanize: runHumanize,
         'scene-breakdown': runSceneBreakdown,
+        'compose-short': runComposeShort,
     };
 
     function setupRunButtons() {
@@ -784,6 +868,7 @@
             const action = btn.getAttribute('data-action');
             if (action === 'reset-studio') btn.addEventListener('click', resetStudio);
             if (action === 'send-to-storyboard') btn.addEventListener('click', sendScriptToStoryboard);
+            if (action === 'copy-script-from-storyboard') btn.addEventListener('click', copyScriptFromStoryboard);
         });
     }
 
@@ -791,6 +876,15 @@
         setupTabs();
         setupRunButtons();
         refreshSidecarStatus();
+        // Populate the voice picker once the sidecar is reachable. The first
+        // attempt may hit the soft sentinel; retry alongside the status poll
+        // so the picker fills in shortly after cold start.
+        populateVoicePicker();
+        const voicePollHandle = setInterval(() => {
+            const sel = $('ps-voice');
+            if (sel && sel.options.length > 1) { clearInterval(voicePollHandle); return; }
+            populateVoicePicker();
+        }, 5000);
         // Re-poll every 5s so the dot recovers when the sidecar comes online late.
         setInterval(refreshSidecarStatus, 5000);
     });
