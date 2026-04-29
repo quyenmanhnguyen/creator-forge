@@ -214,7 +214,7 @@ See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full data flow & schemas.
 ```bash
 # Python (research) — API tests must pass; legacy tube-atlas tests are
 # best-effort until each is ported.
-pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py -v
+pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py -v
 pytest research/tests                       # full suite
 
 # Lint
@@ -246,6 +246,11 @@ curl -s -X POST http://127.0.0.1:5050/research/keywords \
 curl -s -X POST http://127.0.0.1:5050/research/keywords \
   -H 'Content-Type: application/json' \
   -d '{"seed":"ai art","compute_kgr":true,"max_kgr_keywords":15}' | jq
+
+# /research/outlier — small channels with breakout videos in the last N days
+curl -s -X POST http://127.0.0.1:5050/research/outlier \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"ai art tutorial","region":"US","window_days":7,"max_subs":100000,"min_outlier":1.5}' | jq
 ```
 
 CI runs lint + API tests + node `--check` on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -258,7 +263,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 
 - **PR-1** — port `01_Research.py` (niche tab) → `/research/niche` (**done**, see `research/api/routes/research.py` + `research/tests/test_api_niche.py`).
 - **PR-2** — port `01_Research.py` (keyword tab) → `/research/keywords` (**done**, see `research/api/routes/keywords.py` + `research/tests/test_api_keywords.py`).
-- **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier`.
+- **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier` (**done**, see `research/api/routes/outlier.py` + `research/tests/test_api_outlier.py`).
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner`.
 - **PR-5** — port `04_Studio.py` (5 steps) → `/studio/*`.
 - **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown`.
