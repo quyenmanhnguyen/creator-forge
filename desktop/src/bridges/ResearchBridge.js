@@ -81,9 +81,33 @@ class ResearchBridge {
     }
 
     /**
-     * 04 Outlier Finder — small channels with viral videos.
-     * @param {{ topic: string, days?: 7|14|30, max_subs?: number, min_views_per_sub?: number }} params
-     * @returns {Promise<{ rows: Array, csv: string }>}
+     * 03 Outlier Finder — POST /research/outlier.
+     * Surfaces small channels (subs <= max_subs) with breakout videos
+     * in the last window_days. Sorted by outlier_score DESC.
+     *
+     * @param {{
+     *   seed: string,
+     *   region?: string,
+     *   window_days?: 7|14|30,
+     *   max_subs?: number,
+     *   min_outlier?: number,
+     *   max_results?: number,
+     * }} params
+     * @returns {Promise<{
+     *   seed: string,
+     *   region: string,
+     *   window_days: number,
+     *   rows: Array<{
+     *     video_id: string, title: string,
+     *     channel_id: string, channel_title: string,
+     *     subs: number, views: number, likes: number, comments: number,
+     *     published_at: string, hours_since: number, vph: number,
+     *     outlier_score: number, thumbnail: string, url: string, duration: string,
+     *   }>,
+     *   stats: { count:number, max_vph:number, avg_vph:number, avg_outlier_score:number },
+     *   warnings: string[],
+     *   notes: string,
+     * }>}
      */
     outlierFinder(params) {
         return this.api.outlierFinder(params);

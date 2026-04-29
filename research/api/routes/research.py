@@ -249,10 +249,19 @@ def niche(req: NicheRequest) -> NicheResponse:
         [],
     )
 
+    # YouTube videos.list does NOT preserve the input ID order, so hydrated[0]
+    # is not necessarily the top-viewed video. Take the max viewCount across
+    # the whole batch — this feeds yt.opportunity_score()'s Reach component.
     top_video_views = 0
     if hydrated:
         try:
-            top_video_views = int(parse_count(hydrated[0].get("statistics", {}).get("viewCount", 0)))
+            top_video_views = max(
+                (
+                    int(parse_count(v.get("statistics", {}).get("viewCount", 0)))
+                    for v in hydrated
+                ),
+                default=0,
+            )
         except (TypeError, ValueError):
             top_video_views = 0
 
