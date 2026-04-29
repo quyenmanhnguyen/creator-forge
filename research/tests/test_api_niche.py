@@ -142,6 +142,66 @@ def test_niche_rejects_empty_seed():
     assert r.status_code == 422
 
 
+def test_niche_top_video_views_uses_max_not_first(monkeypatch, stub_autocomplete, stub_trends_empty, stub_llm_verdict):
+    """Regression: YouTube ``videos.list`` does not preserve the input ID order,
+    so ``hydrated[0]`` is not reliably the top-viewed video. Verify the route
+    picks ``max(viewCount)`` across the whole batch when feeding
+    ``opportunity_score``'s Reach component.
+    """
+    raw_search_resp = {
+        "pageInfo": {"totalResults": 9999},
+        "items": [
+            {"id": {"videoId": "vid_top"},
+             "snippet": {"title": "Top", "channelId": "ca", "channelTitle": "A",
+                         "publishedAt": "2025-01-01T00:00:00Z"}},
+            {"id": {"videoId": "vid_low"},
+             "snippet": {"title": "Low", "channelId": "cb", "channelTitle": "B",
+                         "publishedAt": "2025-01-02T00:00:00Z"}},
+        ],
+    }
+    # videos.list returns the LOW-viewed video first → exposes the old bug
+    # where hydrated[0] was assumed to be the top.
+    hydrated_reversed = [
+        {"id": "vid_low",
+         "snippet": raw_search_resp["items"][1]["snippet"],
+         "statistics": {"viewCount": "10000", "likeCount": "100", "commentCount": "5"}},
+        {"id": "vid_top",
+         "snippet": raw_search_resp["items"][0]["snippet"],
+         "statistics": {"viewCount": "9000000", "likeCount": "200000", "commentCount": "15000"}},
+    ]
+
+    captured: dict = {}
+
+    def spy_opportunity_score(**kw):
+        captured.update(kw)
+        return (88, "high")
+
+    monkeypatch.setattr(niche_route.yt, "search_raw", lambda *a, **kw: raw_search_resp)
+    monkeypatch.setattr(niche_route.yt, "videos_details", lambda ids: hydrated_reversed)
+    monkeypatch.setattr(niche_route.yt, "recent_uploads_count", lambda *a, **kw: 100)
+    monkeypatch.setattr(
+        niche_route.yt, "trend_pulse",
+        lambda *a, **kw: {"recent_7d": 50, "prior_7d": 30, "growth_pct": 66.7, "status": "hot"},
+    )
+    monkeypatch.setattr(niche_route.yt, "channel_details", lambda ids: [])
+    monkeypatch.setattr(niche_route.yt, "detect_outliers", lambda *a, **kw: [])
+    monkeypatch.setattr(niche_route.yt, "opportunity_score", spy_opportunity_score)
+
+    r = client.post(
+        "/research/niche",
+        json={"seed": "ai art", "region": "US", "language": "en", "include_trends": False, "include_verdict": False},
+    )
+    assert r.status_code == 200, r.text
+
+    # Old (buggy) code would have passed top_video_views=10000 (the LOW one
+    # because it was first in the response). Fixed code passes 9_000_000.
+    assert captured["top_video_views"] == 9_000_000, (
+        f"top_video_views should be max viewCount across hydrated, got {captured['top_video_views']}"
+    )
+    assert captured["recent_uploads"] == 100
+    assert captured["total_competition"] == 9999
+
+
 @pytest.mark.parametrize("seed", [" ", "   ", "\t", "\n"])
 def test_niche_rejects_whitespace_only_seed(seed):
     """Whitespace-only seeds must be rejected (422), not stripped to '' and
