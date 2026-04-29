@@ -214,7 +214,7 @@ See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full data flow & schemas.
 ```bash
 # Python (research) — API tests must pass; legacy tube-atlas tests are
 # best-effort until each is ported.
-pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py -v
+pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py -v
 pytest research/tests                       # full suite
 
 # Lint
@@ -278,6 +278,15 @@ curl -s -X POST http://127.0.0.1:5050/studio/script \
 curl -s -X POST http://127.0.0.1:5050/studio/humanize \
   -H 'Content-Type: application/json' \
   -d @/tmp/humanize_request.json | jq      # script + language
+
+# /producer/scene_breakdown — split a finished script into N standalone scenes,
+# each with an ultra-detailed image prompt + 3-4 sentence flow video prompt
+# (paste-ready for AutoGrok, grok.com web, Veo 3, Whisk).
+# template_key ∈ {cinematic, educational, lifestyle, factory}
+# n_scenes is optional — omit to auto-estimate from script length.
+curl -s -X POST http://127.0.0.1:5050/producer/scene_breakdown \
+  -H 'Content-Type: application/json' \
+  -d '{"script":"## PART 1 — Hook\nImagine waking at 3am ...\n\n## PART 2 — Empathy\nYou are not alone ...","template_key":"cinematic","n_scenes":8,"words_per_minute":150,"language":"en"}' | jq
 ```
 
 CI runs lint + API tests + node `--check` on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -293,7 +302,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier` (**done**, see `research/api/routes/outlier.py` + `research/tests/test_api_outlier.py`).
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner` (**done**, see `research/api/routes/cloner.py` + `research/tests/test_api_cloner.py`).
 - **PR-5** — port `04_Studio.py` (5 steps) → `/studio/{topics,titles,outline,script,humanize}` (**done**, see `research/api/routes/studio.py` + `research/tests/test_api_studio.py`).
-- **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown`.
+- **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown` (**done**, see `research/api/routes/producer.py` + `research/tests/test_api_producer.py`).
 - **PR-7** — wire `StoryboardBridge.generateImages` into `ImageService.generateBatch` end-to-end.
 - **PR-8** — port `05_Producer.py` short mode → `/producer/short` (TTS + captions + ffmpeg).
 - **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3.

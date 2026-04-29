@@ -17,6 +17,19 @@ attribution.
 """
 from __future__ import annotations
 
+# Vendored from tube-atlas-oss where the package was importable as
+# ``core.pixelle.*`` (Streamlit ran with ``research/`` as cwd). Inside the
+# FastAPI sidecar the package lives at ``research.core.pixelle.*``, so we
+# alias ``core`` → ``research.core`` once here. This lets every submodule
+# below keep its original ``from core.X import …`` style without touching
+# legacy files.
+import sys as _sys
+
+import research.core as _research_core
+
+_sys.modules.setdefault("core", _research_core)
+_sys.modules.setdefault("core.pixelle", _sys.modules[__name__])
+
 from core.pixelle.composer import ComposerOptions, SceneAsset, VideoSceneAsset, make_short
 from core.pixelle.config import (
     ComfyUIConfig,
