@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Creator Forge</title>
+    <style>
+        :root {
+            --bg-0: #0a0a1a;
+            --bg-1: #111127;
+            --bg-2: #161637;
+            --bg-card: #1a1a3a;
+            --accent: #00e5ff;
+            --accent2: #7c4dff;
+            --text: #e8eaf6;
+            --text-dim: #9fa8da;
+            --border: rgba(255, 255, 255, 0.08);
+            --ok: #00e676;
+            --warn: #ffd740;
+            --err: #ff5252;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0; padding: 0; height: 100%;
+            background: var(--bg-0); color: var(--text);
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 14px;
+        }
+        body { display: flex; flex-direction: column; overflow: hidden; }
+        header {
+            display: flex; align-items: center; gap: 16px;
+            padding: 10px 18px;
+            background: var(--bg-1);
+            border-bottom: 1px solid var(--border);
+        }
+        header h1 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .sidecar-status {
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 12px; color: var(--text-dim);
+            margin-left: auto;
+        }
+        .sidecar-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--text-dim);
+        }
+        .sidecar-dot.ok  { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+        .sidecar-dot.err { background: var(--err); box-shadow: 0 0 6px var(--err); }
+        nav.tabs {
+            display: flex;
+            background: var(--bg-1);
+            border-bottom: 1px solid var(--border);
+            padding: 0 12px;
+            gap: 2px;
+        }
+        nav.tabs button {
+            background: transparent; color: var(--text-dim);
+            border: none; padding: 12px 18px;
+            cursor: pointer; font-size: 13px;
+            border-bottom: 2px solid transparent;
+            transition: color .15s, border-color .15s;
+        }
+        nav.tabs button:hover { color: var(--text); }
+        nav.tabs button.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+        main {
+            flex: 1; overflow-y: auto; padding: 16px 18px;
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .panel {
+            background: var(--bg-1);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 18px;
+            margin-bottom: 16px;
+        }
+        .panel h2 {
+            margin: 0 0 4px;
+            font-size: 14px;
+            color: var(--text);
+            display: flex; align-items: center; gap: 8px;
+        }
+        .panel .desc {
+            color: var(--text-dim);
+            font-size: 12px;
+            margin-bottom: 12px;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px 14px;
+            margin-bottom: 12px;
+        }
+        label {
+            display: flex; flex-direction: column;
+            font-size: 11px; color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            gap: 4px;
+        }
+        input, select, textarea {
+            background: var(--bg-2);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 10px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+            outline: none;
+            transition: border-color .15s;
+        }
+        input:focus, select:focus, textarea:focus {
+            border-color: var(--accent);
+        }
+        textarea { resize: vertical; min-height: 80px; }
+        .form-row-full {
+            grid-column: 1 / -1;
+        }
+        .actions {
+            display: flex; gap: 8px; flex-wrap: wrap;
+            margin-top: 4px;
+        }
+        button.primary {
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            color: #001028;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        button.primary:disabled {
+            opacity: 0.4; cursor: not-allowed;
+        }
+        button.ghost {
+            background: transparent;
+            color: var(--text-dim);
+            border: 1px solid var(--border);
+            padding: 8px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        button.ghost:hover { color: var(--text); border-color: var(--accent); }
+        .result {
+            margin-top: 12px;
+            border-top: 1px dashed var(--border);
+            padding-top: 12px;
+            min-height: 24px;
+        }
+        .loading {
+            display: inline-flex; align-items: center; gap: 8px;
+            color: var(--text-dim);
+            font-size: 12px;
+        }
+        .spinner {
+            width: 14px; height: 14px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .warning-list {
+            background: rgba(255, 215, 64, 0.08);
+            border-left: 3px solid var(--warn);
+            padding: 8px 12px;
+            margin: 8px 0;
+            font-size: 12px;
+            color: #ffe48a;
+            border-radius: 4px;
+        }
+        .warning-list .warning-title {
+            font-weight: 600;
+            color: var(--warn);
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 11px;
+        }
+        .warning-list ul { margin: 0; padding-left: 18px; }
+        .error-box {
+            background: rgba(255, 82, 82, 0.1);
+            border-left: 3px solid var(--err);
+            padding: 10px 12px;
+            font-size: 12px;
+            color: #ffb4b4;
+            border-radius: 4px;
+            white-space: pre-wrap;
+        }
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 10px;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 12.5px;
+            line-height: 1.5;
+        }
+        .card strong { color: var(--accent); display: block; margin-bottom: 4px; }
+        .card .meta {
+            color: var(--text-dim);
+            font-size: 11px;
+            margin-top: 4px;
+        }
+        .card a { color: var(--accent); text-decoration: none; }
+        .card a:hover { text-decoration: underline; }
+        details {
+            margin-top: 12px;
+            background: var(--bg-2);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 12px;
+        }
+        details summary {
+            cursor: pointer;
+            color: var(--text-dim);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        details pre {
+            margin: 8px 0 0;
+            padding: 10px;
+            background: var(--bg-0);
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 11.5px;
+            color: var(--text-dim);
+            max-height: 320px;
+        }
+        .stats-row {
+            display: flex; gap: 14px; flex-wrap: wrap;
+            margin: 6px 0 10px;
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+        .stats-row span { background: var(--bg-2); padding: 4px 8px; border-radius: 4px; }
+        .stats-row b { color: var(--text); margin-left: 4px; }
+        .scene-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+        }
+        .scene-card .scene-title {
+            color: var(--accent);
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .scene-card .scene-meta {
+            color: var(--text-dim);
+            font-size: 11px;
+            margin-bottom: 6px;
+        }
+        .scene-card .scene-block {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px dashed var(--border);
+        }
+        .scene-card .scene-label {
+            color: var(--accent2);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: block;
+            margin-bottom: 2px;
+        }
+        .pill {
+            display: inline-block;
+            background: var(--bg-2);
+            color: var(--text-dim);
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            margin-right: 4px;
+        }
+        .pill.ok { color: var(--ok); }
+        .pill.warn { color: var(--warn); }
+        .empty {
+            color: var(--text-dim);
+            font-size: 12px;
+            font-style: italic;
+        }
+        .flow-hint {
+            background: rgba(0, 229, 255, 0.06);
+            border: 1px dashed rgba(0, 229, 255, 0.3);
+            color: var(--text-dim);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            margin-bottom: 12px;
+        }
+        .flow-hint b { color: var(--accent); }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>creator-forge</h1>
+        <span class="sidecar-status">
+            <span id="sidecar-dot" class="sidecar-dot"></span>
+            <span id="sidecar-label">checking sidecar...</span>
+        </span>
+    </header>
+    <nav class="tabs">
+        <button data-tab="research" class="active">Research</button>
+        <button data-tab="studio">Studio</button>
+        <button data-tab="storyboard">Storyboard</button>
+    </nav>
+    <main>
+        <!-- ─── RESEARCH TAB ─── -->
+        <section id="tab-research" class="tab-content active">
+            <div class="flow-hint">
+                Tip: enter a niche/seed below, then jump to <b>Studio</b> to turn topics into scripts,
+                and to <b>Storyboard</b> to break the script into scenes.
+            </div>
+
+            <!-- Niche -->
+            <div class="panel" data-form="niche">
+                <h2>Niche research <span class="pill">/research/niche</span></h2>
+                <div class="desc">Autocomplete + YouTube search + outliers + DeepSeek verdict for a seed niche.</div>
+                <div class="form-grid">
+                    <label>Seed
+                        <input id="niche-seed" placeholder="sleep stories for adults" />
+                    </label>
+                    <label>Region
+                        <input id="niche-region" value="US" maxlength="4" />
+                    </label>
+                    <label>Language
+                        <select id="niche-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                            <option value="zh-CN">zh-CN</option>
+                        </select>
+                    </label>
+                    <label>Max top videos
+                        <input id="niche-max-top" type="number" value="25" min="1" max="50" />
+                    </label>
+                    <label>Include trends
+                        <select id="niche-trends">
+                            <option value="true">true</option>
+                            <option value="false">false</option>
+                        </select>
+                    </label>
+                    <label>Include verdict
+                        <select id="niche-verdict">
+                            <option value="true">true</option>
+                            <option value="false">false</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="niche">Run niche research</button>
+                </div>
+                <div class="result" id="niche-result"></div>
+            </div>
+
+            <!-- Keywords -->
+            <div class="panel" data-form="keywords">
+                <h2>Keyword finder <span class="pill">/research/keywords</span></h2>
+                <div class="desc">Long-tail keyword expansion, KGR scoring, VPH of top videos.</div>
+                <div class="form-grid">
+                    <label>Seed
+                        <input id="kw-seed" placeholder="buddhism late life fortune" />
+                    </label>
+                    <label>Region
+                        <input id="kw-region" value="US" maxlength="4" />
+                    </label>
+                    <label>Language
+                        <select id="kw-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                    <label>Compute KGR
+                        <select id="kw-kgr">
+                            <option value="false">false</option>
+                            <option value="true">true</option>
+                        </select>
+                    </label>
+                    <label>Max KGR keywords
+                        <input id="kw-max-kgr" type="number" value="25" min="1" max="50" />
+                    </label>
+                    <label>Include questions
+                        <select id="kw-questions">
+                            <option value="true">true</option>
+                            <option value="false">false</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="keywords">Find keywords</button>
+                </div>
+                <div class="result" id="kw-result"></div>
+            </div>
+
+            <!-- Outlier -->
+            <div class="panel" data-form="outlier">
+                <h2>Outlier finder <span class="pill">/research/outlier</span></h2>
+                <div class="desc">Small-channel videos with disproportionate views (views / subs).</div>
+                <div class="form-grid">
+                    <label>Seed
+                        <input id="ol-seed" placeholder="cozy gaming setup" />
+                    </label>
+                    <label>Region
+                        <input id="ol-region" value="US" maxlength="4" />
+                    </label>
+                    <label>Window (days)
+                        <select id="ol-window">
+                            <option value="7">7</option>
+                            <option value="14">14</option>
+                            <option value="30">30</option>
+                        </select>
+                    </label>
+                    <label>Max subs
+                        <input id="ol-max-subs" type="number" value="100000" min="1" />
+                    </label>
+                    <label>Min outlier ratio
+                        <input id="ol-min-outlier" type="number" step="0.1" value="1.5" min="0" />
+                    </label>
+                    <label>Max results
+                        <input id="ol-max-results" type="number" value="50" min="1" max="50" />
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="outlier">Find outliers</button>
+                </div>
+                <div class="result" id="ol-result"></div>
+            </div>
+
+            <!-- Cloner -->
+            <div class="panel" data-form="cloner">
+                <h2>Video cloner <span class="pill">/research/cloner</span></h2>
+                <div class="desc">Take a YouTube URL, pull title + transcript, generate clone-kit (title clones, hooks, outline).</div>
+                <div class="form-grid">
+                    <label class="form-row-full">YouTube URL or ID
+                        <input id="cl-url" placeholder="https://youtu.be/..." />
+                    </label>
+                    <label>New topic (optional)
+                        <input id="cl-new-topic" placeholder="leave blank to keep" />
+                    </label>
+                    <label># titles
+                        <input id="cl-n-titles" type="number" value="10" min="1" max="30" />
+                    </label>
+                    <label>Output language
+                        <select id="cl-language">
+                            <option value="auto">auto</option>
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="cloner">Clone video</button>
+                </div>
+                <div class="result" id="cl-result"></div>
+            </div>
+        </section>
+
+        <!-- ─── STUDIO TAB ─── -->
+        <section id="tab-studio" class="tab-content">
+            <div class="flow-hint">
+                5-step wizard: <b>Topics → Titles → Outline → Script → Humanize</b>.
+                Each step feeds the next automatically.
+            </div>
+
+            <!-- Step 1: Topics -->
+            <div class="panel" data-form="topics">
+                <h2>1. Topics <span class="pill">/studio/topics</span></h2>
+                <div class="desc">Generate N topic ideas from a seed niche.</div>
+                <div class="form-grid">
+                    <label>Seed
+                        <input id="st-topics-seed" placeholder="sleep stories for adults" />
+                    </label>
+                    <label>Language
+                        <select id="st-topics-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                    <label># ideas
+                        <input id="st-topics-n" type="number" value="20" min="1" max="50" />
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="topics">Generate topics</button>
+                    <button class="ghost" data-action="reset-studio">Reset wizard</button>
+                </div>
+                <div class="result" id="st-topics-result"></div>
+            </div>
+
+            <!-- Step 2: Titles -->
+            <div class="panel" data-form="titles">
+                <h2>2. Titles <span class="pill">/studio/titles</span></h2>
+                <div class="desc">Pick a topic above (it auto-fills) and generate CTR-ranked titles.</div>
+                <div class="form-grid">
+                    <label class="form-row-full">Topic
+                        <input id="st-titles-topic" placeholder="auto-filled when you click a topic above" />
+                    </label>
+                    <label>Language
+                        <select id="st-titles-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                    <label># titles
+                        <input id="st-titles-n" type="number" value="10" min="1" max="30" />
+                    </label>
+                    <label>Must keywords
+                        <input id="st-titles-must" placeholder="optional, comma-separated" />
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="titles">Generate titles</button>
+                </div>
+                <div class="result" id="st-titles-result"></div>
+            </div>
+
+            <!-- Step 3: Outline -->
+            <div class="panel" data-form="outline">
+                <h2>3. Outline <span class="pill">/studio/outline</span></h2>
+                <div class="desc">8-part outline. Click a title above to fill this in.</div>
+                <div class="form-grid">
+                    <label class="form-row-full">Title
+                        <input id="st-outline-title" placeholder="auto-filled when you click a title above" />
+                    </label>
+                    <label>Language
+                        <select id="st-outline-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="outline">Generate outline</button>
+                </div>
+                <div class="result" id="st-outline-result"></div>
+            </div>
+
+            <!-- Step 4: Script -->
+            <div class="panel" data-form="script">
+                <h2>4. Script <span class="pill">/studio/script</span></h2>
+                <div class="desc">Long-form script chunked from the 8-part outline.</div>
+                <div class="form-grid">
+                    <label class="form-row-full">Title
+                        <input id="st-script-title" placeholder="re-uses outline title" />
+                    </label>
+                    <label>Language
+                        <select id="st-script-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                    <label>Target chars
+                        <input id="st-script-chars" type="number" value="8000" min="2000" max="40000" />
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="script">Generate script</button>
+                    <button class="ghost" data-action="send-to-storyboard">Send script → Storyboard</button>
+                </div>
+                <div class="result" id="st-script-result"></div>
+            </div>
+
+            <!-- Step 5: Humanize -->
+            <div class="panel" data-form="humanize">
+                <h2>5. Humanize <span class="pill">/studio/humanize</span></h2>
+                <div class="desc">Rewrite the script in a human, less LLM-detectable voice.</div>
+                <div class="form-grid">
+                    <label class="form-row-full">Script
+                        <textarea id="st-humanize-script" rows="6" placeholder="auto-filled from step 4"></textarea>
+                    </label>
+                    <label>Language
+                        <select id="st-humanize-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="humanize">Humanize</button>
+                </div>
+                <div class="result" id="st-humanize-result"></div>
+            </div>
+        </section>
+
+        <!-- ─── STORYBOARD TAB ─── -->
+        <section id="tab-storyboard" class="tab-content">
+            <div class="flow-hint">
+                Break a long-form script into scenes — each with narration + image prompt + Veo3 video prompt.
+                Use <b>Send script → Storyboard</b> from the Studio tab to fill this automatically.
+            </div>
+
+            <div class="panel" data-form="scene-breakdown">
+                <h2>Scene breakdown <span class="pill">/producer/scene_breakdown</span></h2>
+                <div class="desc">
+                    Long-form mode. Pick a template, set scene count + WPM, get a list of scenes
+                    with image_prompt + flow_video_prompt ready for AutoGrok / Veo3.
+                </div>
+                <div class="form-grid">
+                    <label>Template
+                        <select id="sb-template">
+                            <option value="cinematic">cinematic</option>
+                            <option value="educational">educational</option>
+                            <option value="lifestyle">lifestyle</option>
+                            <option value="factory">factory</option>
+                        </select>
+                    </label>
+                    <label>Language
+                        <select id="sb-language">
+                            <option value="en">en</option>
+                            <option value="vi">vi</option>
+                            <option value="ko">ko</option>
+                            <option value="ja">ja</option>
+                        </select>
+                    </label>
+                    <label># scenes (blank = auto)
+                        <input id="sb-n-scenes" type="number" placeholder="auto" min="3" max="60" />
+                    </label>
+                    <label>Words per minute
+                        <input id="sb-wpm" type="number" value="150" min="90" max="200" />
+                    </label>
+                    <label class="form-row-full">Script
+                        <textarea id="sb-script" rows="10" placeholder="paste a long-form script (or click 'Send script → Storyboard' in Studio)"></textarea>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="scene-breakdown">Break into scenes</button>
+                </div>
+                <div class="result" id="sb-result"></div>
+            </div>
+        </section>
+    </main>
+    <script src="creator-forge.js"></script>
+</body>
+</html>
