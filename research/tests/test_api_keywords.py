@@ -75,6 +75,21 @@ def test_keywords_rejects_empty_seed():
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize("seed", [" ", "   ", "\t", "\n", " \t\n "])
+def test_keywords_rejects_whitespace_only_seed(seed):
+    """Whitespace-only seeds must be rejected (422), not stripped to '' and
+    silently passed to upstream calls."""
+    r = client.post("/research/keywords", json={"seed": seed, "region": "US", "language": "en"})
+    assert r.status_code == 422, r.text
+
+
+def test_keywords_strips_seed_before_use(stub_autocomplete, stub_youtube_happy):
+    """A surrounding whitespace seed should be stripped, not rejected."""
+    r = client.post("/research/keywords", json={"seed": "  ai art  ", "region": "US", "language": "en"})
+    assert r.status_code == 200, r.text
+    assert r.json()["seed"] == "ai art"
+
+
 # ─── Happy path ─────────────────────────────────────────────────────────────
 
 def test_keywords_happy_path(stub_autocomplete, stub_youtube_happy):

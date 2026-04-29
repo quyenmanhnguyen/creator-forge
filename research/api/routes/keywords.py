@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from research.core import autocomplete, keywords as kw
 from research.core import youtube as yt
@@ -37,6 +37,13 @@ class KeywordRequest(BaseModel):
     max_kgr_keywords: int = Field(25, ge=1, le=50, description="When compute_kgr=true, cap how many keywords get scored.")
     max_top_videos: int = Field(10, ge=1, le=50, description="How many top videos to hydrate for VPH + competition_score.")
     include_questions: bool = Field(True, description="Fetch question-bucket autocomplete (how/what/why/...).")
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _strip_seed(cls, v: object) -> object:
+        # Strip BEFORE min_length runs so whitespace-only inputs like " " are
+        # rejected as 422 instead of slipping through to upstream calls.
+        return v.strip() if isinstance(v, str) else v
 
 
 class KeywordRow(BaseModel):
@@ -141,7 +148,7 @@ def keywords(req: KeywordRequest) -> KeywordResponse:
     Returns a partial result with ``warnings`` populated when individual
     upstream calls fail (missing API key, network, rate limit, etc.).
     """
-    seed = req.seed.strip()
+    seed = req.seed  # already stripped by the validator
     warnings: list[str] = []
 
     # ── Long-tail autocomplete (no API key needed) ─────────────────────────

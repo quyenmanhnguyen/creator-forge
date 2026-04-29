@@ -142,6 +142,14 @@ def test_niche_rejects_empty_seed():
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize("seed", [" ", "   ", "\t", "\n"])
+def test_niche_rejects_whitespace_only_seed(seed):
+    """Whitespace-only seeds must be rejected (422), not stripped to '' and
+    silently passed to upstream YouTube / DeepSeek calls."""
+    r = client.post("/research/niche", json={"seed": seed, "region": "US", "language": "en"})
+    assert r.status_code == 422, r.text
+
+
 # ─── Happy path ─────────────────────────────────────────────────────────────
 
 def test_niche_happy_path(stub_youtube_happy, stub_autocomplete, stub_trends_empty, stub_llm_verdict):
