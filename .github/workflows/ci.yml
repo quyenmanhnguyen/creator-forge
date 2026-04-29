@@ -79,3 +79,8 @@ jobs:
           node --check desktop/electron/researchIPC.js
           for f in desktop/src/bridges/*.js; do node --check "$f"; done
           for f in desktop/src/services/*.js; do node --check "$f"; done
+
+      - name: Offline regression tests (no puppeteer install required)
+        run: |
+          node desktop/tests/test_image_service_config.js
+          node desktop/tests/test_storyboard_bridge.js

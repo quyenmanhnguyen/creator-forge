@@ -74,16 +74,32 @@ class StoryboardBridge {
      * has retry/auth/account-rotation logic) — we don't re-implement Grok
      * calls here, we just translate prompts.
      *
-     * @param {{ scenes: Array, count_per_scene?: number, account?: string }} params
+     * The IPC contract (`image:generate`) expects:
+     *   - `prompts`: string[]                          (one prompt per shot)
+     *   - `config`: { imageGenerationCount, ... }      (passed to ImageService)
+     *
+     * Earlier this method passed `count` as a top-level field and `prompts` as
+     * an array of objects, both of which were silently dropped by main.js's
+     * destructure of `{ prompts, config, startIdx }` and would crash on
+     * `prompt.substring(...)` inside `ImageService.generateBatch`.
+     *
+     * @param {{ scenes: Array, count_per_scene?: number, account?: string,
+     *           aspectRatio?: string, enablePro?: boolean }} params
      */
-    async generateImages({ scenes, count_per_scene = 4, account } = {}) {
-        const prompts = (scenes || []).map((s) => ({
-            id: s.scene_id,
-            prompt: s.image_prompt,
-            negative: s.negative_prompt || null,
-            style: s.style || null,
-        }));
-        return this.image.generate({ prompts, count: count_per_scene, account });
+    async generateImages({
+        scenes,
+        count_per_scene = 4,
+        account,
+        aspectRatio,
+        enablePro,
+    } = {}) {
+        const prompts = (scenes || [])
+            .map((s) => (s && typeof s.image_prompt === 'string' ? s.image_prompt.trim() : ''))
+            .filter((p) => p.length > 0);
+        const config = { imageGenerationCount: count_per_scene };
+        if (aspectRatio) config.aspectRatio = aspectRatio;
+        if (typeof enablePro === 'boolean') config.enablePro = enablePro;
+        return this.image.generate({ prompts, config, account });
     }
 
     /**
