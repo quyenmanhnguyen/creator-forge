@@ -178,6 +178,22 @@ npm start
 
 The Electron shell still runs on its own if the sidecar fails — only the Research / Studio / Producer tabs go dark.
 
+### Renderer modes (PR-7)
+
+By default, Electron loads the **Creator Forge UI** (`desktop/dist/creator-forge.html`) — a vanilla HTML/JS shell with three tabs:
+
+- **Research** — niche, keywords, outlier, video cloner.
+- **Studio** — 5-step wizard: topics → titles → outline → script → humanize. Click a topic to send to step 2, click a title to send to step 3, etc.
+- **Storyboard** — `/producer/scene_breakdown`. Each scene comes with `narration`, `image_prompt`, and `flow_video_prompt` ready for AutoGrok / Veo3.
+
+A small status dot in the header shows whether the Python sidecar is reachable. Warnings from the sidecar (missing API keys, partial LLM failures) are surfaced inline; the raw JSON is also available behind a `<details>` toggle for debugging.
+
+To run the legacy AutoGrok renderer instead (PR-9 will fix its image-count + moderation bugs):
+
+```bash
+CREATOR_FORGE_UI=autogrok npm run dev
+```
+
 ---
 
 ## 🔑 API keys
