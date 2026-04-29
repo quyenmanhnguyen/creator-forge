@@ -214,7 +214,7 @@ See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full data flow & schemas.
 ```bash
 # Python (research) — API tests must pass; legacy tube-atlas tests are
 # best-effort until each is ported.
-pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py -v
+pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py -v
 pytest research/tests                       # full suite
 
 # Lint
@@ -256,6 +256,28 @@ curl -s -X POST http://127.0.0.1:5050/research/outlier \
 curl -s -X POST http://127.0.0.1:5050/research/cloner \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","new_topic":"protein for cyclists","n_titles":10}' | jq
+
+# /studio/* — 5-step wizard: topic ideas -> titles -> 8-part outline -> long-form script -> humanize
+curl -s -X POST http://127.0.0.1:5050/studio/topics \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"sleep stories for adults","language":"en","n":12}' | jq
+
+curl -s -X POST http://127.0.0.1:5050/studio/titles \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"How to fall asleep in 5 minutes","language":"en","n":10,"must_keywords":"insomnia"}' | jq
+
+curl -s -X POST http://127.0.0.1:5050/studio/outline \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"5 Bedtime Tips That Work in 60 Seconds","language":"en"}' | jq
+
+# Step 4 needs the 8 parts from /studio/outline; step 5 needs the script from step 4.
+curl -s -X POST http://127.0.0.1:5050/studio/script \
+  -H 'Content-Type: application/json' \
+  -d @/tmp/script_request.json | jq        # title + parts[] + language + target_chars
+
+curl -s -X POST http://127.0.0.1:5050/studio/humanize \
+  -H 'Content-Type: application/json' \
+  -d @/tmp/humanize_request.json | jq      # script + language
 ```
 
 CI runs lint + API tests + node `--check` on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -270,7 +292,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-2** — port `01_Research.py` (keyword tab) → `/research/keywords` (**done**, see `research/api/routes/keywords.py` + `research/tests/test_api_keywords.py`).
 - **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier` (**done**, see `research/api/routes/outlier.py` + `research/tests/test_api_outlier.py`).
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner` (**done**, see `research/api/routes/cloner.py` + `research/tests/test_api_cloner.py`).
-- **PR-5** — port `04_Studio.py` (5 steps) → `/studio/*`.
+- **PR-5** — port `04_Studio.py` (5 steps) → `/studio/{topics,titles,outline,script,humanize}` (**done**, see `research/api/routes/studio.py` + `research/tests/test_api_studio.py`).
 - **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown`.
 - **PR-7** — wire `StoryboardBridge.generateImages` into `ImageService.generateBatch` end-to-end.
 - **PR-8** — port `05_Producer.py` short mode → `/producer/short` (TTS + captions + ffmpeg).
