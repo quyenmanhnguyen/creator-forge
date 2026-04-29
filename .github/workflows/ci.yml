@@ -28,7 +28,8 @@ jobs:
           pip install fastapi uvicorn pydantic python-dotenv requests \
                       langdetect openai vaderSentiment \
                       google-api-python-client pytrends pandas \
-                      youtube-transcript-api yt-dlp
+                      youtube-transcript-api yt-dlp \
+                      Pillow
 
       - name: Ruff lint
         run: ruff check research
