@@ -221,14 +221,21 @@ def _llm_clone_kit(
         warnings.append(f"Clone kit failed: {type(exc).__name__}: {exc}")
         return None
 
-    titles = list(data.get("title_clones", []) or [])[:n_titles]
-    return CloneKit(
-        hook_analysis=str(data.get("hook_analysis", "")),
-        title_clones=[str(t) for t in titles],
-        script=str(data.get("script", "")),
-        thumbnail_copy=[str(t) for t in (data.get("thumbnail_copy", []) or [])],
-        tags=[str(t) for t in (data.get("tags", []) or [])],
-    )
+    # Construction can still raise on unexpected field types (e.g. an LLM
+    # returning ``"title_clones": 12345`` makes ``list(int)`` raise TypeError).
+    # Keep the partial-200 contract instead of letting it become a 500.
+    try:
+        titles = list(data.get("title_clones", []) or [])[:n_titles]
+        return CloneKit(
+            hook_analysis=str(data.get("hook_analysis", "")),
+            title_clones=[str(t) for t in titles],
+            script=str(data.get("script", "")),
+            thumbnail_copy=[str(t) for t in (data.get("thumbnail_copy", []) or [])],
+            tags=[str(t) for t in (data.get("tags", []) or [])],
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Clone kit parse failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 # ─── Endpoint ───────────────────────────────────────────────────────────────

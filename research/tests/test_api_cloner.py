@@ -276,6 +276,45 @@ def test_cloner_llm_returns_invalid_json(monkeypatch, video_item, transcript_seg
     assert any("invalid JSON" in w for w in body["warnings"])
 
 
+@pytest.mark.parametrize(
+    "bad_kit",
+    [
+        # title_clones is an int → list(int) raises TypeError.
+        {"hook_analysis": "x", "title_clones": 12345, "script": "x",
+         "thumbnail_copy": [], "tags": []},
+        # thumbnail_copy is a non-iterable → list(...) raises.
+        {"hook_analysis": "x", "title_clones": [], "script": "x",
+         "thumbnail_copy": 42, "tags": []},
+        # tags is non-iterable.
+        {"hook_analysis": "x", "title_clones": [], "script": "x",
+         "thumbnail_copy": [], "tags": 99},
+    ],
+)
+def test_cloner_kit_parse_failure_no_500(monkeypatch, video_item, transcript_segments, bad_kit):
+    """Regression: DeepSeek returning a non-iterable for any list field must
+    NOT crash the route. Expect 200 + ``kit=None`` + parse-failure warning,
+    while fingerprint and transcript stay populated."""
+    monkeypatch.setattr(cloner_route.yt, "videos_details", lambda ids: [video_item])
+    monkeypatch.setattr(
+        cloner_route.transcript, "fetch_transcript", lambda vid, languages=None: transcript_segments
+    )
+    monkeypatch.setattr(cloner_route.lang_detect, "detect_lang", lambda text, default="en": "en")
+    monkeypatch.setattr(
+        cloner_route.llm,
+        "chat_json",
+        lambda prompt, system=None, model=None: json.dumps(bad_kit),
+    )
+
+    r = client.post("/research/cloner", json={"url": "abcd1234XYZ"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kit"] is None
+    assert any("Clone kit parse failed" in w for w in body["warnings"]), body["warnings"]
+    # Fingerprint + transcript should still be present.
+    assert body["fingerprint"]["title"] != ""
+    assert body["transcript_segments"] == 3
+
+
 def test_cloner_accepts_youtu_be_short_url(stub_happy):
     """Confirms parse_video_id works through the route for youtu.be format."""
     r = client.post("/research/cloner", json={"url": "https://youtu.be/abcd1234XYZ?t=42"})
