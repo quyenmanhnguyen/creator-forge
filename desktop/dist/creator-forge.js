@@ -46,6 +46,10 @@
     }
 
     // ─── Sidecar status indicator ──────────────────────────────────────────
+    // Track whether the sidecar has ever been ready so we can distinguish
+    // "still booting" (cold start, first ~5–30s) from "went down later".
+    let sidecarHasBeenReady = false;
+
     async function refreshSidecarStatus() {
         const dot = $('sidecar-dot');
         const label = $('sidecar-label');
@@ -55,14 +59,24 @@
             return;
         }
         // Use a known cheap endpoint. /producer/voices is GET and returns
-        // immediately even when no key is configured.
+        // immediately even when no key is configured. While the sidecar is
+        // still booting, researchIPC.js returns { ready: false } as a soft
+        // sentinel instead of throwing, so we don't pollute the main log.
         try {
-            await api.producer.listVoices();
+            const resp = await api.producer.listVoices();
+            if (resp && resp.ready === false) {
+                dot.classList.remove('ok'); dot.classList.add('err');
+                label.textContent = 'starting sidecar...';
+                return;
+            }
+            sidecarHasBeenReady = true;
             dot.classList.remove('err'); dot.classList.add('ok');
             label.textContent = 'sidecar ready';
         } catch (err) {
             dot.classList.remove('ok'); dot.classList.add('err');
-            label.textContent = 'sidecar not reachable — check `npm run dev`';
+            label.textContent = sidecarHasBeenReady
+                ? 'sidecar not reachable — check `npm run dev`'
+                : 'starting sidecar...';
         }
     }
 
