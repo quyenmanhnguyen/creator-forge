@@ -55,9 +55,14 @@ class ImageService {
      */
     buildBody(prompt, config = {}) {
         const aspectRatio = config.aspectRatio || '1:1';
-        const imageCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2;
+        // Pro mode on Grok Imagine returns a single high-quality image and
+        // suppresses `enable_side_by_side`. When the caller wants a batch
+        // (>1) we must keep Pro off; when the caller explicitly asks for
+        // Pro we force the count to 1 to match server behavior.
+        const enablePro = config.enablePro === true;
+        const requestedCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2;
+        const imageCount = enablePro ? 1 : requestedCount;
         const enableNsfw = config.enableNsfw === false ? false : true;
-        const enablePro = config.enablePro !== false ? true : false;
         return {
             temporary: false,
             modelName: 'grok-3',
@@ -100,10 +105,12 @@ class ImageService {
     }
 
     buildApiBody(prompt, config = {}) {
+        const enablePro = config.enablePro === true;
+        const requestedCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2;
         return {
             model: config.imageModel || process.env.XAI_IMAGE_MODEL || 'grok-imagine-image',
             prompt,
-            n: config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2,
+            n: enablePro ? 1 : requestedCount,
             response_format: 'b64_json',
             aspect_ratio: config.aspectRatio || '1:1',
         };
@@ -141,9 +148,13 @@ class ImageService {
         const page = session._page;
 
         const aspectRatio = config.aspectRatio || '1:1';
-        const imageCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2;
+        // Pro is opt-in. When enabled, server returns a single Pro image and
+        // ignores `enable_side_by_side`, so we cap the requested count at 1
+        // to keep round/maybeAdvance accounting honest.
+        const enablePro = config.enablePro === true;
+        const requestedCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 2;
+        const imageCount = enablePro ? 1 : requestedCount;
         const enableNsfw = config.enableNsfw === false ? false : true;
-        const enablePro = config.enablePro !== false ? true : false; // default ON for quality
 
         try {
             // The websocket connects from the page origin, so we must be on grok.com.
@@ -163,6 +174,10 @@ class ImageService {
                 const STREAM_IDLE_MS = 30000;
                 const INTER_ROUND_GRACE_MS = 2000;
                 const MAX_ROUNDS = 4;
+                // Smaller blobs are streaming preview frames or moderation
+                // placeholders. Reject in both harvest paths so we never
+                // surface a blurred/redacted image as a final.
+                const MIN_BLOB_LEN = 50000;
 
                 function buildReset() {
                     return {
@@ -225,9 +240,8 @@ class ImageService {
 
                 function harvestPartialFinals() {
                     // Promote any slot with a buffered blob but no `completed` frame into
-                    // a final image. Skip tiny blobs (< 50000 base64 chars ≈ 37KB decoded)
-                    // which are just blurred preview frames, not real images.
-                    const MIN_BLOB_LEN = 50000;
+                    // a final image. Skip tiny blobs (< MIN_BLOB_LEN base64 chars ≈ 37KB
+                    // decoded) which are just blurred preview frames, not real images.
                     for (const slot of slots.values()) {
                         if (!slot.done && slot.last_blob && slot.last_blob.length >= MIN_BLOB_LEN && !seenFinals.has(slot.image_id)) {
                             seenFinals.add(slot.image_id);
@@ -334,7 +348,11 @@ class ImageService {
                             slot.moderated = !!msg.moderated;
                             slot.r_rated = !!msg.r_rated;
 
-                            if (slot.last_blob && !seenFinals.has(imageId)) {
+                            const blobLen = (slot.last_blob || '').length;
+                            // Reject blobs smaller than MIN_BLOB_LEN — those are streaming
+                            // preview placeholders or moderation-redacted thumbnails. Letting
+                            // them through caused PR-9 bug: "final image is blurred / tiny".
+                            if (slot.last_blob && blobLen >= MIN_BLOB_LEN && !seenFinals.has(imageId)) {
                                 seenFinals.add(imageId);
                                 finals.push({
                                     blob: slot.last_blob,
@@ -344,9 +362,9 @@ class ImageService {
                                     moderated: slot.moderated,
                                     r_rated: slot.r_rated,
                                 });
-                                debug.push('completed order=' + slot.order + ' blob_len=' + slot.last_blob.length + ' mod=' + slot.moderated);
+                                debug.push('completed order=' + slot.order + ' blob_len=' + blobLen + ' mod=' + slot.moderated);
                             } else {
-                                debug.push('completed order=' + slot.order + ' NO_BLOB mod=' + slot.moderated);
+                                debug.push('completed order=' + slot.order + ' REJECTED blob_len=' + blobLen + ' mod=' + slot.moderated);
                             }
                             maybeAdvance();
                         }
@@ -413,7 +431,8 @@ class ImageService {
             // WS debug summary (console only — no file writes in production)
 
             const finals = wsResult.finals || [];
-            console.log('[ImageService] 🔌 WS finals: ' + finals.length + ' (errors: ' + (wsResult.errors || []).length + ')');
+            const moderatedCount = finals.filter(f => f.moderated).length;
+            console.log('[ImageService] 🔌 WS finals: ' + finals.length + ' (moderated: ' + moderatedCount + ', errors: ' + (wsResult.errors || []).length + ')');
 
             if (finals.length === 0) {
                 if ((wsResult.errors || []).length > 0) {
@@ -428,6 +447,7 @@ class ImageService {
                 imageBase64: [],
                 error: null,
                 status: 200,
+                moderatedCount,
             };
 
             // Sort by blob size descending — prioritize highest-quality images

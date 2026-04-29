@@ -375,6 +375,36 @@ The renderer is loaded directly from `desktop/dist/`, no bundler step.
 Just `Cmd/Ctrl+R` (View → Reload) inside the Electron window — no rebuild
 needed.
 
+### Grok image generation only returns 1 image instead of 4
+Fixed in PR-9. Root cause: `ImageService.buildBody` and the Imagine WS
+request used to default `enable_pro: true`. With Pro on, the Grok server
+returns a *single* high-quality Pro image and silently ignores
+`enable_side_by_side`, so even if you asked for `imageGenerationCount: 4`
+you would only ever get 1 image back. PR-9 flips the default — Pro is now
+opt-in (`config.enablePro: true`), and when set the request count is
+clamped to 1 to match server behavior. Same fix applied in
+`RefImageService` for the image-edit / ref flow.
+
+### Grok images come back blurred / suspiciously small (~25–37 KB)
+Fixed in PR-9. The Imagine WS streams base64 preview frames during
+generation; when moderation triggers mid-stream the server emits a small
+placeholder blob right before `current_status: "completed"`. The pre-PR-9
+code unconditionally promoted that placeholder to a "final" image. PR-9
+applies the same `MIN_BLOB_LEN` (≈ 50 000 base64 chars / 37 KB decoded)
+filter inside the `completed` handler that `harvestPartialFinals` already
+used, and surfaces a `moderatedCount` field on the result so callers can
+distinguish moderation rejects from normal failures.
+
+### `npm run dev` works but `count_per_scene` from Storyboard is ignored
+Fixed in PR-9. `StoryboardBridge.generateImages` used to send
+`{ prompts: object[], count, account }`, but the IPC handler
+`image:generate` destructures `{ prompts, config, startIdx }` — `count`
+was silently dropped, and the object-shaped `prompts` would crash
+`ImageService.generateBatch` when it tried `prompt.substring(...)`. PR-9
+forwards string prompts and packages count as
+`config.imageGenerationCount`, so the storyboard → image flow now
+honors the per-scene count.
+
 ---
 
 ## 🗺 Roadmap
@@ -389,7 +419,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-6** — port `05_Producer.py` long-form mode → `/producer/scene_breakdown` (**done**, see `research/api/routes/producer.py` + `research/tests/test_api_producer.py`).
 - **PR-7** — Electron renderer UI (`desktop/dist/creator-forge.html` + `.js`) with Research / Studio / Storyboard tabs, sidecar status dot, cross-tab handoff (**done**).
 - **PR-8** — port `05_Producer.py` short mode → `/producer/short` (Edge-TTS + captions + ffmpeg compose, real `/producer/voices` and `/producer/providers`) (**done**, see `research/api/routes/producer.py::compose_short` + `research/tests/test_api_producer.py`).
-- **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3.
+- **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3 (**done**, see `desktop/src/services/ImageService.js`, `desktop/src/services/RefImageService.js`, `desktop/src/bridges/StoryboardBridge.js`, and `desktop/tests/test_image_service_config.js` / `test_storyboard_bridge.js`).
 - **PR-10** — polish: probe-and-reuse for the sidecar (no port-conflict crashes when uvicorn is started in a separate terminal), expanded README setup, troubleshooting section.
 
 ---

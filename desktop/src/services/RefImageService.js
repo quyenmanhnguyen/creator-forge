@@ -150,9 +150,11 @@ class RefImageService {
      * Now includes enableNsfw, enablePro, and correct imageGenerationCount
      */
     buildRefImageBody(prompt, imageUrls, parentPostId, config = {}) {
-        const imageCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 4;
+        // Pro mode forces single-image output; opt-in only.
+        const enablePro = config.enablePro === true;
+        const requestedCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 4;
+        const imageCount = enablePro ? 1 : requestedCount;
         const enableNsfw = config.enableNsfw === false ? false : true;
-        const enablePro = config.enablePro !== false ? true : false;
         return {
             temporary: true,
             modelName: MODEL_CONFIG.REF_IMAGE_MODEL,
@@ -380,9 +382,12 @@ class RefImageService {
         const page = session._page;
 
         const aspectRatio = config.aspectRatio || '1:1';
-        const imageCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 4;
+        // Pro is opt-in. When enabled, server returns a single Pro image and
+        // ignores `enable_side_by_side`, so cap requested count at 1.
+        const enablePro = config.enablePro === true;
+        const requestedCount = config.imageGenerationCount || config.count || IMAGE_CONFIG.imageGenerationCount || 4;
+        const imageCount = enablePro ? 1 : requestedCount;
         const enableNsfw = config.enableNsfw === false ? false : true;
-        const enablePro = config.enablePro !== false ? true : false;
 
         try {
             const currentUrl = page.url();
@@ -400,6 +405,9 @@ class RefImageService {
                 const STREAM_IDLE_MS = 30000;
                 const INTER_ROUND_GRACE_MS = 2000;
                 const MAX_ROUNDS = 4;
+                // Reject blobs smaller than this (≈ 37KB decoded) — streaming
+                // preview frames or moderation placeholders, never real images.
+                const MIN_BLOB_LEN = 50000;
 
                 function buildReset() {
                     return {
@@ -457,7 +465,6 @@ class RefImageService {
                 let finished = false;
 
                 function harvestPartialFinals() {
-                    const MIN_BLOB_LEN = 50000;
                     for (const slot of slots.values()) {
                         if (!slot.done && slot.last_blob && slot.last_blob.length >= MIN_BLOB_LEN && !seenFinals.has(slot.image_id)) {
                             seenFinals.add(slot.image_id);
@@ -545,16 +552,19 @@ class RefImageService {
                             slot.done = true;
                             slot.moderated = !!msg.moderated;
                             slot.r_rated = !!msg.r_rated;
-                            if (slot.last_blob && !seenFinals.has(imageId)) {
+                            const blobLen = (slot.last_blob || '').length;
+                            // Reject blobs below MIN_BLOB_LEN — those are preview
+                            // frames or moderation placeholders. Same fix as ImageService.
+                            if (slot.last_blob && blobLen >= MIN_BLOB_LEN && !seenFinals.has(imageId)) {
                                 seenFinals.add(imageId);
                                 finals.push({
                                     blob: slot.last_blob, url: slot.last_url,
                                     image_id: imageId, order: slot.order,
                                     moderated: slot.moderated, r_rated: slot.r_rated,
                                 });
-                                debug.push('completed order=' + slot.order + ' blob_len=' + slot.last_blob.length + ' mod=' + slot.moderated);
+                                debug.push('completed order=' + slot.order + ' blob_len=' + blobLen + ' mod=' + slot.moderated);
                             } else {
-                                debug.push('completed order=' + slot.order + ' NO_BLOB mod=' + slot.moderated);
+                                debug.push('completed order=' + slot.order + ' REJECTED blob_len=' + blobLen + ' mod=' + slot.moderated);
                             }
                             maybeAdvance();
                         }
@@ -600,7 +610,8 @@ class RefImageService {
             }
 
             const finals = wsResult.finals || [];
-            console.log(`[RefImageService] 🔌 WS finals: ${finals.length} (errors: ${(wsResult.errors || []).length})`);
+            const moderatedCount = finals.filter(f => f.moderated).length;
+            console.log(`[RefImageService] 🔌 WS finals: ${finals.length} (moderated: ${moderatedCount}, errors: ${(wsResult.errors || []).length})`);
 
             if (finals.length === 0) {
                 if ((wsResult.errors || []).length > 0) {
@@ -609,7 +620,7 @@ class RefImageService {
                 return null;
             }
 
-            const result = { title: '', imageUrls: [], imageBase64: [], error: null, status: 200 };
+            const result = { title: '', imageUrls: [], imageBase64: [], error: null, status: 200, moderatedCount };
 
             finals.sort((a, b) => (b.blob || '').length - (a.blob || '').length);
             const trimmedFinals = finals.slice(0, imageCount);
