@@ -59,21 +59,24 @@
             return;
         }
         // Use a known cheap endpoint. /producer/voices is GET and returns
-        // immediately even when no key is configured.
+        // immediately even when no key is configured. While the sidecar is
+        // still booting, researchIPC.js returns { ready: false } as a soft
+        // sentinel instead of throwing, so we don't pollute the main log.
         try {
-            await api.producer.listVoices();
+            const resp = await api.producer.listVoices();
+            if (resp && resp.ready === false) {
+                dot.classList.remove('ok'); dot.classList.add('err');
+                label.textContent = 'starting sidecar...';
+                return;
+            }
             sidecarHasBeenReady = true;
             dot.classList.remove('err'); dot.classList.add('ok');
             label.textContent = 'sidecar ready';
         } catch (err) {
             dot.classList.remove('ok'); dot.classList.add('err');
-            // researchIPC.js throws "research sidecar is not running" while the
-            // Python subprocess is still booting. Treat that as a soft state.
-            const msg = (err && err.message) ? String(err.message) : '';
-            const stillBooting = !sidecarHasBeenReady && /sidecar is not running/i.test(msg);
-            label.textContent = stillBooting
-                ? 'starting sidecar...'
-                : 'sidecar not reachable — check `npm run dev`';
+            label.textContent = sidecarHasBeenReady
+                ? 'sidecar not reachable — check `npm run dev`'
+                : 'starting sidecar...';
         }
     }
 

@@ -70,11 +70,23 @@ const CHANNELS = {
     'producer:listProviders':     { method: 'GET',  path: '/producer/providers' },
 };
 
+// `producer:listVoices` is the channel the renderer polls every 5s for the
+// status-dot indicator. Treat "sidecar not ready yet" as a soft state for this
+// channel only — return a sentinel object instead of throwing, so the
+// main-process log stays quiet during cold start. All other channels still
+// throw (user explicitly clicked Run, so a hard error is appropriate).
+const SOFT_NOT_READY_CHANNELS = new Set(['producer:listVoices']);
+
 function register({ ipcMain, sidecar }) {
     for (const [channel, route] of Object.entries(CHANNELS)) {
         ipcMain.handle(channel, async (_event, payload) => {
             const port = sidecar.getPort();
-            if (!port) throw new Error('research sidecar is not running');
+            if (!port) {
+                if (SOFT_NOT_READY_CHANNELS.has(channel)) {
+                    return { ready: false, status: 'sidecar starting' };
+                }
+                throw new Error('research sidecar is not running');
+            }
             return jsonRequest(port, route.method, route.path, payload ?? null);
         });
     }
