@@ -46,6 +46,10 @@
     }
 
     // ─── Sidecar status indicator ──────────────────────────────────────────
+    // Track whether the sidecar has ever been ready so we can distinguish
+    // "still booting" (cold start, first ~5–30s) from "went down later".
+    let sidecarHasBeenReady = false;
+
     async function refreshSidecarStatus() {
         const dot = $('sidecar-dot');
         const label = $('sidecar-label');
@@ -58,11 +62,18 @@
         // immediately even when no key is configured.
         try {
             await api.producer.listVoices();
+            sidecarHasBeenReady = true;
             dot.classList.remove('err'); dot.classList.add('ok');
             label.textContent = 'sidecar ready';
         } catch (err) {
             dot.classList.remove('ok'); dot.classList.add('err');
-            label.textContent = 'sidecar not reachable — check `npm run dev`';
+            // researchIPC.js throws "research sidecar is not running" while the
+            // Python subprocess is still booting. Treat that as a soft state.
+            const msg = (err && err.message) ? String(err.message) : '';
+            const stillBooting = !sidecarHasBeenReady && /sidecar is not running/i.test(msg);
+            label.textContent = stillBooting
+                ? 'starting sidecar...'
+                : 'sidecar not reachable — check `npm run dev`';
         }
     }
 

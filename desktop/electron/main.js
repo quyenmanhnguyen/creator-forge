@@ -259,11 +259,17 @@ app.whenReady().then(async () => {
 
     // creator-forge: spawn the Python research sidecar in the background. Failure
     // is non-fatal — log it and let the user retry from the UI.
+    //
+    // Register IPC handlers BEFORE start() so that the renderer's first-load poll
+    // (refreshSidecarStatus → producer:listVoices) hits a registered channel that
+    // returns a friendly "sidecar is not running" error instead of Electron's
+    // "No handler registered" log noise. Once the sidecar is healthy, getPort()
+    // starts returning a port and the same handlers proxy through normally.
     researchSidecar.setLogSink((level, ...args) => writeRuntimeLog(level || 'info', '[research]', ...args));
+    researchIPC.register({ ipcMain, sidecar: researchSidecar });
     researchSidecar
         .start()
         .then(({ port }) => {
-            researchIPC.register({ ipcMain, sidecar: researchSidecar });
             console.log(`[research] sidecar ready on :${port}`);
         })
         .catch((err) => {
