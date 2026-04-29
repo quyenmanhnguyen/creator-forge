@@ -1,0 +1,25 @@
+{
+  "name": "creator-forge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end YouTube creator suite — research → script → storyboard → AI image/video gen (Grok+Veo3) → final product. Fusion of autogrok-veo3 (Electron base) + tube-atlas-oss (research toolkit).",
+  "homepage": "https://github.com/quyenmanhnguyen/creator-forge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quyenmanhnguyen/creator-forge.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently -n research,desktop -c blue,magenta \"npm:dev:research\" \"npm:dev:desktop\"",
+    "dev:research": "uvicorn research.api.main:app --host 127.0.0.1 --port 5050 --reload",
+    "dev:desktop": "cd desktop && npm start",
+    "install:all": "cd desktop && npm install && cd .. && pip install -r research/requirements.txt",
+    "lint:py": "ruff check research",
+    "lint:js": "cd desktop && npm run lint || true",
+    "test:py": "pytest research/tests",
+    "test": "npm run lint:py && npm run test:py"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

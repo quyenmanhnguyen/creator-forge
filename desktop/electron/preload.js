@@ -1,0 +1,117 @@
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+contextBridge.exposeInMainWorld('electronAPI', {
+    getPathForFile: (file) => webUtils.getPathForFile(file),
+    selectFolder: () => ipcRenderer.invoke('file:selectFolder'),
+    selectFiles: (options) => ipcRenderer.invoke('file:selectFiles', options),
+    getImagesFromFolder: (folderPath) => ipcRenderer.invoke('file:getImagesFromFolder', folderPath),
+    readFile: (filePath) => ipcRenderer.invoke('file:readFile', filePath),
+    getFileUrl: (filePath) => ipcRenderer.invoke('file:getFileUrl', filePath),
+    openFolder: (folderPath) => ipcRenderer.invoke('file:openFolder', folderPath),
+    openPath: (filePath) => ipcRenderer.invoke('file:openPath', filePath),
+    showItemInFolder: (filePath) => ipcRenderer.invoke('file:showItemInFolder', filePath),
+    deleteFile: (filePath) => ipcRenderer.invoke('file:deleteFile', filePath),
+
+    auth: {
+        login: (credentials) => ipcRenderer.invoke('auth:login', credentials),
+        getAccounts: () => ipcRenderer.invoke('auth:getAccounts'),
+        saveAccounts: (accounts) => ipcRenderer.invoke('auth:saveAccounts', accounts),
+        setupAccounts: (accounts) => ipcRenderer.invoke('auth:setupAccounts', accounts),
+        importTxt: () => ipcRenderer.invoke('account:importTxt'),
+    },
+
+    license: {
+        check: () => ipcRenderer.invoke('license:check'),
+        validate: (key) => ipcRenderer.invoke('license:validate', key),
+        deactivate: () => ipcRenderer.invoke('license:deactivate'),
+        getMachineId: () => ipcRenderer.invoke('license:getMachineId'),
+    },
+
+    api: {
+        backendLogin: (params) => ipcRenderer.invoke('api:backendLogin', params),
+        backendVerifyToken: (params) => ipcRenderer.invoke('api:backendVerifyToken', params),
+        backendGetProfile: (params) => ipcRenderer.invoke('api:backendGetProfile', params),
+        backendLogout: (params) => ipcRenderer.invoke('api:backendLogout', params),
+    },
+
+    assistant: {
+        open: (url) => ipcRenderer.invoke('assistant:open', url),
+    },
+
+    image: {
+        generate: (params) => ipcRenderer.invoke('image:generate', params),
+        cancel: () => ipcRenderer.invoke('image:cancel'),
+    },
+
+    video: {
+        generate: (params) => ipcRenderer.invoke('video:generate', params),
+        merge: (params) => ipcRenderer.invoke('video:merge', params),
+    },
+
+    i2v: {
+        generate: (params) => ipcRenderer.invoke('i2v:generate', params),
+    },
+
+    refimg: {
+        generate: (params) => ipcRenderer.invoke('refimg:generate', params),
+    },
+
+    onProgress: (callback) => {
+        ipcRenderer.on('job:progress', (_, data) => callback(data));
+    },
+
+    onLog: (callback) => {
+        ipcRenderer.on('log', (_, data) => callback(data));
+    },
+
+    removeProgressListener: () => {
+        ipcRenderer.removeAllListeners('job:progress');
+    },
+
+    removeLogListener: () => {
+        ipcRenderer.removeAllListeners('log');
+    },
+
+    // creator-forge: research / studio / storyboard / producer namespaces.
+    // Each method maps 1:1 to an IPC channel registered by researchIPC.js.
+    research: {
+        searchNiche: (params) => ipcRenderer.invoke('research:searchNiche', params),
+        keywordIdeas: (params) => ipcRenderer.invoke('research:keywordIdeas', params),
+        outlierFinder: (params) => ipcRenderer.invoke('research:outlierFinder', params),
+        videoCloner: (params) => ipcRenderer.invoke('research:videoCloner', params),
+    },
+
+    studio: {
+        topics: (params) => ipcRenderer.invoke('studio:topics', params),
+        titles: (params) => ipcRenderer.invoke('studio:titles', params),
+        outline: (params) => ipcRenderer.invoke('studio:outline', params),
+        script: (params) => ipcRenderer.invoke('studio:script', params),
+        humanize: (params) => ipcRenderer.invoke('studio:humanize', params),
+    },
+
+    storyboard: {
+        fromScript: (params) => ipcRenderer.invoke('storyboard:fromScript', params),
+        thumbnail: (params) => ipcRenderer.invoke('storyboard:thumbnail', params),
+    },
+
+    producer: {
+        composeShort: (params) => ipcRenderer.invoke('producer:composeShort', params),
+        listVoices: () => ipcRenderer.invoke('producer:listVoices'),
+        listProviders: () => ipcRenderer.invoke('producer:listProviders'),
+    },
+
+    updater: {
+        checkForUpdates: () => ipcRenderer.invoke('updater:checkForUpdates'),
+        downloadUpdate: () => ipcRenderer.invoke('updater:downloadUpdate'),
+        quitAndInstall: () => ipcRenderer.invoke('updater:quitAndInstall'),
+        getStatus: () => ipcRenderer.invoke('updater:getStatus'),
+        onUpdateEvent: (callback) => {
+            const subscription = (_event, data) => callback(data);
+            ipcRenderer.on('auto-updater', subscription);
+            return subscription;
+        },
+        removeUpdateListener: (callback) => {
+            ipcRenderer.removeListener('auto-updater', callback);
+        }
+    },
+});

@@ -1,0 +1,6 @@
+[lint]
+select = ["E", "F", "W"]
+ignore = ["E402", "E501", "E702"]
+
+[lint.per-file-ignores]
+"pages/*.py" = ["E402", "E501", "E702"]

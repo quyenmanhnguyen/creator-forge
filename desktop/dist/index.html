@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>AutoGrok ::: CRACK BY KCRACKER</title>
+        <script>window.global = window;
+                window.process = window.process || { env: {} };</script>
+        <script defer="defer" src="renderer.js"></script>
+<style>
+:root {
+  --bg-primary: #0a0a1a;
+  --bg-secondary: #111127;
+  --bg-tertiary: #161637;
+  --bg-card: #1a1a3a;
+  --accent: #00e5ff;
+  --accent2: #7c4dff;
+  --accent-glow: rgba(0,229,255,0.15);
+  --text-primary: #e8eaf6;
+  --text-secondary: #9fa8da;
+  --border: rgba(255,255,255,0.08);
+  --success: #00e676;
+  --error: #ff5252;
+  --warning: #ffd740;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-primary) !important;
+  color: var(--text-primary);
+  font-family: 'Segoe UI', -apple-system, sans-serif !important;
+  overflow: hidden;
+}
+
+#root { height: 100vh; }
+
+/* ===== VIDEO/IMAGE PREVIEW MODAL FIX ===== */
+.video-preview-modal,
+.video-preview-overlay {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  background: rgba(0,0,0,0.85) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  z-index: 99999 !important;
+  backdrop-filter: blur(8px) !important;
+}
+
+.video-preview-content {
+  max-width: 90vw !important;
+  max-height: 85vh !important;
+  background: var(--bg-secondary) !important;
+  border-radius: 16px !important;
+  padding: 20px !important;
+  border: 1px solid rgba(0,229,255,0.2) !important;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.6), 0 0 40px rgba(0,229,255,0.1) !important;
+  position: relative !important;
+}
+
+.video-preview-content img,
+.video-preview-content video {
+  max-width: 80vw !important;
+  max-height: 70vh !important;
+  border-radius: 8px !important;
+  display: block !important;
+}
+
+.video-preview-content .close-button,
+.video-preview-content button {
+  position: absolute !important;
+  top: 8px !important;
+  right: 8px !important;
+  background: rgba(255,82,82,0.8) !important;
+  border: none !important;
+  color: #fff !important;
+  width: 32px !important;
+  height: 32px !important;
+  border-radius: 50% !important;
+  cursor: pointer !important;
+  font-size: 16px !important;
+  z-index: 10 !important;
+}
+
+/* ===== APP CONTAINER ===== */
+.app-container {
+  background: var(--bg-primary) !important;
+  color: var(--text-primary) !important;
+}
+
+/* ===== TOP HEADER / NAVBAR ===== */
+.header, .navbar, .top-bar, [class*="header"], [class*="navbar"] {
+  background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%) !important;
+  border-bottom: 1px solid var(--border) !important;
+  box-shadow: 0 2px 20px rgba(0,0,0,0.3) !important;
+}
+
+/* ===== TABS ===== */
+.tab-button, [class*="tab-btn"], [class*="tab-item"], [class*="TabButton"] {
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid transparent !important;
+  border-radius: 10px !important;
+  padding: 8px 20px !important;
+  font-weight: 500 !important;
+  transition: all 0.3s ease !important;
+  cursor: pointer !important;
+}
+
+.tab-button:hover, [class*="tab-btn"]:hover {
+  color: var(--accent) !important;
+  border-color: rgba(0,229,255,0.2) !important;
+  background: rgba(0,229,255,0.05) !important;
+}
+
+.tab-button.active, [class*="tab-btn"].active,
+.tab-button[class*="active"], [class*="tab-btn"][class*="active"] {
+  background: linear-gradient(135deg, rgba(0,229,255,0.15), rgba(124,77,255,0.15)) !important;
+  color: var(--accent) !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 20px rgba(0,229,255,0.1) !important;
+}
+
+/* ===== PANELS ===== */
+.panel, .left-panel, .right-panel, .input-panel, .output-panel,
+[class*="panel"], [class*="Panel"] {
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+}
+
+.panel-title, [class*="panel-title"] {
+  color: var(--accent) !important;
+  font-weight: 600 !important;
+  font-size: 14px !important;
+}
+
+/* ===== INPUT FIELDS ===== */
+input[type="text"], input[type="password"], input[type="number"],
+textarea, select, [class*="input"], [class*="textarea"] {
+  background: var(--bg-primary) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid rgba(255,255,255,0.1) !important;
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-size: 13px !important;
+  transition: border-color 0.3s, box-shadow 0.3s !important;
+  outline: none !important;
+}
+
+input:focus, textarea:focus, select:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 12px rgba(0,229,255,0.15) !important;
+}
+
+/* ===== BUTTONS ===== */
+button, .btn, [class*="btn-"] {
+  border-radius: 10px !important;
+  font-weight: 500 !important;
+  transition: all 0.3s ease !important;
+  cursor: pointer !important;
+}
+
+.btn-primary, [class*="start"], [class*="Start"] {
+  background: linear-gradient(135deg, #00e5ff, #7c4dff) !important;
+  color: #fff !important;
+  border: none !important;
+  box-shadow: 0 4px 20px rgba(0,229,255,0.25) !important;
+}
+
+.btn-primary:hover, [class*="start"]:hover {
+  box-shadow: 0 6px 28px rgba(0,229,255,0.4) !important;
+  transform: translateY(-1px) !important;
+}
+
+.btn-danger, [class*="stop"], [class*="Stop"] {
+  background: linear-gradient(135deg, #ff5252, #ff1744) !important;
+  color: #fff !important;
+  border: none !important;
+}
+
+.btn-secondary, [class*="clear"], [class*="Clear"] {
+  background: rgba(255,255,255,0.06) !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid var(--border) !important;
+}
+
+/* ===== TABLE ===== */
+table, .job-table, [class*="table"] {
+  border-collapse: separate !important;
+  border-spacing: 0 4px !important;
+}
+
+thead th, .table-header th {
+  background: var(--bg-tertiary) !important;
+  color: var(--text-secondary) !important;
+  font-weight: 600 !important;
+  font-size: 12px !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.5px !important;
+  padding: 10px 12px !important;
+  border: none !important;
+}
+
+tbody tr, .table-row {
+  background: var(--bg-card) !important;
+  transition: background 0.2s !important;
+}
+
+tbody tr:hover, .table-row:hover {
+  background: rgba(0,229,255,0.05) !important;
+}
+
+tbody td {
+  padding: 10px 12px !important;
+  border: none !important;
+  color: var(--text-primary) !important;
+  font-size: 13px !important;
+}
+
+/* ===== PROGRESS BAR ===== */
+.progress-bar, [class*="progress"] {
+  background: rgba(255,255,255,0.06) !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+
+.progress-bar-fill, [class*="progress-fill"], [class*="progress"] > div {
+  background: linear-gradient(90deg, #00e5ff, #7c4dff) !important;
+  border-radius: 8px !important;
+  transition: width 0.4s ease !important;
+}
+
+/* ===== STATUS BADGES ===== */
+.status-done, [class*="done"], [class*="DONE"] {
+  color: var(--success) !important;
+  font-weight: 600 !important;
+}
+
+.status-error, [class*="error"], [class*="ERROR"] {
+  color: var(--error) !important;
+}
+
+.status-running, [class*="running"], [class*="RUNNING"] {
+  color: var(--warning) !important;
+}
+
+/* ===== LOG PANEL ===== */
+.log-panel, .logs, [class*="log-panel"], [class*="log-container"] {
+  background: var(--bg-primary) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+  font-family: 'Cascadia Code', 'Fira Code', monospace !important;
+  font-size: 12px !important;
+}
+
+.log-entry, [class*="log-entry"], [class*="log-item"] {
+  padding: 4px 8px !important;
+  border-bottom: 1px solid rgba(255,255,255,0.03) !important;
+}
+
+/* ===== SIDEBAR / CONFIG ===== */
+.config-panel, .sidebar, [class*="config"], [class*="sidebar"] {
+  background: var(--bg-secondary) !important;
+}
+
+label {
+  color: var(--text-secondary) !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+}
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(0,229,255,0.2);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(0,229,255,0.4); }
+
+/* ===== SLIDER ===== */
+input[type="range"] {
+  -webkit-appearance: none !important;
+  background: rgba(255,255,255,0.06) !important;
+  height: 6px !important;
+  border-radius: 3px !important;
+  outline: none !important;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none !important;
+  width: 16px !important;
+  height: 16px !important;
+  border-radius: 50% !important;
+  background: var(--accent) !important;
+  cursor: pointer !important;
+  box-shadow: 0 0 8px rgba(0,229,255,0.4) !important;
+}
+
+/* ===== ICON BUTTONS ===== */
+.review-btn, [title="Xem kết quả"] {
+  cursor: pointer !important;
+  font-size: 18px !important;
+  transition: transform 0.2s !important;
+}
+
+.review-btn:hover, [title="Xem kết quả"]:hover {
+  transform: scale(1.2) !important;
+}
+
+/* ===== FILE BROWSER BUTTON ===== */
+.file-select-btn, [class*="folder-btn"] {
+  background: linear-gradient(135deg, #00e5ff, #7c4dff) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: 10px !important;
+}
+
+/* ===== USER BADGE ===== */
+.user-badge, [class*="user-info"], [class*="UserBadge"] {
+  background: rgba(0,229,255,0.1) !important;
+  border: 1px solid rgba(0,229,255,0.2) !important;
+  border-radius: 20px !important;
+  color: var(--accent) !important;
+}
+
+/* ===== ANIMATIONS ===== */
+@keyframes glow {
+  0%, 100% { box-shadow: 0 0 5px rgba(0,229,255,0.2); }
+  50% { box-shadow: 0 0 20px rgba(0,229,255,0.4); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.app-container > div {
+  animation: fadeIn 0.3s ease-out !important;
+}
+
+/* ===== ACCOUNT CARDS ===== */
+.account-card, [class*="account-item"] {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+  transition: border-color 0.3s !important;
+}
+
+.account-card:hover, [class*="account-item"]:hover {
+  border-color: rgba(0,229,255,0.3) !important;
+}
+
+/* ===== BOTTOM BAR ===== */
+.bottom-bar, .action-bar, [class*="bottom-bar"], [class*="action-bar"] {
+  background: var(--bg-secondary) !important;
+  border-top: 1px solid var(--border) !important;
+}
+
+/* ===== TOOLTIP & POPOVER ===== */
+[class*="tooltip"], [class*="popover"] {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  color: var(--text-primary) !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4) !important;
+}
+
+/* ===== CHECKBOX ===== */
+input[type="checkbox"] {
+  accent-color: var(--accent) !important;
+}
+
+/* ===== PAGINATION ===== */
+.pagination, [class*="pagination"] {
+  color: var(--text-secondary) !important;
+}
+
+.pagination button {
+  background: rgba(255,255,255,0.05) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text-secondary) !important;
+}
+
+/* ===== SELECT DROPDOWN ===== */
+select option {
+  background: var(--bg-primary) !important;
+  color: var(--text-primary) !important;
+}
+</style></head>
+
+<body>
+        <div id="root"></div>
+<script>
+// Inject Image Count selector into config panel
+(function() {
+    window.__imageCount = 4; // default
+
+    function injectImageCountDropdown() {
+        // Find the Aspect Ratio label/select container
+        const allLabels = document.querySelectorAll('label');
+        let aspectLabel = null;
+        for (const l of allLabels) {
+            if (l.textContent && l.textContent.includes('Aspect Ratio')) {
+                aspectLabel = l;
+                break;
+            }
+        }
+
+        if (!aspectLabel || document.getElementById('image-count-container')) return;
+
+        // Create container matching the existing style
+        const container = document.createElement('div');
+        container.id = 'image-count-container';
+        container.style.cssText = 'margin-top: 12px; display: flex; align-items: center; gap: 10px;';
+
+        const label = document.createElement('label');
+        label.textContent = 'Số lượng ảnh:';
+        label.style.cssText = 'color: var(--text-secondary); font-size: 12px; font-weight: 500; white-space: nowrap; min-width: 90px;';
+
+        const select = document.createElement('select');
+        select.id = 'image-count-select';
+        select.style.cssText = 'background: var(--bg-primary); color: var(--text-primary); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 8px 12px; font-size: 13px; cursor: pointer; flex: 1; outline: none; transition: border-color 0.3s, box-shadow 0.3s;';
+
+        [1, 2, 4].forEach(n => {
+            const opt = document.createElement('option');
+            opt.value = n;
+            opt.textContent = n + (n === 4 ? ' (mặc định)' : '');
+            if (n === 4) opt.selected = true;
+            select.appendChild(opt);
+        });
+
+        select.addEventListener('change', () => {
+            window.__imageCount = parseInt(select.value, 10);
+            console.log('[UI] Image count set to:', window.__imageCount);
+        });
+
+        select.addEventListener('focus', () => {
+            select.style.borderColor = 'var(--accent)';
+            select.style.boxShadow = '0 0 12px rgba(0,229,255,0.15)';
+        });
+        select.addEventListener('blur', () => {
+            select.style.borderColor = 'rgba(255,255,255,0.1)';
+            select.style.boxShadow = 'none';
+        });
+
+        container.appendChild(label);
+        container.appendChild(select);
+
+        // Insert after the aspect ratio section
+        const aspectParent = aspectLabel.closest('div') || aspectLabel.parentElement;
+        if (aspectParent && aspectParent.parentElement) {
+            aspectParent.parentElement.insertBefore(container, aspectParent.nextSibling);
+        }
+    }
+
+    // Hook into image:generate to inject imageGenerationCount
+    function hookGenerate() {
+        if (!window.electronAPI?.image?.generate) return false;
+        if (window.__generateHooked) return true;
+        const origGenerate = window.electronAPI.image.generate;
+        window.electronAPI.image.generate = function(params) {
+            if (params && params.config) {
+                params.config.imageGenerationCount = window.__imageCount || 4;
+            } else if (params) {
+                params.config = { imageGenerationCount: window.__imageCount || 4 };
+            }
+            console.log('[UI] Generating with imageCount:', window.__imageCount || 4);
+            return origGenerate(params);
+        };
+        window.__generateHooked = true;
+        return true;
+    }
+
+    // Try injecting periodically until React has rendered
+    let attempts = 0;
+    const interval = setInterval(() => {
+        injectImageCountDropdown();
+        hookGenerate();
+        attempts++;
+        if (document.getElementById('image-count-container') && window.__generateHooked || attempts > 60) {
+            clearInterval(interval);
+        }
+    }, 1000);
+})();
+</script>
+</body>
+
+</html>
+

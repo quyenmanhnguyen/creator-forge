@@ -1,0 +1,17 @@
+{
+  "name": "autogrok-hieummo",
+  "version": "2.0.0",
+  "description": "AutoGrok Hieummo - 0347854097",
+  "author": "AutoGrok Hieummo",
+  "main": "electron/main.js",
+  "dependencies": {
+    "axios": "^1.13.5",
+    "electron-log": "^5.4.3",
+    "electron-updater": "^6.8.3",
+    "puppeteer": "^24.2.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}

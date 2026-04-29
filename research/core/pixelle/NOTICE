@@ -1,0 +1,23 @@
+Tube Atlas — Pixelle vendoring NOTICE
+======================================
+
+This subpackage (``core/pixelle/``) contains code and ideas adapted from
+``Pixelle-Video`` by AIDC-AI (https://github.com/AIDC-AI/Pixelle-Video),
+which is licensed under the Apache License, Version 2.0.
+
+A copy of the Apache License is provided alongside this NOTICE in
+``LICENSE-APACHE``.
+
+Modifications:
+- Adapted to plug into Tube Atlas's Streamlit pipeline
+  (``Studio script → Producer mp4`` flow rather than Pixelle's own web UI).
+- Trimmed to: TTS + ComfyUI client + LLM provider abstraction. Pixelle's
+  full template / history / batch UI is not vendored.
+- Default LLM provider is DeepSeek (existing in ``core/llm.py``); Google
+  Gemini is supported as an optional fallback.
+- Default TTS engine is Edge-TTS (no key required); IndexTTS / ChatTTS
+  may be added in future revisions through the ``TTSAdapter`` interface.
+
+The rest of Tube Atlas is licensed under the MIT License — only this
+subpackage carries Apache-2.0 obligations (attribution + NOTICE
+preservation). Do not strip this file when redistributing.

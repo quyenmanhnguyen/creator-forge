@@ -1,0 +1,63 @@
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.coverage.*
+
+# --- Node / Electron ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.npm/
+.cache/
+
+# Electron build artifacts (these used to be vendored in autogrok-veo3 but
+# don't belong in source — electron-builder regenerates them).
+desktop/dist-electron/
+desktop/release/
+desktop/out/
+*.dll
+*.dylib
+*.so
+*.pak
+*.bin
+*.dat
+*.exe
+*.app
+*.ico
+LICENSES.chromium.html
+LICENSE.electron.txt
+
+# --- Runtime / user data ---
+electron-runtime.log
+sessions/
+output/
+debug/
+ref-images/
+*.log
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

@@ -1,0 +1,26 @@
+# FastAPI sidecar (creator-forge) — Electron spawns uvicorn on :5050.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+
+# Streamlit kept for legacy `_streamlit_pages_legacy/` reference & dev.
+streamlit>=1.36
+google-api-python-client>=2.120
+youtube-transcript-api>=1.0
+youtube-comment-downloader>=0.1.76
+pytrends>=4.9.2
+yt-dlp>=2024.8.6
+requests>=2.32
+pandas>=2.2
+plotly>=5.22
+python-dotenv>=1.0
+openai>=1.40
+vaderSentiment>=3.3.2
+wordcloud>=1.9
+matplotlib>=3.9
+langdetect>=1.0.9
+edge-tts>=6.1
+mutagen>=1.47
+moviepy>=1.0.3,<2
+imageio-ffmpeg>=0.4
+Pillow>=10.0
