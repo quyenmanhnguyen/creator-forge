@@ -52,11 +52,17 @@ function pythonExecutable() {
  */
 function probe(port) {
     return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
         const req = http.get(
             { host: '127.0.0.1', port, path: '/healthz', timeout: 2000 },
             (res) => {
                 if (res.statusCode !== 200) {
-                    resolve({ ok: false, ours: false });
+                    finish({ ok: false, ours: false });
                     res.resume();
                     return;
                 }
@@ -64,17 +70,21 @@ function probe(port) {
                 res.setEncoding('utf8');
                 res.on('data', (chunk) => {
                     body += chunk;
-                    if (body.length > 1024) req.destroy();
+                    if (body.length > 1024) {
+                        finish({ ok: true, ours: body.includes(SERVICE_TAG) });
+                        res.destroy();
+                    }
                 });
                 res.on('end', () => {
-                    resolve({ ok: true, ours: body.includes(SERVICE_TAG) });
+                    finish({ ok: true, ours: body.includes(SERVICE_TAG) });
                 });
+                res.on('error', () => finish({ ok: false, ours: false }));
             },
         );
-        req.on('error', () => resolve({ ok: false, ours: false }));
+        req.on('error', () => finish({ ok: false, ours: false }));
         req.on('timeout', () => {
             req.destroy();
-            resolve({ ok: false, ours: false });
+            finish({ ok: false, ours: false });
         });
     });
 }
