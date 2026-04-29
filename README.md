@@ -212,23 +212,41 @@ See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full data flow & schemas.
 ## 🧪 Testing
 
 ```bash
-# Python (research)
-pytest research/tests
+# Python (research) — API tests must pass; legacy tube-atlas tests are
+# best-effort until each is ported.
+pytest research/tests/test_api_niche.py -v
+pytest research/tests                       # full suite
 
 # Lint
 ruff check research
 cd desktop && npm run lint  # (TODO: add eslint config)
 ```
 
-CI runs both on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+### Manual API smoke
+
+With the sidecar running:
+
+```bash
+# happy path (needs YOUTUBE_API_KEY + DEEPSEEK_API_KEY in .env)
+curl -s -X POST http://127.0.0.1:5050/research/niche \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"sleep stories for adults","region":"US","language":"en"}' | jq
+
+# fast-only path — skip slow / optional upstreams
+curl -s -X POST http://127.0.0.1:5050/research/niche \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"ai art","region":"US","language":"en","include_trends":false,"include_verdict":false}' | jq
+```
+
+CI runs lint + API tests + node `--check` on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
 
 ## 🗺 Roadmap
 
-This repo's first commit is **PR-0: integration scaffold**. Each FastAPI route currently returns a shell response with a `notes:` field telling you exactly which `research.core.*` function to wire in. Suggested follow-up PRs:
+This repo's first commit is **PR-0: integration scaffold**. Each remaining FastAPI route returns a shell response with a `notes:` field telling you exactly which `research.core.*` function to wire in. Roadmap:
 
-- **PR-1** — port `01_Research.py` → `/research/niche` (real implementation).
+- **PR-1** — port `01_Research.py` → `/research/niche` (**done** — real implementation, see `research/api/routes/research.py` and `research/tests/test_api_niche.py`).
 - **PR-2** — port `02_Keyword_Finder.py` → `/research/keywords`.
 - **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier`.
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner`.

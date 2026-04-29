@@ -17,9 +17,35 @@ class ResearchBridge {
     }
 
     /**
-     * 01 Niche / Research.
-     * @param {{ seed: string, language?: string, region?: string }} params
-     * @returns {Promise<{ trends: Array, longtail: Array, channels: Array, outliers: Array, opportunity: number, pulse_7d: string, sentiment: object, verdict: string }>}
+     * 01 Niche / Research — POST /research/niche.
+     *
+     * @param {{
+     *   seed: string,
+     *   language?: string,
+     *   region?: string,
+     *   include_trends?: boolean,
+     *   include_verdict?: boolean,
+     *   max_top_videos?: number,
+     * }} params
+     * @returns {Promise<{
+     *   seed: string,
+     *   region: string,
+     *   language: string,
+     *   longtail: string[],
+     *   top_videos: Array<{video_id:string,title:string,channel_id:string,channel_title:string,views:number,likes:number,comments:number,published_at:string,url:string}>,
+     *   channels: Array<{channel_id:string,title:string,subs:number,views:number,videos:number,url:string}>,
+     *   outliers: Array<{video_id:string,title:string,channel_title:string,views:number,view_ratio:number,url:string}>,
+     *   total_competition: number,
+     *   recent_uploads_14d: number,
+     *   pulse_7d: { recent_7d:number, prior_7d:number, growth_pct:number, status:string },
+     *   opportunity_score: number,
+     *   opportunity_grade: string,
+     *   trends_top: Array<object>,
+     *   trends_rising: Array<object>,
+     *   verdict: { verdict:string, score:number, competition:string, summary:string, opportunities:string[], risks:string[], content_gaps:string[] } | null,
+     *   warnings: string[],
+     *   notes: string,
+     * }>}
      */
     searchNiche(params) {
         return this.api.searchNiche(params);
