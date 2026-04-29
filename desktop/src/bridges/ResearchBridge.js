@@ -52,9 +52,29 @@ class ResearchBridge {
     }
 
     /**
-     * 02 Keyword Finder.
-     * @param {{ seed: string, language?: string }} params
-     * @returns {Promise<{ longtail: Array, score: { volume: number, competition: number }, vph: Array, kgr: number, questions: object }>}
+     * 02 Keyword Finder — POST /research/keywords.
+     *
+     * @param {{
+     *   seed: string,
+     *   language?: string,
+     *   region?: string,
+     *   compute_kgr?: boolean,
+     *   max_kgr_keywords?: number,
+     *   max_top_videos?: number,
+     *   include_questions?: boolean,
+     * }} params
+     * @returns {Promise<{
+     *   seed: string,
+     *   region: string,
+     *   language: string,
+     *   suggestions: Array<{keyword:string,length:number,words:number,competition:number,score:number,grade:string}>,
+     *   seed_score: { volume:number, competition:number, keyword:number, grade:string },
+     *   total_results: number,
+     *   vph_top: Array<{video_id:string,title:string,views:number,vph:number,published_at:string,url:string}>,
+     *   questions: Object<string, string[]>,
+     *   warnings: string[],
+     *   notes: string,
+     * }>}
      */
     keywordIdeas(params) {
         return this.api.keywordIdeas(params);
