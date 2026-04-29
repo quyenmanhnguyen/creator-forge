@@ -214,7 +214,7 @@ See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full data flow & schemas.
 ```bash
 # Python (research) — API tests must pass; legacy tube-atlas tests are
 # best-effort until each is ported.
-pytest research/tests/test_api_niche.py -v
+pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py -v
 pytest research/tests                       # full suite
 
 # Lint
@@ -236,6 +236,16 @@ curl -s -X POST http://127.0.0.1:5050/research/niche \
 curl -s -X POST http://127.0.0.1:5050/research/niche \
   -H 'Content-Type: application/json' \
   -d '{"seed":"ai art","region":"US","language":"en","include_trends":false,"include_verdict":false}' | jq
+
+# /research/keywords — long-tail finder (autocomplete + VidIQ-style score + VPH)
+curl -s -X POST http://127.0.0.1:5050/research/keywords \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"ai art","region":"US","language":"en","include_questions":true}' | jq
+
+# Same, with per-keyword KGR competition scoring (1 YouTube call per keyword)
+curl -s -X POST http://127.0.0.1:5050/research/keywords \
+  -H 'Content-Type: application/json' \
+  -d '{"seed":"ai art","compute_kgr":true,"max_kgr_keywords":15}' | jq
 ```
 
 CI runs lint + API tests + node `--check` on every push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -246,8 +256,8 @@ CI runs lint + API tests + node `--check` on every push (see [`.github/workflows
 
 This repo's first commit is **PR-0: integration scaffold**. Each remaining FastAPI route returns a shell response with a `notes:` field telling you exactly which `research.core.*` function to wire in. Roadmap:
 
-- **PR-1** — port `01_Research.py` → `/research/niche` (**done** — real implementation, see `research/api/routes/research.py` and `research/tests/test_api_niche.py`).
-- **PR-2** — port `02_Keyword_Finder.py` → `/research/keywords`.
+- **PR-1** — port `01_Research.py` (niche tab) → `/research/niche` (**done**, see `research/api/routes/research.py` + `research/tests/test_api_niche.py`).
+- **PR-2** — port `01_Research.py` (keyword tab) → `/research/keywords` (**done**, see `research/api/routes/keywords.py` + `research/tests/test_api_keywords.py`).
 - **PR-3** — port `03_Outlier_Finder.py` → `/research/outlier`.
 - **PR-4** — port `02_Video_Cloner.py` → `/research/cloner`.
 - **PR-5** — port `04_Studio.py` (5 steps) → `/studio/*`.

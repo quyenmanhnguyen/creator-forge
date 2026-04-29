@@ -18,7 +18,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from research.core import autocomplete, llm, trends
 from research.core import youtube as yt
@@ -37,6 +37,13 @@ class NicheRequest(BaseModel):
     include_trends: bool = Field(True, description="Call pytrends for related queries (slow, easily rate-limited).")
     include_verdict: bool = Field(True, description="Call DeepSeek for the AI verdict block.")
     max_top_videos: int = Field(25, ge=1, le=50, description="How many top YouTube videos to hydrate.")
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _strip_seed(cls, v: object) -> object:
+        # Strip BEFORE min_length runs so whitespace-only inputs like " " are
+        # rejected as 422 instead of slipping through to upstream calls.
+        return v.strip() if isinstance(v, str) else v
 
 
 class TopVideo(BaseModel):
@@ -213,7 +220,7 @@ def niche(req: NicheRequest) -> NicheResponse:
     upstream calls fail (missing API key, network, rate limit, etc.) so the
     client can surface them without the whole request failing.
     """
-    seed = req.seed.strip()
+    seed = req.seed  # already stripped by the validator
     warnings: list[str] = []
 
     # ── Long-tail keywords (Google/YouTube autocomplete; no API key) ───────
