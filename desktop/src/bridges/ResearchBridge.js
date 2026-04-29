@@ -114,9 +114,38 @@ class ResearchBridge {
     }
 
     /**
-     * 03 Video Cloner — paste a YouTube URL → clone kit.
-     * @param {{ url: string, language_override?: string }} params
-     * @returns {Promise<{ fingerprint: object, hook: string, structure: Array, title_clones: string[], script: string, thumbnail: object, seo_tags: string[] }>}
+     * 04 Video Cloner — POST /research/cloner.
+     * Reverse-engineers a YouTube video into a remake kit: fingerprint
+     * (stats + tags) + hook analysis + N title clones + full script clone +
+     * thumbnail copy + SEO tags, in the source video's language (or override).
+     *
+     * @param {{
+     *   url: string,
+     *   new_topic?: string,
+     *   n_titles?: number,
+     *   language_override?: 'auto'|'en'|'ko'|'ja'|'vi',
+     *   transcript_languages?: string[],
+     *   transcript_max_chars?: number,
+     * }} params
+     * @returns {Promise<{
+     *   video_id: string,
+     *   fingerprint: {
+     *     video_id:string, title:string, channel_id:string, channel_title:string,
+     *     published_at:string, duration_sec:number, views:number, likes:number,
+     *     comments:number, engagement_rate_pct:number, thumbnail:string,
+     *     tags:string[], url:string,
+     *   },
+     *   transcript_excerpt: string,
+     *   transcript_segments: number,
+     *   detected_language: string,
+     *   output_language: string,
+     *   kit: null | {
+     *     hook_analysis:string, title_clones:string[], script:string,
+     *     thumbnail_copy:string[], tags:string[],
+     *   },
+     *   warnings: string[],
+     *   notes: string,
+     * }>}
      */
     videoCloner(params) {
         return this.api.videoCloner(params);

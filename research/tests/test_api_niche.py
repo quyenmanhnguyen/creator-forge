@@ -295,6 +295,45 @@ def test_niche_all_youtube_calls_fail(monkeypatch, stub_autocomplete):
     assert "verdict" in joined.lower()
 
 
+@pytest.mark.parametrize(
+    "bad_payload, expect_warning_substr",
+    [
+        # score is a non-numeric string → int(float(...)) raises ValueError.
+        ({"verdict": "hot", "score": "high", "competition": "medium",
+          "opportunities": [], "risks": [], "content_gaps": [], "summary": "..."},
+         "AI verdict parse failed"),
+        # opportunities is a string (not a list) → list(...) iterates it but ok;
+        # use a non-iterable instead — int triggers ValueError.
+        ({"verdict": "warm", "score": 70, "competition": "medium",
+          "opportunities": 12345, "risks": [], "content_gaps": [], "summary": "..."},
+         "AI verdict parse failed"),
+    ],
+)
+def test_niche_verdict_parse_failure_no_500(
+    stub_youtube_happy, stub_autocomplete, stub_trends_empty, monkeypatch,
+    bad_payload, expect_warning_substr,
+):
+    """Regression: DeepSeek returning a malformed score / non-list field must
+    NOT crash the route with a 500. The route should return 200 with
+    ``verdict=null`` and a parse-failure warning."""
+    monkeypatch.setattr(
+        niche_route.llm, "chat_json",
+        lambda prompt, system=None: json.dumps(bad_payload),
+    )
+
+    r = client.post(
+        "/research/niche",
+        json={"seed": "ai art", "region": "US", "language": "en", "include_verdict": True, "include_trends": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["verdict"] is None
+    assert any(expect_warning_substr in w for w in body["warnings"]), body["warnings"]
+    # Other niche fields should still be populated.
+    assert body["opportunity_score"] == 78
+    assert len(body["top_videos"]) > 0
+
+
 def test_niche_missing_only_deepseek(stub_youtube_happy, stub_autocomplete, stub_trends_empty, monkeypatch):
     """DeepSeek-only missing → YouTube fields populated, verdict skipped with friendly warning."""
 
