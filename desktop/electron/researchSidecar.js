@@ -59,9 +59,52 @@ function locatePackagedSidecarRoot(resourcesPath, fsImpl = fs) {
     return resourcesPath;
 }
 
+/**
+ * Pure helper exported for offline tests. Resolution order:
+ *   1. CREATOR_FORGE_PYTHON env (always wins, even if it points at a
+ *      missing path — we want the spawn-side error to surface so users
+ *      know their override is broken).
+ *   2. Bundled-by-electron-builder runtime at
+ *      `<resourcesPath>/python/<interpreter>` (PR-19, Windows).
+ *   3. Dev-mode bundled runtime at
+ *      `<repoRoot>/desktop/build/python-runtime/<host-key>/<interpreter>`
+ *      (populated by `scripts/fetch-python-runtime.js`).
+ *   4. PATH fallback: `python` on Windows, `python3` elsewhere.
+ *
+ * `opts` lets tests inject every external surface (env, platform,
+ * arch, resources path, repo root, fs.existsSync) so we can hit each
+ * branch without touching the real filesystem.
+ */
+function resolvePythonExecutable(opts = {}) {
+    const env = opts.env || process.env;
+    if (env.CREATOR_FORGE_PYTHON) return env.CREATOR_FORGE_PYTHON;
+
+    const platform = opts.platform || process.platform;
+    const arch = opts.arch || process.arch;
+    const fsImpl = opts.fsImpl || fs;
+    const interpreterRel = platform === 'win32' ? 'python.exe' : path.join('bin', 'python3');
+
+    // 2. packaged: <resourcesPath>/python/<interpreterRel>
+    const resourcesPath = opts.resourcesPath !== undefined ? opts.resourcesPath : process.resourcesPath;
+    if (resourcesPath) {
+        const packaged = path.join(resourcesPath, 'python', interpreterRel);
+        if (fsImpl.existsSync(packaged)) return packaged;
+    }
+
+    // 3. dev-mode: <repoRoot>/desktop/build/python-runtime/<key>/python/<interpreterRel>
+    const repoRoot = opts.repoRoot || findRepoRoot(__dirname);
+    if (repoRoot && arch === 'x64' && (platform === 'win32' || platform === 'linux')) {
+        const key = `${platform}-${arch}`;
+        const devBundled = path.join(repoRoot, 'desktop', 'build', 'python-runtime', key, 'python', interpreterRel);
+        if (fsImpl.existsSync(devBundled)) return devBundled;
+    }
+
+    // 4. PATH fallback (existing behaviour pre-PR-19).
+    return platform === 'win32' ? 'python' : 'python3';
+}
+
 function pythonExecutable() {
-    if (process.env.CREATOR_FORGE_PYTHON) return process.env.CREATOR_FORGE_PYTHON;
-    return process.platform === 'win32' ? 'python' : 'python3';
+    return resolvePythonExecutable();
 }
 
 /**
@@ -238,4 +281,6 @@ module.exports = {
     // Exported for offline tests (test_research_sidecar_lookup.js):
     findRepoRoot,
     locatePackagedSidecarRoot,
+    resolvePythonExecutable,
+    pythonExecutable,
 };

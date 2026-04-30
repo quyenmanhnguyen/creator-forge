@@ -87,6 +87,45 @@ win:
         - x64
   artifactName: "${productName}-Setup-${version}-${arch}.${ext}"
   # icon: build/icon.ico   # add later; electron-builder uses Electron default if absent
+  # Windows-only: ship a bundled Python interpreter so users don't need
+  # to install Python 3.10+ themselves before launching. Sourced from
+  # python-build-standalone (astral-sh) — fetch via
+  # `npm run prefetch:python -- --platform win32 --arch x64` before
+  # `npm run dist:win`. See scripts/python-runtime.config.json for
+  # pinning. This path is platform-scoped on purpose: macOS and Linux
+  # bundled runtimes are deliberately a follow-up PR.
+  #
+  # IMPORTANT: electron-builder REPLACES the top-level `extraResources`
+  # with this platform-specific one (no merge), so we must redeclare
+  # the research/ sidecar entry here too — otherwise the Windows
+  # installer would ship python.exe but no research/api/main.py and
+  # the sidecar would fail to start.
+  extraResources:
+    - from: "../research"
+      to: "research"
+      filter:
+        - "**/*"
+        - "!__pycache__/**"
+        - "!**/__pycache__/**"
+        - "!*.pyc"
+        - "!**/*.pyc"
+        - "!.pytest_cache/**"
+        - "!.ruff_cache/**"
+        - "!.venv/**"
+        - "!venv/**"
+        - "!tests/**"
+        - "!**/*.egg-info/**"
+    - from: "build/python-runtime/win32-x64/python"
+      to: "python"
+      filter:
+        - "**/*"
+        - "!**/__pycache__/**"
+        - "!**/*.pyc"
+        - "!**/test/**"
+        - "!**/tests/**"
+        - "!**/idle_test/**"
+        - "!**/turtledemo/**"
+        - "!**/tkinter/test/**"
 
 nsis:
   oneClick: false

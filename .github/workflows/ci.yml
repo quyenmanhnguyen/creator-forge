@@ -92,8 +92,10 @@ jobs:
           node desktop/tests/test_e2e_compose_script.js
           node desktop/tests/test_storyboard_compose_helpers.js
           node desktop/tests/test_research_sidecar_lookup.js
+          node desktop/tests/test_fetch_python_runtime.js
 
       - name: Syntax check standalone E2E scripts
         run: |
           node --check scripts/e2e_autogrok_image.js
           node --check scripts/e2e_compose_with_scene_assets.js
+          node --check scripts/fetch-python-runtime.js
