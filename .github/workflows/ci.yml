@@ -21,11 +21,15 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pytest
-          # Heavy stack (moviepy, pytrends, edge-tts) is not needed just to
-          # syntax-check the sidecar. Only install what tests touch.
+          pip install ruff pytest httpx
+          # Sidecar-runtime deps that the API routes import at module load.
+          # Heavy stack (moviepy, edge-tts, mutagen, plotly) is still not
+          # needed for ruff + the API tests; tighten as more routes are wired.
           pip install fastapi uvicorn pydantic python-dotenv requests \
-                      langdetect openai vaderSentiment
+                      langdetect openai vaderSentiment \
+                      google-api-python-client pytrends pandas \
+                      youtube-transcript-api yt-dlp \
+                      Pillow
 
       - name: Ruff lint
         run: ruff check research
@@ -33,22 +37,27 @@ jobs:
       - name: Compile-check every Python file
         run: python -m compileall -q research
 
-      - name: Pytest (smoke only)
+      - name: Pytest — API tests (must pass)
+        run: pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py -v --no-header
+
+      - name: Pytest — legacy tube-atlas tests (best-effort)
         run: |
-          if [ -d research/tests ]; then
-            # Most legacy tube-atlas tests need optional deps not installed in
-            # this minimal CI image — run them in `lf` mode and don't fail CI
-            # on missing imports for now. Tighten this in PR-1.
-            pytest research/tests -q --no-header -x \
-              --ignore=research/tests/test_pixelle_comfyui_image.py \
-              --ignore=research/tests/test_pixelle_subtitles.py \
-              --ignore=research/tests/test_pixelle_composer.py \
-              --ignore=research/tests/test_pixelle_tts.py \
-              --ignore=research/tests/test_pixelle_tts_timing.py || \
-              echo "::warning::pytest had failures — tracked, not blocking PR-0"
-          else
-            echo "no tests/ yet"
-          fi
+          # Many tube-atlas tests need heavy deps (moviepy, edge-tts, etc.)
+          # not installed in this minimal CI image — run them best-effort
+          # and surface failures as warnings until each is ported.
+          pytest research/tests -q --no-header \
+            --ignore=research/tests/test_api_niche.py \
+            --ignore=research/tests/test_api_keywords.py \
+            --ignore=research/tests/test_api_outlier.py \
+            --ignore=research/tests/test_api_cloner.py \
+            --ignore=research/tests/test_api_studio.py \
+            --ignore=research/tests/test_api_producer.py \
+            --ignore=research/tests/test_pixelle_comfyui_image.py \
+            --ignore=research/tests/test_pixelle_subtitles.py \
+            --ignore=research/tests/test_pixelle_composer.py \
+            --ignore=research/tests/test_pixelle_tts.py \
+            --ignore=research/tests/test_pixelle_tts_timing.py || \
+            echo "::warning::legacy pytest had failures — tracked, not blocking"
 
   desktop-node:
     name: Desktop shell — node syntax check
@@ -71,3 +80,8 @@ jobs:
           node --check desktop/electron/researchIPC.js
           for f in desktop/src/bridges/*.js; do node --check "$f"; done
           for f in desktop/src/services/*.js; do node --check "$f"; done
+
+      - name: Offline regression tests (no puppeteer install required)
+        run: |
+          node desktop/tests/test_image_service_config.js
+          node desktop/tests/test_storyboard_bridge.js

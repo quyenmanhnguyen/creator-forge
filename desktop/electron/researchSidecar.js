@@ -17,9 +17,11 @@ const path = require('path');
 const DEFAULT_PORT = Number(process.env.CREATOR_FORGE_RESEARCH_PORT || 5050);
 const HEALTH_TIMEOUT_MS = 30_000;
 const HEALTH_INTERVAL_MS = 500;
+const SERVICE_TAG = 'creator-forge.research';
 
 let child = null;
 let actualPort = null;
+let externalReuse = false;
 let logSink = (...args) => console.log('[research-sidecar]', ...args);
 
 function setLogSink(fn) {
@@ -42,19 +44,47 @@ function pythonExecutable() {
     return process.platform === 'win32' ? 'python' : 'python3';
 }
 
-function ping(port) {
+/**
+ * Probe `:port/healthz`. Returns `{ ok, ours }`:
+ *   - ok: status 200 (some HTTP service is alive on the port).
+ *   - ours: response body contains the creator-forge.research service tag,
+ *           proving it's our FastAPI app (not some unrelated server).
+ */
+function probe(port) {
     return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
         const req = http.get(
             { host: '127.0.0.1', port, path: '/healthz', timeout: 2000 },
             (res) => {
-                resolve(res.statusCode === 200);
-                res.resume();
+                if (res.statusCode !== 200) {
+                    finish({ ok: false, ours: false });
+                    res.resume();
+                    return;
+                }
+                let body = '';
+                res.setEncoding('utf8');
+                res.on('data', (chunk) => {
+                    body += chunk;
+                    if (body.length > 1024) {
+                        finish({ ok: true, ours: body.includes(SERVICE_TAG) });
+                        res.destroy();
+                    }
+                });
+                res.on('end', () => {
+                    finish({ ok: true, ours: body.includes(SERVICE_TAG) });
+                });
+                res.on('error', () => finish({ ok: false, ours: false }));
             },
         );
-        req.on('error', () => resolve(false));
+        req.on('error', () => finish({ ok: false, ours: false }));
         req.on('timeout', () => {
             req.destroy();
-            resolve(false);
+            finish({ ok: false, ours: false });
         });
     });
 }
@@ -62,7 +92,8 @@ function ping(port) {
 async function waitForHealth(port) {
     const deadline = Date.now() + HEALTH_TIMEOUT_MS;
     while (Date.now() < deadline) {
-        if (await ping(port)) return true;
+        const { ok } = await probe(port);
+        if (ok) return true;
         await new Promise((r) => setTimeout(r, HEALTH_INTERVAL_MS));
     }
     return false;
@@ -72,9 +103,29 @@ async function waitForHealth(port) {
  * Start the sidecar. Returns { port } when /healthz is green.
  *
  * Idempotent — calling twice returns the existing handle.
+ *
+ * Probe-before-spawn: if `http://127.0.0.1:<port>/healthz` already responds
+ * with the creator-forge.research service tag, we reuse that external sidecar
+ * instead of spawning another uvicorn (which would race-fail on the busy port
+ * and leave actualPort=null after the spawned child exits).
  */
 async function start({ port = DEFAULT_PORT, repoRoot } = {}) {
-    if (child && actualPort) return { port: actualPort };
+    if (actualPort) return { port: actualPort };
+
+    const pre = await probe(port);
+    if (pre.ours) {
+        actualPort = port;
+        externalReuse = true;
+        logSink('reusing external sidecar on :' + port);
+        return { port };
+    }
+    if (pre.ok && !pre.ours) {
+        throw new Error(
+            `port :${port} is taken by a non-creator-forge service ` +
+                `(GET /healthz returned 200 but without the "${SERVICE_TAG}" tag). ` +
+                'Free the port or set CREATOR_FORGE_RESEARCH_PORT to a different port.',
+        );
+    }
 
     const root = repoRoot || findRepoRoot(__dirname);
     if (!root) {
@@ -113,7 +164,15 @@ async function start({ port = DEFAULT_PORT, repoRoot } = {}) {
 }
 
 async function stop() {
-    if (!child) return;
+    if (externalReuse) {
+        externalReuse = false;
+        actualPort = null;
+        return;
+    }
+    if (!child) {
+        actualPort = null;
+        return;
+    }
     const proc = child;
     child = null;
     actualPort = null;

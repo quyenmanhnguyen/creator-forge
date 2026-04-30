@@ -28,6 +28,9 @@ yarn-error.log*
 .pnpm-debug.log*
 .npm/
 .cache/
+# package-lock.json is not committed — keeps the repo light and matches the
+# existing convention. Re-generate locally with `npm install`.
+package-lock.json
 
 # Electron build artifacts (these used to be vendored in autogrok-veo3 but
 # don't belong in source — electron-builder regenerates them).

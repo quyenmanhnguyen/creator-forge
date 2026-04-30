@@ -131,8 +131,16 @@ function createWindow() {
     // Remove menu bar completely
     Menu.setApplicationMenu(null);
 
+    // creator-forge: which renderer page to load.
+    //   default                  -> creator-forge.html (Research/Studio/Storyboard).
+    //   CREATOR_FORGE_UI=autogrok -> dist/index.html (legacy AutoGrok UI; PR-9 fixes).
+    const uiMode = (process.env.CREATOR_FORGE_UI || 'forge').toLowerCase();
+    const useForgeUI = uiMode !== 'autogrok';
+    const rendererFile = useForgeUI ? 'creator-forge.html' : 'index.html';
+    const windowTitle = useForgeUI ? 'creator-forge' : 'AutoGrok ::: Hiếu Nghĩa MMO';
+
     mainWindow = new BrowserWindow({
-        title: 'AutoGrok ::: Hiếu Nghĩa MMO',
+        title: windowTitle,
         width: 1400,
         height: 900,
         minWidth: 1200,
@@ -156,6 +164,8 @@ function createWindow() {
 
     mainWindow.webContents.on('did-finish-load', () => {
         console.log('[Electron] Page loaded successfully');
+        // creator-forge UI is self-contained — skip the AutoGrok DOM patches.
+        if (useForgeUI) return;
         // Inject UI patches — delete is handled in renderer.js via __autogrokSetJobs
         mainWindow.webContents.executeJavaScript(`
             (function() {
@@ -203,7 +213,7 @@ function createWindow() {
                 try {
                     if (mainWindow && !mainWindow.isDestroyed()) {
                         console.log('[Electron] Reloading renderer after crash...');
-                        mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+                        mainWindow.loadFile(path.join(__dirname, '../dist/' + rendererFile));
                     }
                 } catch (error) {
                     console.error('[Electron] Failed to reload renderer:', error.message);
@@ -231,8 +241,8 @@ function createWindow() {
     });
 
     // Load the app - always load from dist
-    const htmlPath = path.join(__dirname, '../dist/index.html');
-    console.log('[Electron] Loading file:', htmlPath);
+    const htmlPath = path.join(__dirname, '../dist/' + rendererFile);
+    console.log('[Electron] Loading file:', htmlPath, '(uiMode=' + uiMode + ')');
     mainWindow.loadFile(htmlPath).catch(err => {
         console.error('[Electron] Failed to load file:', err);
     });
@@ -249,11 +259,17 @@ app.whenReady().then(async () => {
 
     // creator-forge: spawn the Python research sidecar in the background. Failure
     // is non-fatal — log it and let the user retry from the UI.
+    //
+    // Register IPC handlers BEFORE start() so that the renderer's first-load poll
+    // (refreshSidecarStatus → producer:listVoices) hits a registered channel that
+    // returns a friendly "sidecar is not running" error instead of Electron's
+    // "No handler registered" log noise. Once the sidecar is healthy, getPort()
+    // starts returning a port and the same handlers proxy through normally.
     researchSidecar.setLogSink((level, ...args) => writeRuntimeLog(level || 'info', '[research]', ...args));
+    researchIPC.register({ ipcMain, sidecar: researchSidecar });
     researchSidecar
         .start()
         .then(({ port }) => {
-            researchIPC.register({ ipcMain, sidecar: researchSidecar });
             console.log(`[research] sidecar ready on :${port}`);
         })
         .catch((err) => {
