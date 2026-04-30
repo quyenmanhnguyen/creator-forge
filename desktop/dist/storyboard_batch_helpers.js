@@ -502,6 +502,192 @@
     }
 
     /**
+     * PR-27 — bulk selection + inline edit + delete + re-roll helpers.
+     *
+     * The renderer maintains a Set<string> of selected ``row_id``s
+     * per kind (image / video). All selection helpers are pure and
+     * return new Sets so React-style "render from state" stays
+     * trivial to reason about.
+     */
+
+    /** Return a new Set with ``row_id`` toggled. */
+    function toggleRowSelection(selected, row_id) {
+        const out = new Set(selected || []);
+        const key = row_id == null ? "" : String(row_id);
+        if (!key) return out;
+        if (out.has(key)) out.delete(key); else out.add(key);
+        return out;
+    }
+
+    /** Build a Set of every row_id in ``rows`` (skipped rows included). */
+    function selectAllRowIds(rows) {
+        const out = new Set();
+        if (!Array.isArray(rows)) return out;
+        for (const r of rows) {
+            if (r && r.row_id != null) out.add(String(r.row_id));
+        }
+        return out;
+    }
+
+    /** Filter ``selected`` so it only contains row_ids present in ``rows``. */
+    function reconcileSelection(selected, rows) {
+        const valid = selectAllRowIds(rows);
+        const out = new Set();
+        for (const k of (selected || [])) {
+            if (valid.has(String(k))) out.add(String(k));
+        }
+        return out;
+    }
+
+    /**
+     * Settled rows (``generated`` / ``retried``) keep their files on
+     * disk — editing the prompt for one of them would do nothing
+     * useful since the asset is already produced. Skipped rows can be
+     * edited (so the user can fix the prompt and re-fill). In-flight
+     * rows can't be edited because the IPC has already taken the
+     * prompt.
+     */
+    function canEditRow(row) {
+        if (!row) return false;
+        const s = row.status || "pending";
+        return s === "pending" || s === "skipped" || s === "fallback";
+    }
+
+    /**
+     * Allow delete on every status — the renderer will still warn the
+     * user via a confirm dialog before nuking generated assets.
+     * Returning ``true`` for ``generating`` is a soft cancel: the
+     * row vanishes from the table and any late progress / result
+     * events for that row_id silently no-op (applyBatchProgress /
+     * applyBatchResult key by row_id, so a missing row simply skips).
+     */
+    function canDeleteRow(row) {
+        return Boolean(row);
+    }
+
+    /**
+     * Drop every row whose row_id is in ``removeIds`` (Set or any
+     * iterable). Returns a new array; the input is never mutated. The
+     * surviving rows keep their original ``order`` / ``variant_idx``
+     * so the table doesn't visually re-shuffle after a delete — only
+     * the deleted rows disappear.
+     */
+    function removeRows(rows, removeIds) {
+        if (!Array.isArray(rows)) return [];
+        const drop = new Set();
+        for (const k of (removeIds || [])) drop.add(String(k));
+        if (!drop.size) return rows.slice();
+        return rows.filter((r) => {
+            const key = r && r.row_id != null ? String(r.row_id) : "";
+            return !drop.has(key);
+        });
+    }
+
+    /**
+     * Replace the prompt text of a single row. Pure — returns a new
+     * array. ``status === "skipped"`` rows whose prompt was empty get
+     * promoted to ``pending`` once a non-empty prompt arrives so the
+     * user can re-fill them; conversely a prompt cleared back to
+     * empty falls back to ``skipped``.
+     */
+    function updatePromptForRow(rows, row_id, prompt) {
+        if (!Array.isArray(rows)) return [];
+        const target = String(row_id);
+        const next = (typeof prompt === "string") ? prompt.trim() : "";
+        return rows.map((r) => {
+            if (!r || String(r.row_id) !== target) return r;
+            // Settled rows ignore prompt edits — once a file is on
+            // disk, editing the prompt would be misleading. Generating
+            // rows ignore too because the IPC already picked up the
+            // value. Both states are protected at the UI level via
+            // canEditRow, but enforce here as well so a programmatic
+            // caller can't sneak past it.
+            if (!canEditRow(r)) return r;
+            const wasSkipped = r.status === "skipped";
+            return Object.assign({}, r, {
+                prompt: next,
+                status: next ? (wasSkipped ? "pending" : r.status) : "skipped",
+                reason: next ? null : (r.reason || "missing image_prompt"),
+            });
+        });
+    }
+
+    /**
+     * Re-roll: replace the prompts for every row matching ``scene_id``
+     * with entries from ``newPrompts``. Slots beyond the length of
+     * ``newPrompts`` keep their existing prompt (degraded
+     * gracefully when the LLM returns fewer prompts than variants).
+     * Used after ``storyboard.variantPrompts`` resolves — keeps
+     * row_id, status, attempts intact so progress mid-batch isn't
+     * obliterated.
+     */
+    function applyVariantPrompts(rows, scene_id, newPrompts) {
+        if (!Array.isArray(rows)) return [];
+        if (!Array.isArray(newPrompts) || !newPrompts.length) return rows.slice();
+        const target = String(scene_id);
+        // Walk variants in variant_idx order so ``newPrompts[v]`` lands
+        // on variant v deterministically.
+        const order = rows
+            .map((r, i) => ({ r, i }))
+            .filter(({ r }) => r && String(r.scene_id) === target)
+            .sort((a, b) => {
+                const ai = (typeof a.r.variant_idx === "number") ? a.r.variant_idx : 0;
+                const bi = (typeof b.r.variant_idx === "number") ? b.r.variant_idx : 0;
+                return ai - bi;
+            });
+        const out = rows.slice();
+        for (let v = 0; v < order.length && v < newPrompts.length; v += 1) {
+            const idx = order[v].i;
+            const row = out[idx];
+            if (!canEditRow(row)) continue; // don't trample settled / in-flight rows
+            const next = (typeof newPrompts[v] === "string") ? newPrompts[v].trim() : "";
+            if (!next) continue;
+            out[idx] = Object.assign({}, row, {
+                prompt: next,
+                status: row.status === "skipped" ? "pending" : row.status,
+                reason: null,
+            });
+        }
+        return out;
+    }
+
+    /**
+     * Summary of a selection — used by the bulk-action toolbar to
+     * decide which buttons to enable. ``editable`` / ``deletable`` are
+     * counts of rows in the selection that pass canEditRow /
+     * canDeleteRow respectively. ``scenes`` is the set of distinct
+     * scene_ids touched, useful for "Re-roll variants for the N scenes
+     * you selected".
+     */
+    function summarizeSelection(rows, selected) {
+        const sel = new Set();
+        for (const k of (selected || [])) sel.add(String(k));
+        const byId = new Map();
+        for (const r of (rows || [])) {
+            if (r && r.row_id != null) byId.set(String(r.row_id), r);
+        }
+        let editable = 0;
+        let deletable = 0;
+        let inFlight = 0;
+        const scenes = new Set();
+        for (const k of sel) {
+            const r = byId.get(k);
+            if (!r) continue;
+            if (canEditRow(r)) editable += 1;
+            if (canDeleteRow(r)) deletable += 1;
+            if (r.status === "generating") inFlight += 1;
+            if (r.scene_id != null) scenes.add(String(r.scene_id));
+        }
+        return {
+            total: sel.size,
+            editable,
+            deletable,
+            inFlight,
+            scenes,
+        };
+    }
+
+    /**
      * PR-24 — format the "scene N · variant K/M" label segment for a
      * row. When the scene only has a single variant (legacy 1-row-per-
      * scene tables) the variant tag is omitted so older tables keep
@@ -532,6 +718,16 @@
         statusClass,
         buildVariantTotals,
         formatVariantLabel,
+        // PR-27 — bulk selection / inline edit / delete / re-roll.
+        toggleRowSelection,
+        selectAllRowIds,
+        reconcileSelection,
+        canEditRow,
+        canDeleteRow,
+        removeRows,
+        updatePromptForRow,
+        applyVariantPrompts,
+        summarizeSelection,
     };
 
     if (typeof module === "object" && module.exports) module.exports = api;

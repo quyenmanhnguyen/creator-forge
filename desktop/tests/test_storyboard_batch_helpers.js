@@ -557,6 +557,167 @@ test("PR-26: legacy scenes without image_prompts behave identically (no regressi
     assert.strictEqual(rows[3].prompt, "p2");
 });
 
+// ── PR-27: bulk selection + inline edit + delete + re-roll ────────────
+
+function pr27Rows() {
+    // Two scenes, 2 variants each → 4 rows. Mix statuses so the
+    // helpers' status guards have something to bite on.
+    const scenes = [
+        { scene_id: 1, image_prompt: "scene1 base", duration_s: 3 },
+        { scene_id: 2, image_prompt: "scene2 base", duration_s: 4 },
+    ];
+    const rows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene: 2 });
+    // rows[0]/[1] → scene 1 variant 0/1, rows[2]/[3] → scene 2 variant 0/1.
+    rows[1].status = "generating";
+    rows[1].progress = 30;
+    rows[2].status = "generated";
+    rows[2].image_path = "/tmp/scene2v0.png";
+    return rows;
+}
+
+test("PR-27: toggleRowSelection adds, then removes; never mutates input", () => {
+    const a = new Set();
+    const b = helpers.toggleRowSelection(a, "1#0");
+    assert.strictEqual(a.size, 0, "input must not be mutated");
+    assert.ok(b.has("1#0"));
+    const c = helpers.toggleRowSelection(b, "1#0");
+    assert.ok(!c.has("1#0"));
+});
+
+test("PR-27: toggleRowSelection ignores null/empty row_id", () => {
+    const a = helpers.toggleRowSelection(new Set(["1#0"]), null);
+    assert.deepStrictEqual([...a], ["1#0"]);
+    const b = helpers.toggleRowSelection(new Set(["1#0"]), "");
+    assert.deepStrictEqual([...b], ["1#0"]);
+});
+
+test("PR-27: selectAllRowIds returns every row_id, including settled / generating rows", () => {
+    const sel = helpers.selectAllRowIds(pr27Rows());
+    assert.deepStrictEqual([...sel].sort(), ["1#0", "1#1", "2#0", "2#1"]);
+});
+
+test("PR-27: reconcileSelection drops row_ids no longer in the table (after delete)", () => {
+    const rows = helpers.removeRows(pr27Rows(), ["1#0", "2#1"]);
+    const sel = new Set(["1#0", "1#1", "2#0", "2#1", "stale#0"]);
+    const out = helpers.reconcileSelection(sel, rows);
+    assert.deepStrictEqual([...out].sort(), ["1#1", "2#0"]);
+});
+
+test("PR-27: canEditRow allows pending/skipped/fallback, blocks generating/generated/retried", () => {
+    assert.strictEqual(helpers.canEditRow({ status: "pending" }), true);
+    assert.strictEqual(helpers.canEditRow({ status: "skipped" }), true);
+    assert.strictEqual(helpers.canEditRow({ status: "fallback" }), true);
+    assert.strictEqual(helpers.canEditRow({ status: "generating" }), false);
+    assert.strictEqual(helpers.canEditRow({ status: "generated" }), false);
+    assert.strictEqual(helpers.canEditRow({ status: "retried" }), false);
+    assert.strictEqual(helpers.canEditRow(null), false);
+});
+
+test("PR-27: canDeleteRow allows every status (soft cancel for generating)", () => {
+    for (const s of ["pending", "skipped", "fallback", "generating", "generated", "retried"]) {
+        assert.strictEqual(helpers.canDeleteRow({ status: s }), true, `status=${s}`);
+    }
+    assert.strictEqual(helpers.canDeleteRow(null), false);
+});
+
+test("PR-27: removeRows drops only matching row_ids, preserves order, returns a new array", () => {
+    const rows = pr27Rows();
+    const out = helpers.removeRows(rows, ["1#1", "2#0"]);
+    assert.strictEqual(out.length, 2);
+    assert.deepStrictEqual(out.map((r) => r.row_id), ["1#0", "2#1"]);
+    // Input untouched.
+    assert.strictEqual(rows.length, 4);
+    // Empty / non-array inputs are safe.
+    assert.deepStrictEqual(helpers.removeRows(null, ["1#0"]), []);
+    assert.deepStrictEqual(helpers.removeRows([], ["1#0"]), []);
+    // Empty removeIds → identity slice (same content, different array).
+    const noop = helpers.removeRows(rows, []);
+    assert.notStrictEqual(noop, rows);
+    assert.strictEqual(noop.length, rows.length);
+});
+
+test("PR-27: updatePromptForRow rewrites prompt + flips skipped→pending, blocks settled/generating rows", () => {
+    let rows = pr27Rows();
+    rows = helpers.updatePromptForRow(rows, "1#0", "  new prompt 1  ");
+    assert.strictEqual(rows[0].prompt, "new prompt 1");
+    assert.strictEqual(rows[0].status, "pending");
+    // Generating row (1#1) must not be edited.
+    rows = helpers.updatePromptForRow(rows, "1#1", "should-not-apply");
+    assert.strictEqual(rows[1].prompt, "scene1 base");
+    assert.strictEqual(rows[1].status, "generating");
+    // Generated row (2#0) must not be edited.
+    rows = helpers.updatePromptForRow(rows, "2#0", "should-not-apply-either");
+    assert.strictEqual(rows[2].prompt, "scene2 base");
+    assert.strictEqual(rows[2].status, "generated");
+});
+
+test("PR-27: updatePromptForRow with empty string falls back to skipped", () => {
+    const rows = helpers.initImageRowsFromScenes([
+        { scene_id: 1, image_prompt: "x", duration_s: 1 },
+    ], { imagesPerScene: 1 });
+    const out = helpers.updatePromptForRow(rows, "1#0", "   ");
+    assert.strictEqual(out[0].prompt, "");
+    assert.strictEqual(out[0].status, "skipped");
+    assert.match(out[0].reason || "", /image_prompt/);
+});
+
+test("PR-27: applyVariantPrompts replaces editable variants in variant_idx order", () => {
+    const rows = pr27Rows();
+    // scene 1 has 1#0 (pending) + 1#1 (generating). Re-roll should
+    // touch only 1#0 (variant 0) and skip 1#1 (in-flight).
+    const out = helpers.applyVariantPrompts(rows, 1, ["fresh-v0", "fresh-v1"]);
+    assert.strictEqual(out[0].prompt, "fresh-v0");
+    assert.strictEqual(out[0].status, "pending");
+    assert.strictEqual(out[1].prompt, "scene1 base", "generating row must not be re-rolled");
+    assert.strictEqual(out[1].status, "generating");
+});
+
+test("PR-27: applyVariantPrompts no-op when newPrompts is empty / non-array", () => {
+    const rows = pr27Rows();
+    assert.strictEqual(helpers.applyVariantPrompts(rows, 1, []).length, rows.length);
+    assert.strictEqual(helpers.applyVariantPrompts(rows, 1, null).length, rows.length);
+    // Reference inequality (returns a fresh array) but content equal.
+    const out = helpers.applyVariantPrompts(rows, 1, []);
+    assert.notStrictEqual(out, rows);
+    assert.deepStrictEqual(out.map((r) => r.prompt), rows.map((r) => r.prompt));
+});
+
+test("PR-27: summarizeSelection counts editable vs deletable + tracks scenes touched", () => {
+    const rows = pr27Rows();
+    const sel = new Set(["1#0", "1#1", "2#0", "2#1"]);
+    const s = helpers.summarizeSelection(rows, sel);
+    assert.strictEqual(s.total, 4);
+    // Editable: 1#0 (pending) + 2#1 (pending) = 2; 1#1 generating, 2#0 generated.
+    assert.strictEqual(s.editable, 2);
+    // Deletable: every row in selection.
+    assert.strictEqual(s.deletable, 4);
+    assert.strictEqual(s.inFlight, 1, "1#1 is generating");
+    assert.deepStrictEqual([...s.scenes].sort(), ["1", "2"]);
+});
+
+test("PR-27: summarizeSelection ignores stale row_ids no longer in the table", () => {
+    const rows = pr27Rows();
+    const sel = new Set(["1#0", "deleted#9"]);
+    const s = helpers.summarizeSelection(rows, sel);
+    // ``total`` reflects the size of the selection (not eligibility),
+    // so the stale entry contributes — but editable / deletable count
+    // only rows actually in ``rows``.
+    assert.strictEqual(s.total, 2);
+    assert.strictEqual(s.editable, 1);
+    assert.strictEqual(s.deletable, 1);
+});
+
+test("PR-27: applyBatchProgress / applyBatchResult silently no-op for deleted rows", () => {
+    let rows = pr27Rows();
+    rows = helpers.removeRows(rows, ["1#1"]);
+    // Late progress event for the deleted row_id must not crash and
+    // must not resurrect the row.
+    rows = helpers.applyBatchProgress(rows, "1#1", { progress: 90 });
+    assert.strictEqual(rows.find((r) => r.row_id === "1#1"), undefined);
+    rows = helpers.applyBatchResult(rows, "1#1", { status: "generated", image_path: "/tmp/x.png" });
+    assert.strictEqual(rows.find((r) => r.row_id === "1#1"), undefined);
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {
