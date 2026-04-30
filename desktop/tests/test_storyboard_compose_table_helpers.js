@@ -110,6 +110,19 @@ async function run() {
         assert.strictEqual(rows[1].image.progress, 0);
     });
 
+    test("applyImageProgress: skipped rows ignore late progress events (matches I2V counterpart)", () => {
+        // Regression for Devin Review BUG_pr-review-...0001:
+        // applyImageProgress was missing the "skipped" branch from its
+        // settled-row guard, so a stray late progress event would
+        // bump a skipped row's progress bar above 0.
+        let rows = helpers.initRowsFromScenes(SCENES);
+        rows = helpers.startImagePhase(rows, [1, 2], [{ scene_id: 3, reason: "missing image_prompt" }]);
+        // scene 3 is 'skipped' from startImagePhase.
+        rows = helpers.applyImageProgress(rows, 3, { progress: 70 });
+        assert.strictEqual(rows[2].image.status, "skipped");
+        assert.strictEqual(rows[2].image.progress, 0, "skipped row's progress must stay at 0");
+    });
+
     test("applyImageProgress: never downgrades a settled row", () => {
         let rows = helpers.initRowsFromScenes(SCENES);
         rows = helpers.startImagePhase(rows, [1, 2], []);

@@ -151,9 +151,12 @@
             const p = (payload && typeof payload.progress === "number") ? payload.progress : null;
             const next = Object.assign({}, row.image);
             if (p !== null && p > next.progress) next.progress = Math.max(0, Math.min(100, p));
-            // Don't downgrade a row that's already settled.
+            // Don't downgrade a row that's already settled — including
+            // 'skipped' rows that were filtered out at the planning
+            // stage, so a stray late `image:progress` event for a
+            // recycled scene_id can't bump a skipped row's bar.
             if (row.image.status === "generated" || row.image.status === "retried"
-                || row.image.status === "fallback") return row;
+                || row.image.status === "fallback" || row.image.status === "skipped") return row;
             return Object.assign({}, row, { image: next });
         });
     }
