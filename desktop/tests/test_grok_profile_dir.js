@@ -13,10 +13,17 @@ const assert = require("assert");
 const launchCalls = [];
 const fakePage = {
     _url: "https://accounts.x.ai/sign-in?redirect=grok-com&email=true",
+    _gotoShouldFail: false,
     isClosed: () => false,
     url() { return this._url; },
     async title() { return "Grok"; },
-    async goto(url) { this._url = url; return null; },
+    async goto(url) {
+        if (this._gotoShouldFail) {
+            throw new Error("net::ERR_INTERNET_DISCONNECTED");
+        }
+        this._url = url;
+        return null;
+    },
     async evaluate(fn) {
         try { return fn(); } catch { return null; }
     },
@@ -113,6 +120,35 @@ assert.strictEqual(typeof browser.openManualLogin, "function", "openManualLogin 
         "manual login is always headful"
     );
 
+    // ── test 6: about:blank must NOT be treated as a successful login.
+    //           Simulate a failed page.goto (network down): the .catch in
+    //           browser.js swallows it, page stays at about:blank. The
+    //           polling loop must NOT early-return ok:true (regression for
+    //           the negative-only URL check; fixed by allow-listing
+    //           grok.com / x.ai as the post-login destination).
+    fakePage._url = "about:blank";
+    fakePage._gotoShouldFail = true;
+    const tmpDir2 = "/tmp/cf-test-grok-profile-blank";
+    const r2 = await browser.openManualLogin({
+        profileDir: tmpDir2,
+        timeoutMs: 1500, // short — confirm it doesn't early-return ok:true
+        executablePath: "/usr/bin/fake-chrome-for-test",
+    });
+    fakePage._gotoShouldFail = false;
+    assert.strictEqual(r2.ok, false, `about:blank must not be treated as success, got ${JSON.stringify(r2)}`);
+    assert.match(r2.error || "", /timed out|closed/i, "expect timeout or closed error, not silent success");
+
+    // ── test 7: chrome://newtab / random hosts must also not count as success.
+    fakePage._url = "https://example.com/";
+    fakePage._gotoShouldFail = true;
+    const r3 = await browser.openManualLogin({
+        profileDir: "/tmp/cf-test-grok-profile-randomhost",
+        timeoutMs: 1500,
+        executablePath: "/usr/bin/fake-chrome-for-test",
+    });
+    fakePage._gotoShouldFail = false;
+    assert.strictEqual(r3.ok, false, `non-grok host must not be treated as success, got ${JSON.stringify(r3)}`);
+
     console.log("# GROK_PROFILE_DIR + openManualLogin");
     console.log("  ok  GROK_PROFILE_DIR overrides SESSIONS_DIR in config.js");
     console.log("  ok  GROK_PROFILE_DIR overrides PATHS.SESSIONS_DIR in app.config.js");
@@ -120,7 +156,9 @@ assert.strictEqual(typeof browser.openManualLogin, "function", "openManualLogin 
     console.log("  ok  openManualLogin returns ok:false on missing profileDir");
     console.log("  ok  openManualLogin launches headful with userDataDir = profileDir");
     console.log("  ok  openManualLogin resolves ok:true once user leaves /sign-in");
-    console.log("\n# results: 6 passed, 0 failed");
+    console.log("  ok  openManualLogin rejects about:blank (failed page.goto)");
+    console.log("  ok  openManualLogin rejects non-grok hosts (no allow-listed host)");
+    console.log("\n# results: 8 passed, 0 failed");
 })().catch((err) => {
     console.error("FAIL:", err && err.stack ? err.stack : err);
     process.exit(1);

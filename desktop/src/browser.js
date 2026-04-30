@@ -346,8 +346,17 @@ async function openManualLogin({ profileDir, label = "GrokLogin", timeoutMs = 10
         console.log(`[${label}] 🌐 ${url}`);
         lastUrl = url;
       }
-      if (url && !url.includes("sign-in") && !url.includes("accounts.x.ai/sign-in")) {
-        // User has navigated away from the sign-in page — treat as success.
+      if (
+        url
+        && !url.includes("sign-in")
+        && !url.includes("accounts.x.ai/sign-in")
+        // Require an explicit allow-listed post-login destination, otherwise
+        // a failed `page.goto` (page stuck at about:blank, error pages,
+        // chrome://newtab, etc.) would falsely match the "left sign-in"
+        // condition and report ok:true with an empty cookie jar.
+        && (url.includes("grok.com") || url.includes("x.ai"))
+      ) {
+        // User has navigated to grok.com / x.ai post-login — treat as success.
         // Give the profile a couple of seconds to flush cookies before close.
         await delay(2000, 3000);
         console.log(`[${label}] ✅ Login complete — profile saved at ${profileDir}`);
