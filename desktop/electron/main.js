@@ -558,6 +558,28 @@ ipcMain.handle('video:validateOutput', async (_, params) => {
     }
 });
 
+// PR-24: open a native folder picker for the Batch / Compose-short
+// output-dir input. Renderer calls ``api.dialog.chooseOutputDir()``
+// which returns ``{ canceled, path }`` — the renderer is responsible
+// for stuffing the returned path into the matching <input>.
+ipcMain.handle('dialog:chooseOutputDir', async (_, opts) => {
+    try {
+        const title = (opts && typeof opts.title === 'string') ? opts.title : 'Choose output folder';
+        const defaultPath = (opts && typeof opts.defaultPath === 'string' && opts.defaultPath) ? opts.defaultPath : undefined;
+        const result = await dialog.showOpenDialog(mainWindow, {
+            title,
+            defaultPath,
+            properties: ['openDirectory', 'createDirectory'],
+        });
+        if (result.canceled || !result.filePaths.length) {
+            return { canceled: true, path: '' };
+        }
+        return { canceled: false, path: result.filePaths[0] };
+    } catch (error) {
+        return { canceled: true, path: '', error: (error && error.message) || String(error) };
+    }
+});
+
 ipcMain.handle('account:importTxt', async () => {
     try {
         const result = await dialog.showOpenDialog(mainWindow, {
@@ -650,6 +672,36 @@ ipcMain.handle('auth:getSessionStatus', async (_, params) => {
         if (params && typeof params === 'object' && typeof params.maxAgeMs === 'number') {
             opts.maxAgeMs = params.maxAgeMs;
         }
+        // PR-24: unify the accounts.json source-of-truth with
+        // ``auth:saveAccounts`` / ``auth:getAccounts`` (both rooted at
+        // ``app.getPath('userData')/accounts.json``). The legacy default
+        // path resolved through ``app.config.PATHS.ACCOUNTS_FILE``
+        // pointed at ``desktop/accounts.json`` in dev mode (``npm
+        // start``) which is NOT where the IPC writer lands, so
+        // ``getSessionStatus`` would keep returning ``no_accounts`` even
+        // right after a successful save+auto-login. We pass an explicit
+        // ``accountsLoader`` that reads the same file the writer wrote.
+        opts.accountsLoader = () => {
+            const fs = require('fs');
+            const userDataPath = path.join(app.getPath('userData'), 'accounts.json');
+            try {
+                if (fs.existsSync(userDataPath)) {
+                    const data = fs.readFileSync(userDataPath, 'utf8');
+                    const parsed = JSON.parse(data);
+                    return Array.isArray(parsed) ? parsed : [];
+                }
+            } catch (e) {
+                console.warn('[auth:getSessionStatus] userData accounts read failed:', e && e.message);
+            }
+            // Last-resort: fall back to the AccountService default so
+            // builds that DO ship accounts.json next to the binary keep
+            // working.
+            try {
+                return require('../src/services/AccountService').loadAccounts();
+            } catch {
+                return [];
+            }
+        };
         return AuthService.getSessionStatus(opts);
     } catch (error) {
         return {
