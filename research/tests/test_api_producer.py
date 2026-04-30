@@ -596,3 +596,196 @@ def test_short_skips_srt_when_disabled(monkeypatch, tmp_path):
     # Audio + mp4 still produced.
     assert body["audio_path"]
     assert body["mp4_path"]
+
+
+# ─── /producer/short — scene_assets wiring (PR-14) ──────────────────────────
+
+
+def _basic_fake_tts():
+    """Reusable fake Edge-TTS adapter that yields a 4s clip + 2 word boundaries."""
+
+    class FakeAdapter:
+        name = "fake-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 8)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=4.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[
+                    WordBoundary(start_s=0.0, end_s=2.0, text="Welcome"),
+                    WordBoundary(start_s=2.0, end_s=4.0, text="creator-forge."),
+                ],
+            )
+
+    return FakeAdapter
+
+
+def test_short_passes_scene_assets_to_composer(monkeypatch, tmp_path):
+    """Happy path: every scene_assets entry has an existing file → all
+    pass through to ``_make_short`` as ``SceneAsset`` instances and the
+    response counts ``scenes_used``."""
+    captured: dict[str, Any] = {}
+
+    img_a = tmp_path / "scene_a.jpg"
+    img_b = tmp_path / "scene_b.jpg"
+    img_a.write_bytes(b"\xff" * 1024)
+    img_b.write_bytes(b"\xff" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "out_scene_assets_ok"
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(out),
+            "scene_assets": [
+                {"image_path": str(img_a), "start_s": 0.0, "duration_s": 2.0},
+                {"image_path": str(img_b), "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_used"] == 2
+    assert body["scenes_missing"] == 0
+    assert body["warnings"] == []
+
+    # _make_short must have received exactly two SceneAsset instances,
+    # in declaration order, with the requested timings.
+    assets = captured["scene_assets"]
+    assert assets is not None
+    assert len(assets) == 2
+    assert all(a.__class__.__name__ == "SceneAsset" for a in assets)
+    assert assets[0].image_path == img_a
+    assert assets[0].start_s == 0.0
+    assert assets[0].duration_s == 2.0
+    assert assets[1].image_path == img_b
+    assert assets[1].start_s == 2.0
+    assert assets[1].duration_s == 2.0
+
+
+def test_short_skips_missing_scene_asset_with_warning(monkeypatch, tmp_path):
+    """Robust failure mode: a scene_assets entry whose image_path doesn't
+    exist must NOT 422 the whole request — it gets a friendly warning,
+    is dropped from the composer payload, and counted in
+    ``scenes_missing``. This mirrors the rest of the suite (e.g. studio
+    LLM failures still return 200 + warnings)."""
+    captured: dict[str, Any] = {}
+
+    img_a = tmp_path / "scene_a.jpg"
+    img_a.write_bytes(b"\xff" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "out_scene_assets_partial"
+    missing_path = str(tmp_path / "does_not_exist.jpg")
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(out),
+            "scene_assets": [
+                {"image_path": str(img_a), "start_s": 0.0, "duration_s": 2.0},
+                {"image_path": missing_path, "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_used"] == 1
+    assert body["scenes_missing"] == 1
+    assert any("does_not_exist.jpg" in w for w in body["warnings"]), body["warnings"]
+
+    # Composer received only the surviving asset.
+    assets = captured["scene_assets"]
+    assert assets is not None
+    assert len(assets) == 1
+    assert assets[0].image_path == img_a
+
+
+def test_short_omits_scene_assets_preserves_gradient_default(monkeypatch, tmp_path):
+    """Backwards-compat: when the caller omits ``scene_assets`` the
+    composer must still be invoked with ``scene_assets=None`` (gradient
+    Ken-Burns fallback) and the response reports ``scenes_used=0``."""
+    captured: dict[str, Any] = {}
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "out_no_scene_assets"
+    r = client.post(
+        "/producer/short",
+        json={"script": SHORT_SCRIPT, "output_dir": str(out)},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_used"] == 0
+    assert body["scenes_missing"] == 0
+    assert captured["scene_assets"] is None
+
+
+def test_short_rejects_invalid_scene_asset_timings():
+    """Pydantic-level validation: duration_s must be > 0 and start_s must
+    be >= 0. These are programmer errors, not partial-batch failures, so
+    a 422 is appropriate (unlike a missing-file case)."""
+    # duration_s = 0 → 422
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "scene_assets": [
+                {"image_path": "/tmp/x.jpg", "start_s": 0.0, "duration_s": 0.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text
+
+    # start_s < 0 → 422
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "scene_assets": [
+                {"image_path": "/tmp/x.jpg", "start_s": -1.0, "duration_s": 1.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text
+
+    # whitespace-only image_path → 422 after strip
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "scene_assets": [
+                {"image_path": "   ", "start_s": 0.0, "duration_s": 1.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text

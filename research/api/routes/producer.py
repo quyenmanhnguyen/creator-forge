@@ -39,6 +39,7 @@ from research.core.pixelle import (
     ComposerOptions,
     EdgeTTSAdapter,
     LongFormScene,
+    SceneAsset,
     captions_to_srt,
     count_words,
     estimate_scene_count,
@@ -251,6 +252,21 @@ def _default_output_dir() -> Path:
     return base / f"short-{int(time.time() * 1000)}"
 
 
+class SceneAssetSpec(BaseModel):
+    """One pre-rendered per-scene background image to splice into the
+    composed short. Mirrors :class:`research.core.pixelle.SceneAsset`
+    but as a request schema (validates types, leaves disk-existence
+    checks to the route so a missing file becomes a friendly warning
+    instead of a 422).
+    """
+
+    image_path: str = Field(..., min_length=1, description="Absolute path to a PNG/JPEG/WebP on disk (typically from ImageService.generateBatch.savedFiles).")
+    start_s: float = Field(..., ge=0.0, description="Start time on the audio timeline in seconds.")
+    duration_s: float = Field(..., gt=0.0, description="How long this image stays on screen in seconds.")
+
+    _strip_path = field_validator("image_path", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+
 class ShortRequest(BaseModel):
     script: str = Field(..., min_length=1, description="Full narration script (single voice).")
     voice: str = Field(_DEFAULT_VOICE, description="Edge-TTS voice short name (e.g. 'en-US-AriaNeural').")
@@ -259,6 +275,16 @@ class ShortRequest(BaseModel):
     visual_provider: str = Field(DEFAULT_PROVIDER_NAME, description="Visual provider id (image source). Today only 'placeholder' is wired into the composer; other providers are reported via /producer/providers.")
     aspect: Literal["9:16"] = Field("9:16", description="Output aspect. Composer currently hard-codes 1080×1920.")
     write_srt: bool = Field(True, description="Write a sibling .srt next to the mp4.")
+    scene_assets: list[SceneAssetSpec] | None = Field(
+        None,
+        description=(
+            "Optional per-scene background images. Each entry pins one image to a "
+            "[start_s, start_s+duration_s] window on the audio timeline. When "
+            "provided, the composer skips the gradient placeholder and Ken-Burns "
+            "the supplied images instead. Missing files are skipped with a warning "
+            "(not a 422) so a partial AutoGrok batch still composes."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
@@ -277,6 +303,8 @@ class ShortResponse(BaseModel):
     caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
     visual_provider: str
     output_dir: str
+    scenes_used: int = 0
+    scenes_missing: int = 0
     warnings: list[str] = []
     notes: str = ""
 
@@ -339,7 +367,39 @@ def compose_short(req: ShortRequest) -> ShortResponse:
             caption_source="none",
             visual_provider=req.visual_provider,
             output_dir=str(output_dir),
+            scenes_used=0,
+            scenes_missing=len(req.scene_assets or []),
             warnings=warnings,
+        )
+
+    # ─── Resolve scene_assets (existence check, gradient fallback) ──────
+    # We deliberately do NOT 422 on missing files — a partial AutoGrok
+    # batch (e.g. 5 of 8 scenes succeeded) should still compose with the
+    # surviving frames + gradient gaps for the rest, mirroring the rest
+    # of the suite's "warnings + partial result" pattern.
+    resolved_scene_assets: list[SceneAsset] = []
+    scenes_missing = 0
+    for spec in req.scene_assets or []:
+        p = Path(spec.image_path).expanduser()
+        if not p.exists():
+            scenes_missing += 1
+            warnings.append(
+                f"Scene asset skipped (file not found): {spec.image_path} "
+                f"@ start={spec.start_s:.2f}s dur={spec.duration_s:.2f}s"
+            )
+            continue
+        if not p.is_file():
+            scenes_missing += 1
+            warnings.append(
+                f"Scene asset skipped (not a regular file): {spec.image_path}"
+            )
+            continue
+        resolved_scene_assets.append(
+            SceneAsset(
+                image_path=p,
+                start_s=float(spec.start_s),
+                duration_s=float(spec.duration_s),
+            )
         )
 
     audio_path = output_dir / "voice.mp3"
@@ -407,6 +467,7 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 captions=captions or None,
                 duration_hint=duration_s or None,
                 options=opts,
+                scene_assets=resolved_scene_assets or None,
             )
             composed_ok = mp4_path.exists()
         except Exception as exc:  # noqa: BLE001
@@ -431,6 +492,8 @@ def compose_short(req: ShortRequest) -> ShortResponse:
         caption_source=caption_source,
         visual_provider=req.visual_provider,
         output_dir=str(output_dir),
+        scenes_used=len(resolved_scene_assets),
+        scenes_missing=scenes_missing,
         warnings=warnings,
     )
 
