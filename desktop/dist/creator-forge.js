@@ -1344,6 +1344,343 @@
         }
     });
 
+    // ─── PR-20D — "Batch Image + Video" panel ────────────────────────
+    // KCRACKER-style two-table flow that auto-fills image_prompt +
+    // video_prompt from the scene_breakdown above. Each table is
+    // batched independently; the video table can run in I2V mode
+    // (uses each scene's settled image) or T2V mode (prompt-only).
+    //
+    // Persistent Grok session reuse comes from PR-11/12/13 — cookies
+    // live in $GROK_PROFILE_DIR (default `~/.creator-forge/grok-profile/`)
+    // and `AuthService.refreshAllCookies()` runs before every batch
+    // IPC, so logging in once via the manual-login window keeps the
+    // session valid across app restarts.
+    const sbbState = {
+        imageRows: [],
+        videoRows: [],
+        currentImageBatchSceneIds: [],
+        currentVideoBatchSceneIds: [],
+        listenerInstalled: false,
+        sessionKnown: false,
+    };
+
+    /** Repaint both image and video tables. */
+    function sbbRepaintAll() {
+        sbbRepaintImage();
+        sbbRepaintVideo();
+    }
+
+    /** Repaint just the image batch table. */
+    function sbbRepaintImage() {
+        const target = $('sbb-image-result');
+        if (!target) return;
+        if (!sbbState.imageRows.length) {
+            target.innerHTML = '<div class="empty">No prompts loaded. Click "Auto-fill from scenes" after running "Break into scenes" above.</div>';
+            return;
+        }
+        target.innerHTML = sbbRenderTable(sbbState.imageRows, 'image');
+    }
+
+    /** Repaint just the video batch table. */
+    function sbbRepaintVideo() {
+        const target = $('sbb-video-result');
+        if (!target) return;
+        if (!sbbState.videoRows.length) {
+            target.innerHTML = '<div class="empty">No prompts loaded. Click "Auto-fill from scenes" after running "Break into scenes" above.</div>';
+            return;
+        }
+        target.innerHTML = sbbRenderTable(sbbState.videoRows, 'video');
+    }
+
+    /**
+     * Render a per-row table for either kind. Same column layout for
+     * both so the panels are visually consistent: # | scene | prompt |
+     * status (pill + progress bar + thumb when settled) | actions.
+     */
+    function sbbRenderTable(rows, kind) {
+        const helpers = window.StoryboardBatchHelpers;
+        const summary = helpers.summarizeRows(rows);
+        const summaryStr = `total ${summary.total}`
+            + (summary.generated ? ` · ${summary.generated} done` : '')
+            + (summary.generating ? ` · ${summary.generating} generating` : '')
+            + (summary.fallback ? ` · ${summary.fallback} failed` : '')
+            + (summary.skipped ? ` · ${summary.skipped} skipped` : '');
+        let html = `<div class="stats-row"><span>${escapeHtml(summaryStr)}</span></div>`;
+        html += `<table class="swc-table"><thead><tr>
+            <th>#</th><th>Scene</th><th>Prompt</th><th>Status</th><th>Output</th><th>Actions</th>
+        </tr></thead><tbody>`;
+        for (const r of rows) {
+            const label = helpers.statusLabel(r.status);
+            const cls = helpers.statusClass(r.status);
+            let statusCell = `<span class="pill ${escapeHtml(cls)}">${escapeHtml(label)} (${escapeHtml(r.attempts || 0)}x)</span>`;
+            if (r.status === 'generating') {
+                statusCell += `<div class="progress-bar"><div style="width:${escapeHtml(r.progress || 0)}%"></div></div>`;
+            }
+            if (r.reason && (r.status === 'fallback' || r.status === 'skipped')) {
+                statusCell += `<div class="reason">${escapeHtml(r.reason)}</div>`;
+            }
+            let outCell = '<span class="muted">—</span>';
+            const outPath = kind === 'image' ? r.image_path : r.video_path;
+            if (outPath) {
+                if (kind === 'image' && r.url) {
+                    outCell = `<div class="thumb-cell"><img src="${escapeHtml(r.url)}" alt="scene ${escapeHtml(r.scene_id)}" /></div>`;
+                } else if (kind === 'video' && r.url) {
+                    outCell = `<div class="thumb-cell"><video src="${escapeHtml(r.url)}" muted playsinline preload="metadata"></video></div>`;
+                } else {
+                    outCell = `<div class="thumb-cell"><div class="thumb-placeholder">loading…</div></div>`;
+                }
+                outCell += `<div class="reason"><code>${escapeHtml(outPath)}</code></div>`;
+            }
+            const actions = outPath ? sbbRenderPathActions(outPath) : '<span class="muted">—</span>';
+            html += `<tr>
+                <td class="scene-num">${escapeHtml(r.order)}</td>
+                <td><b>scene ${escapeHtml(r.scene_id != null ? r.scene_id : '?')}</b><div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
+                <td class="prompt-cell">${escapeHtml(r.prompt || '')}</td>
+                <td>${statusCell}</td>
+                <td>${outCell}</td>
+                <td class="actions">${actions}</td>
+            </tr>`;
+        }
+        html += '</tbody></table>';
+        return html;
+    }
+
+    function sbbRenderPathActions(path) {
+        if (!path) return '';
+        const safe = String(path).replace(/"/g, '&quot;');
+        if (api && typeof api.openPath === 'function') {
+            return `<span class="actions"><a href="#" data-swc-open="${safe}">open</a> <a href="#" data-swc-show="${safe}">show in folder</a></span>`;
+        }
+        return '';
+    }
+
+    /**
+     * Resolve thumbnail file:// URLs after a phase settles. Reuses
+     * `electronAPI.getFileUrl` (same approach as PR-20C).
+     */
+    async function sbbResolveUrls(rows, kind) {
+        if (!api || typeof api.getFileUrl !== 'function') return;
+        const tasks = [];
+        rows.forEach((row) => {
+            const pathField = kind === 'image' ? row.image_path : row.video_path;
+            if (pathField && !row.url) {
+                tasks.push(api.getFileUrl(pathField).then((res) => {
+                    if (res && res.success && res.url) row.url = res.url;
+                }).catch(() => {}));
+            }
+        });
+        if (!tasks.length) return;
+        await Promise.all(tasks);
+        if (kind === 'image') sbbRepaintImage(); else sbbRepaintVideo();
+    }
+
+    /** Install a single shared progress listener for both image + video phases. */
+    function sbbInstallListener() {
+        if (sbbState.listenerInstalled) return;
+        if (!api || typeof api.onProgress !== 'function') return;
+        api.onProgress((data) => {
+            if (!data || !data.progress) return;
+            const helpers = window.StoryboardBatchHelpers;
+            const { jobId, progress } = data;
+            const idx = (progress && typeof progress.globalIdx === 'number') ? progress.globalIdx : -1;
+            if (jobId === 'image' && idx >= 0 && idx < sbbState.currentImageBatchSceneIds.length) {
+                const sid = sbbState.currentImageBatchSceneIds[idx];
+                sbbState.imageRows = helpers.applyBatchProgress(sbbState.imageRows, sid, progress);
+                sbbRepaintImage();
+            } else if ((jobId === 'i2v' || jobId === 'video') && idx >= 0 && idx < sbbState.currentVideoBatchSceneIds.length) {
+                const sid = sbbState.currentVideoBatchSceneIds[idx];
+                sbbState.videoRows = helpers.applyBatchProgress(sbbState.videoRows, sid, progress);
+                sbbRepaintVideo();
+            }
+        });
+        sbbState.listenerInstalled = true;
+    }
+
+    /**
+     * Best-effort check for "is there at least one Grok account
+     * configured?". `auth:getAccounts` reads `accounts.json` so a
+     * non-empty list means the user has set up accounts; it does
+     * NOT prove a live session, but `image:generate` /
+     * `i2v:generate` / `video:generate` will surface "no active
+     * sessions" inline if cookies expired. We use this banner to
+     * nudge users who haven't run manual-login at all yet.
+     */
+    async function sbbCheckSession() {
+        const banner = $('sbb-login-banner');
+        if (!banner) return;
+        if (!api || !api.auth || typeof api.auth.getAccounts !== 'function') {
+            banner.hidden = true;
+            return;
+        }
+        try {
+            const res = await api.auth.getAccounts();
+            const accounts = Array.isArray(res) ? res : (res && Array.isArray(res.accounts) ? res.accounts : []);
+            const hasAny = accounts.length > 0;
+            banner.hidden = hasAny;
+            sbbState.sessionKnown = hasAny;
+        } catch (_) {
+            banner.hidden = false;
+        }
+    }
+
+    function sbbAutoFill() {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) {
+            $('sbb-image-result').innerHTML = '<div class="error">storyboard_batch_helpers.js failed to load — rebuild Electron.</div>';
+            return;
+        }
+        const scenes = (state.lastScenes || []).slice();
+        if (!scenes.length) {
+            $('sbb-image-result').innerHTML = '<div class="error">No scenes in memory. Run "Break into scenes" above first.</div>';
+            $('sbb-video-result').innerHTML = '';
+            return;
+        }
+        sbbState.imageRows = helpers.initImageRowsFromScenes(scenes);
+        sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes);
+        sbbRepaintAll();
+    }
+
+    function sbbClear() {
+        sbbState.imageRows = [];
+        sbbState.videoRows = [];
+        sbbRepaintAll();
+    }
+
+    async function sbbOpenLogin() {
+        if (!api || !api.auth || typeof api.auth.openManualLogin !== 'function') {
+            const banner = $('sbb-login-banner');
+            if (banner) banner.querySelector('span').textContent = 'auth.openManualLogin IPC unavailable — rebuild Electron.';
+            return;
+        }
+        try {
+            await api.auth.openManualLogin({});
+            // Re-poll session status after the login window closes.
+            setTimeout(() => sbbCheckSession().catch(() => {}), 1000);
+        } catch (e) {
+            console.error('openManualLogin failed', e);
+        }
+    }
+
+    async function sbbGenerateImages() {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        if (!sbbState.imageRows.length) {
+            sbbAutoFill();
+            if (!sbbState.imageRows.length) return;
+        }
+        if (!api || !api.image || typeof api.image.generate !== 'function') {
+            $('sbb-image-result').innerHTML = '<div class="error">electronAPI.image.generate unavailable.</div>';
+            return;
+        }
+        const plan = helpers.planImageGenerate(sbbState.imageRows);
+        if (!plan.prompts.length) {
+            $('sbb-image-result').innerHTML = '<div class="error">No eligible image prompts (every scene was skipped — check image_prompt).</div>';
+            return;
+        }
+        sbbInstallListener();
+        sbbState.imageRows = helpers.startBatchPhase(sbbState.imageRows);
+        sbbState.currentImageBatchSceneIds = plan.sceneIds.slice();
+        sbbRepaintImage();
+
+        const config = { imageGenerationCount: 1 };
+        const aspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
+        if (aspect) config.aspectRatio = aspect;
+        let resp;
+        try {
+            resp = await api.image.generate({ prompts: plan.prompts, config });
+        } catch (err) {
+            const banner = $('sbb-image-result');
+            if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">image:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
+            return;
+        }
+        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'image');
+        for (const r of settled) {
+            sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.scene_id, r);
+        }
+        // Re-pair the video table now that some images settled —
+        // I2V mode depends on having the latest image_path bindings.
+        sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
+        sbbRepaintAll();
+        sbbResolveUrls(sbbState.imageRows, 'image').catch(() => {});
+
+        if (resp && resp.success === false) {
+            const why = resp.error || 'Unknown — check Login panel for an active Grok session.';
+            $('sbb-image-result').insertAdjacentHTML('afterbegin', `<div class="error">image:generate failed: ${escapeHtml(why)}</div>`);
+        }
+    }
+
+    async function sbbGenerateVideos() {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        if (!sbbState.videoRows.length) {
+            sbbAutoFill();
+            if (!sbbState.videoRows.length) return;
+        }
+        const mode = ($('sbb-video-mode') || {}).value || 'i2v';
+        if (mode === 'i2v') {
+            if (!api || !api.i2v || typeof api.i2v.generate !== 'function') {
+                $('sbb-video-result').innerHTML = '<div class="error">electronAPI.i2v.generate unavailable.</div>';
+                return;
+            }
+        } else {
+            if (!api || !api.video || typeof api.video.generate !== 'function') {
+                $('sbb-video-result').innerHTML = '<div class="error">electronAPI.video.generate unavailable (T2V).</div>';
+                return;
+            }
+        }
+        // Always re-pair before planning so the latest image table state
+        // is reflected in I2V eligibility.
+        sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
+        const plan = helpers.planVideoGenerate(sbbState.videoRows, mode);
+        const eligibleCount = mode === 'i2v' ? plan.items.length : plan.prompts.length;
+        if (!eligibleCount) {
+            const reason = mode === 'i2v'
+                ? 'No eligible scenes — generate images first or switch to T2V mode.'
+                : 'No video prompts — every scene is missing video_prompt / flow_video_prompt.';
+            $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(reason)}</div>`);
+            return;
+        }
+        sbbInstallListener();
+        // Mark eligible rows as generating, but also reflect any
+        // skipped rows from the plan (e.g. I2V rows missing an image).
+        const eligibleSet = new Set(plan.sceneIds.map(String));
+        const skippedMap = new Map((plan.skipped || []).map((s) => [String(s.scene_id), s.reason]));
+        sbbState.videoRows = sbbState.videoRows.map((row) => {
+            const sid = String(row.scene_id);
+            if (eligibleSet.has(sid)) {
+                return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
+            }
+            if (skippedMap.has(sid)) {
+                return Object.assign({}, row, { status: 'skipped', reason: skippedMap.get(sid) });
+            }
+            return row;
+        });
+        sbbState.currentVideoBatchSceneIds = plan.sceneIds.slice();
+        sbbRepaintVideo();
+
+        let resp;
+        try {
+            if (mode === 'i2v') {
+                resp = await api.i2v.generate({ items: plan.items });
+            } else {
+                resp = await api.video.generate({ prompts: plan.prompts });
+            }
+        } catch (err) {
+            $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(mode)}:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
+            return;
+        }
+        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'video');
+        for (const r of settled) {
+            sbbState.videoRows = helpers.applyBatchResult(sbbState.videoRows, r.scene_id, r);
+        }
+        sbbRepaintVideo();
+        sbbResolveUrls(sbbState.videoRows, 'video').catch(() => {});
+
+        if (resp && resp.success === false) {
+            const why = resp.error || 'Unknown — check Login panel for an active Grok session.';
+            $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(mode)}:generate failed: ${escapeHtml(why)}</div>`);
+        }
+    }
 
     async function populateStoryboardComposeVoicePicker() {
         if (!api) return;
@@ -1411,6 +1748,11 @@
         'scene-breakdown': runSceneBreakdown,
         'compose-short': runComposeShort,
         'storyboard-compose': runStoryboardCompose,
+        'storyboard-batch-fill': async () => sbbAutoFill(),
+        'storyboard-batch-clear': async () => sbbClear(),
+        'storyboard-batch-image': sbbGenerateImages,
+        'storyboard-batch-video': sbbGenerateVideos,
+        'storyboard-batch-login': sbbOpenLogin,
     };
 
     function setupRunButtons() {
@@ -1444,6 +1786,12 @@
         // so the picker fills in shortly after cold start.
         populateVoicePicker();
         populateStoryboardComposeVoicePicker();
+        // PR-20D — paint the empty-state for the batch panel and
+        // poll the Grok session banner so the user sees right away
+        // whether they need to log in.
+        sbbRepaintAll();
+        sbbCheckSession().catch(() => {});
+        setInterval(() => sbbCheckSession().catch(() => {}), 30_000);
         const voicePollHandle = setInterval(() => {
             const ps = $('ps-voice');
             const swc = $('swc-voice');
