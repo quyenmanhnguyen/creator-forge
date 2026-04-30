@@ -76,12 +76,18 @@ try {
     APP_BASE_DIR = process.env.AUTOGROK_USER_DATA_DIR || path.join(__dirname, "..", "..");
 }
 
+// GROK_PROFILE_DIR (env) takes precedence for the Puppeteer userDataDir root —
+// see desktop/src/config.js for the same override on the legacy export.
+const SESSIONS_DIR = process.env.GROK_PROFILE_DIR
+    ? path.resolve(process.env.GROK_PROFILE_DIR)
+    : path.join(APP_BASE_DIR, "sessions");
+
 const PATHS = {
     IMAGE_DIR: path.join(APP_BASE_DIR, "images"),
     VIDEO_DIR: path.join(APP_BASE_DIR, "videos"),
     I2V_DIR: path.join(APP_BASE_DIR, "i2v-videos"),
     I2V_INPUT_DIR: path.join(APP_BASE_DIR, "i2v-input"),
-    SESSIONS_DIR: path.join(APP_BASE_DIR, "sessions"),
+    SESSIONS_DIR,
     LOG_DIR: path.join(APP_BASE_DIR, "logs"),
     ACCOUNTS_FILE: path.join(APP_BASE_DIR, "accounts.json"),
 };

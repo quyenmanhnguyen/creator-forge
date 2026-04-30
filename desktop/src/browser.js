@@ -262,4 +262,103 @@ async function setupAccount(account, accIdx) {
   return { browser, page, accIdx, statsigId: capturedHeaders?.['x-statsig-id'] || null, capturedHeaders };
 }
 
-module.exports = { login, setupAccount };
+/**
+ * Open a headful browser window pointed at the Grok login page using a
+ * persistent userDataDir, then wait for the user to finish logging in by
+ * polling the URL until it leaves `/sign-in`. Cookies/session are written to
+ * the persistent profile directory and reused on next launch.
+ *
+ * Use this when the operator wants to log in manually (no email+password
+ * stored in `accounts.json`). Once the function resolves with `ok:true`, the
+ * profile at `profileDir` can be passed back into `setupAccount` (or used
+ * directly via Puppeteer with the same `userDataDir`).
+ *
+ * @param {Object} opts
+ * @param {string} opts.profileDir   Persistent userDataDir for Puppeteer.
+ * @param {string} [opts.label]      Console-log prefix.
+ * @param {number} [opts.timeoutMs]  Max time to wait for login (default 10min).
+ * @returns {Promise<{ok: boolean, profileDir: string, error?: string}>}
+ */
+async function openManualLogin({ profileDir, label = "GrokLogin", timeoutMs = 10 * 60 * 1000, executablePath } = {}) {
+  if (!profileDir || typeof profileDir !== "string") {
+    return { ok: false, profileDir: profileDir || "", error: "profileDir is required" };
+  }
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  const chromePath = executablePath || process.env.CHROME_EXECUTABLE_PATH || findChromePath();
+  if (!chromePath) {
+    return {
+      ok: false,
+      profileDir,
+      error: "Chrome/Edge not found on this machine. Install Google Chrome or Microsoft Edge, or set CHROME_EXECUTABLE_PATH.",
+    };
+  }
+
+  console.log(`[${label}] 🚀 Manual login — launching headful browser at ${profileDir}`);
+  const browser = await puppeteer.launch({
+    headless: false,
+    executablePath: chromePath,
+    defaultViewport: { width: 1280, height: 720 },
+    userDataDir: profileDir,
+    protocolTimeout: 300000,
+    args: [
+      "--window-position=0,0",
+      "--window-size=1280,720",
+      "--no-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-infobars",
+      "--disable-dev-shm-usage",
+      "--no-first-run",
+      "--disable-features=TranslateUI",
+      "--remote-debugging-port=0",
+    ],
+    ignoreDefaultArgs: ["--enable-automation"],
+  });
+
+  try {
+    const pages = await browser.pages();
+    for (let i = 1; i < pages.length; i++) await pages[i].close();
+    const page = pages[0] || (await browser.newPage());
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      window.chrome = { runtime: {} };
+    });
+
+    await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 60000 }).catch(() => { });
+    await handleCf(page, label);
+
+    // Poll URL until the user leaves the sign-in flow (or hits timeout, or
+    // closes the window). 1.5s tick keeps CPU low.
+    const start = Date.now();
+    let lastUrl = "";
+    while (Date.now() - start < timeoutMs) {
+      let pageStillOpen = true;
+      let url = "";
+      try {
+        url = page.url();
+      } catch {
+        pageStillOpen = false;
+      }
+      if (!pageStillOpen || page.isClosed?.()) {
+        return { ok: false, profileDir, error: "Login window was closed before login completed" };
+      }
+      if (url && url !== lastUrl) {
+        console.log(`[${label}] 🌐 ${url}`);
+        lastUrl = url;
+      }
+      if (url && !url.includes("sign-in") && !url.includes("accounts.x.ai/sign-in")) {
+        // User has navigated away from the sign-in page — treat as success.
+        // Give the profile a couple of seconds to flush cookies before close.
+        await delay(2000, 3000);
+        console.log(`[${label}] ✅ Login complete — profile saved at ${profileDir}`);
+        return { ok: true, profileDir };
+      }
+      await delay(1500, 1500);
+    }
+    return { ok: false, profileDir, error: `Manual login timed out after ${timeoutMs}ms` };
+  } finally {
+    try { await browser.close(); } catch { /* ignore */ }
+  }
+}
+
+module.exports = { login, setupAccount, openManualLogin };

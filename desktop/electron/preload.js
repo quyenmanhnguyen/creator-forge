@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
         saveAccounts: (accounts) => ipcRenderer.invoke('auth:saveAccounts', accounts),
         setupAccounts: (accounts) => ipcRenderer.invoke('auth:setupAccounts', accounts),
         importTxt: () => ipcRenderer.invoke('account:importTxt'),
+        // Open a headful Puppeteer browser at the Grok login page using a
+        // persistent userDataDir. Useful when the user wants to log in by
+        // hand instead of storing credentials in `accounts.json`.
+        openManualLogin: (params) => ipcRenderer.invoke('auth:openManualLogin', params),
     },
 
     license: {

@@ -56,6 +56,18 @@ output/
 debug/
 ref-images/
 *.log
+# Puppeteer userDataDir (Grok login session). Default location is inside
+# `sessions/` above, but GROK_PROFILE_DIR may point this anywhere — also
+# ignore the common opt-in name in case someone places it under desktop/.
+grok-profile/
+desktop/sessions/
+desktop/grok-profile/
+# Generation outputs when running in dev mode (BASE_DIR = desktop/).
+desktop/images/
+desktop/videos/
+desktop/i2v-videos/
+desktop/i2v-input/
+desktop/logs/
 
 # --- IDE / OS ---
 .vscode/

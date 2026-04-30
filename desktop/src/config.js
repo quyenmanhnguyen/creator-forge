@@ -25,7 +25,12 @@ const UPLOAD_URL = "https://grok.com/rest/app-chat/upload-file";
 const IMAGE_DIR = path.join(BASE_DIR, "images");
 const VIDEO_DIR = path.join(BASE_DIR, "videos");
 const I2V_DIR = path.join(BASE_DIR, "i2v-videos");
-const SESSIONS_DIR = path.join(BASE_DIR, "sessions");
+// GROK_PROFILE_DIR (env) takes precedence: lets users point per-account
+// Puppeteer userDataDir profiles at e.g. ~/.creator-forge/grok-profile/
+// instead of <repo>/desktop/sessions/. Falls back to BASE_DIR/sessions.
+const SESSIONS_DIR = process.env.GROK_PROFILE_DIR
+  ? path.resolve(process.env.GROK_PROFILE_DIR)
+  : path.join(BASE_DIR, "sessions");
 const LOG_DIR = path.join(BASE_DIR, "logs");
 const BATCH_SIZE = 30;
 
