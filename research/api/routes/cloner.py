@@ -207,7 +207,7 @@ def _llm_clone_kit(
 
     try:
         raw = llm.chat_json(json.dumps(payload, ensure_ascii=False), system=system)
-        data = json.loads(raw)
+        data = llm.parse_llm_json(raw)
     except RuntimeError as exc:
         if llm.ERR_NO_DEEPSEEK_KEY in str(exc):
             warnings.append("Clone kit skipped: DEEPSEEK_API_KEY not set.")

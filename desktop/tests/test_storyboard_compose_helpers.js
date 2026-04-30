@@ -263,11 +263,17 @@ async function run() {
             "preload.js must expose `statBytes` at the top level (not under `file: { statBytes }`)");
     });
 
-    test("creator-forge.js calls api.statBytes (not api.file.statBytes)", () => {
+    test("creator-forge.js never calls api.file.statBytes (legacy namespace)", () => {
+        // PR-21 removed the "Compose with AutoGrok" panel from the
+        // Storyboard tab, which was the only caller of `api.statBytes`
+        // in the renderer. The bridge layer still uses `statBytes` via
+        // the same preload binding (covered by the preload-shape test
+        // above), but the renderer side now has no direct call. We
+        // only need to keep the *negative* assertion to prevent a
+        // future regression to the wrong namespace.
         const fs = require("fs");
         const path = require("path");
         const src = fs.readFileSync(path.join(__dirname, "..", "dist", "creator-forge.js"), "utf8");
-        assert.ok(src.includes("api.statBytes"), "renderer must call `api.statBytes`");
         assert.ok(!src.includes("api.file.statBytes"),
             "renderer must NOT call `api.file.statBytes` — that namespace doesn't exist in preload.js");
     });
