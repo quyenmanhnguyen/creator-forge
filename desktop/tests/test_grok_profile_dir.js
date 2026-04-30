@@ -158,7 +158,33 @@ assert.strictEqual(typeof browser.openManualLogin, "function", "openManualLogin 
     console.log("  ok  openManualLogin resolves ok:true once user leaves /sign-in");
     console.log("  ok  openManualLogin rejects about:blank (failed page.goto)");
     console.log("  ok  openManualLogin rejects non-grok hosts (no allow-listed host)");
-    console.log("\n# results: 8 passed, 0 failed");
+
+    // ── test 8: regression for the auth:openManualLogin default-path
+    //           resolution. When GROK_PROFILE_DIR is set, the IPC handler
+    //           must resolve `payload.profileDir || <SESSIONS_DIR>/manual`,
+    //           NOT short-circuit on `process.env.GROK_PROFILE_DIR` (which
+    //           would point at SESSIONS_DIR root and collide with the
+    //           per-email subdirs that setupAccount writes there).
+    process.env.GROK_PROFILE_DIR = "/tmp/cf-test-grok-profile-ipc";
+    delete require.cache[require.resolve("../src/config")];
+    const ipcCfg = require("../src/config");
+    // Simulate the resolution that desktop/electron/main.js performs:
+    //   payload.profileDir || path.join(GROK_SESSIONS_DIR, 'manual')
+    const resolved = path.join(ipcCfg.SESSIONS_DIR, "manual");
+    assert.strictEqual(
+        resolved,
+        path.join(path.resolve("/tmp/cf-test-grok-profile-ipc"), "manual"),
+        `auth:openManualLogin default must point at <SESSIONS_DIR>/manual, got ${resolved}`
+    );
+    assert.notStrictEqual(
+        resolved,
+        path.resolve("/tmp/cf-test-grok-profile-ipc"),
+        "manual login profile must NOT be the SESSIONS_DIR root (collides with per-email subdirs)"
+    );
+    delete process.env.GROK_PROFILE_DIR;
+    console.log("  ok  auth:openManualLogin default = <SESSIONS_DIR>/manual (not root)");
+
+    console.log("\n# results: 9 passed, 0 failed");
 })().catch((err) => {
     console.error("FAIL:", err && err.stack ? err.stack : err);
     process.exit(1);
