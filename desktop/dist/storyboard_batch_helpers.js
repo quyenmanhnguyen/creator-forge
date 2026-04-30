@@ -585,10 +585,11 @@
 
     /**
      * Replace the prompt text of a single row. Pure — returns a new
-     * array. ``status === "skipped"`` rows whose prompt was empty get
-     * promoted to ``pending`` once a non-empty prompt arrives so the
-     * user can re-fill them; conversely a prompt cleared back to
-     * empty falls back to ``skipped``.
+     * array. ``status === "skipped"`` and ``status === "fallback"``
+     * rows are promoted to ``pending`` once a non-empty prompt
+     * arrives so the user can re-fill them with the new text;
+     * conversely a prompt cleared back to empty falls back to
+     * ``skipped``.
      */
     function updatePromptForRow(rows, row_id, prompt) {
         if (!Array.isArray(rows)) return [];
@@ -603,10 +604,10 @@
             // canEditRow, but enforce here as well so a programmatic
             // caller can't sneak past it.
             if (!canEditRow(r)) return r;
-            const wasSkipped = r.status === "skipped";
+            const isReeditableStatus = r.status === "skipped" || r.status === "fallback";
             return Object.assign({}, r, {
                 prompt: next,
-                status: next ? (wasSkipped ? "pending" : r.status) : "skipped",
+                status: next ? (isReeditableStatus ? "pending" : r.status) : "skipped",
                 reason: next ? null : (r.reason || "missing image_prompt"),
             });
         });
@@ -642,9 +643,10 @@
             if (!canEditRow(row)) continue; // don't trample settled / in-flight rows
             const next = (typeof newPrompts[v] === "string") ? newPrompts[v].trim() : "";
             if (!next) continue;
+            const isReeditableStatus = row.status === "skipped" || row.status === "fallback";
             out[idx] = Object.assign({}, row, {
                 prompt: next,
-                status: row.status === "skipped" ? "pending" : row.status,
+                status: isReeditableStatus ? "pending" : row.status,
                 reason: null,
             });
         }

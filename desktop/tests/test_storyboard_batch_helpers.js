@@ -651,6 +651,38 @@ test("PR-27: updatePromptForRow rewrites prompt + flips skipped→pending, block
     assert.strictEqual(rows[2].status, "generated");
 });
 
+test("PR-27: updatePromptForRow promotes fallback → pending after fresh prompt edit (Devin Review fix)", () => {
+    const rows = helpers.initImageRowsFromScenes([
+        { scene_id: 1, image_prompt: "old prompt", duration_s: 1 },
+    ], { imagesPerScene: 1 });
+    rows[0].status = "fallback";
+    rows[0].reason = "Grok rate-limited";
+    rows[0].attempts = 2;
+    const out = helpers.updatePromptForRow(rows, "1#0", "fresh prompt");
+    assert.strictEqual(out[0].prompt, "fresh prompt");
+    assert.strictEqual(out[0].status, "pending", "fallback row must flip to pending so the next batch picks it up");
+    assert.strictEqual(out[0].reason, null);
+    // Attempts counter is preserved — it's the LLM's history, not the prompt's.
+    assert.strictEqual(out[0].attempts, 2);
+});
+
+test("PR-27: applyVariantPrompts promotes fallback → pending too (Devin Review fix)", () => {
+    const rows = helpers.initImageRowsFromScenes([
+        { scene_id: 5, image_prompt: "base", duration_s: 1 },
+    ], { imagesPerScene: 2 });
+    rows[0].status = "fallback";
+    rows[0].reason = "Grok timeout";
+    rows[1].status = "pending";
+    const out = helpers.applyVariantPrompts(rows, 5, ["new-v0", "new-v1"]);
+    // Variant 0 (was fallback) → flipped to pending with the new prompt.
+    assert.strictEqual(out[0].prompt, "new-v0");
+    assert.strictEqual(out[0].status, "pending");
+    assert.strictEqual(out[0].reason, null);
+    // Variant 1 (was pending) → stays pending with the new prompt.
+    assert.strictEqual(out[1].prompt, "new-v1");
+    assert.strictEqual(out[1].status, "pending");
+});
+
 test("PR-27: updatePromptForRow with empty string falls back to skipped", () => {
     const rows = helpers.initImageRowsFromScenes([
         { scene_id: 1, image_prompt: "x", duration_s: 1 },
