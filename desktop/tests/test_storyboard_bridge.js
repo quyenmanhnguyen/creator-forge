@@ -636,3 +636,249 @@ test('animateScenes: throws a helpful error if electronAPI.i2v.generate is missi
         /electronAPI\.i2v\.generate is unavailable/,
     );
 });
+
+console.log('');
+console.log('# StoryboardBridge.composeWithVideoScenes (PR-20B)');
+
+// Helper: a richer fake API supporting i2v.generate and statBytes hook.
+function fakeAPIForVideo({ imageReturn, i2vReturn, composeReturn } = {}) {
+    const calls = { image: [], i2v: [], compose: [] };
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: {
+            generate: (params) => {
+                calls.image.push(params);
+                return Promise.resolve(typeof imageReturn === 'function' ? imageReturn(params) : (imageReturn || { ok: true }));
+            },
+        },
+        i2v: {
+            generate: (params) => {
+                calls.i2v.push(params);
+                return Promise.resolve(typeof i2vReturn === 'function' ? i2vReturn(params, calls.i2v.length) : (i2vReturn || { success: true, results: [] }));
+            },
+        },
+        producer: {
+            composeShort: (params) => {
+                calls.compose.push(params);
+                return Promise.resolve(typeof composeReturn === 'function' ? composeReturn(params) : (composeReturn || { mp4_path: '/tmp/out.mp4', scenes_used: 0, scenes_missing: 0, videos_used: 0, videos_missing: 0, warnings: [] }));
+            },
+        },
+        refimg: { generate: () => null },
+    };
+    return { api, calls };
+}
+
+test('composeWithVideoScenes: happy path forwards both scene_assets and video_scene_assets to composeShort', async () => {
+    // Two scenes, both image and i2v succeed cleanly.
+    const sizes = {
+        '/img-s1.png': 80_000,
+        '/img-s2.png': 90_000,
+        '/i2v-s1.mp4': 500_000,
+        '/i2v-s2.mp4': 700_000,
+    };
+    const { api, calls } = fakeAPIForVideo({
+        imageReturn: ({ prompts }) => ({
+            success: true,
+            results: prompts.map((_p, k) => ({ globalIdx: k, savedFiles: [`/img-s${k + 1}.png`], success: true })),
+        }),
+        i2vReturn: ({ items }) => ({
+            success: true,
+            results: items.map((_it, k) => ({ globalIdx: k, savedFile: `/i2v-s${k + 1}.mp4`, success: true })),
+        }),
+    });
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.composeWithVideoScenes({
+        script: 'hello world',
+        scenes: [
+            { scene_id: 1, image_prompt: 'p1', video_prompt: 'v1', duration_s: 3 },
+            { scene_id: 2, image_prompt: 'p2', flow_video_prompt: 'fv2', duration_s: 4 },
+        ],
+        max_attempts: 1,
+        max_attempts_i2v: 1,
+    }, { stat: (p) => sizes[p] != null ? { size: sizes[p] } : null });
+
+    assert.strictEqual(calls.image.length, 1, 'one image:generate call (no retry needed)');
+    assert.strictEqual(calls.i2v.length, 1, 'one i2v:generate call (no retry needed)');
+    assert.strictEqual(calls.compose.length, 1);
+
+    const composePayload = calls.compose[0];
+    assert.deepStrictEqual(composePayload.scene_assets, [
+        { image_path: '/img-s1.png', start_s: 0, duration_s: 3 },
+        { image_path: '/img-s2.png', start_s: 3, duration_s: 4 },
+    ]);
+    assert.ok(Array.isArray(composePayload.video_scene_assets));
+    assert.strictEqual(composePayload.video_scene_assets.length, 2);
+    assert.deepStrictEqual(composePayload.video_scene_assets[0], { video_path: '/i2v-s1.mp4', start_s: 0, duration_s: 3 });
+    assert.deepStrictEqual(composePayload.video_scene_assets[1], { video_path: '/i2v-s2.mp4', start_s: 3, duration_s: 4 });
+    // Video items shipped to i2v carry imagePath + prompt (IPC contract).
+    assert.deepStrictEqual(calls.i2v[0].items, [
+        { imagePath: '/img-s1.png', prompt: 'v1' },
+        { imagePath: '/img-s2.png', prompt: 'fv2' },
+    ]);
+
+    assert.strictEqual(out.sceneAssets.length, 2);
+    assert.strictEqual(out.videoSceneAssets.length, 2);
+    assert.strictEqual(out.videoRetryCount, 0);
+    assert.strictEqual(out.imageRetryCount, 0);
+    assert.deepStrictEqual(out.videoPerSceneStatus.map((s) => s.status), ['generated', 'generated']);
+});
+
+test('composeWithVideoScenes: I2V failure for one scene → that scene falls back to image (no video_scene_assets entry, status=fallback)', async () => {
+    const sizes = {
+        '/img-s1.png': 80_000,
+        '/img-s2.png': 90_000,
+        '/i2v-s1.mp4': 500_000,
+        // s2 i2v fails (no savedFile)
+    };
+    const { api, calls } = fakeAPIForVideo({
+        imageReturn: ({ prompts }) => ({
+            success: true,
+            results: prompts.map((_p, k) => ({ globalIdx: k, savedFiles: [`/img-s${k + 1}.png`], success: true })),
+        }),
+        i2vReturn: ({ items }) => ({
+            success: true,
+            results: items.map((_it, k) => {
+                if (k === 0) return { globalIdx: 0, savedFile: '/i2v-s1.mp4', success: true };
+                return { globalIdx: k, savedFile: '', success: false, error: 'moderation block' };
+            }),
+        }),
+    });
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.composeWithVideoScenes({
+        script: 'hello',
+        scenes: [
+            { scene_id: 1, image_prompt: 'p1', video_prompt: 'v1', duration_s: 3 },
+            { scene_id: 2, image_prompt: 'p2', video_prompt: 'v2', duration_s: 4 },
+        ],
+        max_attempts: 1,
+        max_attempts_i2v: 1,
+    }, { stat: (p) => sizes[p] != null ? { size: sizes[p] } : null });
+
+    // Image phase: both succeeded → both image scene_assets present.
+    assert.strictEqual(calls.compose[0].scene_assets.length, 2);
+    // I2V phase: only scene 1 produced an mp4 → only one video_scene_asset.
+    assert.strictEqual(calls.compose[0].video_scene_assets.length, 1);
+    assert.strictEqual(calls.compose[0].video_scene_assets[0].video_path, '/i2v-s1.mp4');
+
+    const byScene = Object.fromEntries(out.videoPerSceneStatus.map((s) => [s.scene_id, s]));
+    assert.strictEqual(byScene[1].status, 'generated');
+    assert.strictEqual(byScene[2].status, 'fallback');
+    assert.match(byScene[2].reason, /moderation/);
+
+    // Warnings surface the I2V fallback so the UI can explain why some
+    // windows are stills.
+    assert.ok(out.warnings.some((w) => /1 scene\(s\) fell back to image/.test(w)));
+});
+
+test('composeWithVideoScenes: image fallback scene is excluded from I2V plan + appears as skipped', async () => {
+    // Scene 1 image succeeds, scene 2 image fails (all attempts) → no I2V job for scene 2.
+    const sizes = {
+        '/img-s1.png': 80_000,
+        // /img-s2.png missing → image phase hits fallback for scene 2
+        '/i2v-s1.mp4': 500_000,
+    };
+    const { api, calls } = fakeAPIForVideo({
+        imageReturn: ({ prompts }) => ({
+            success: true,
+            results: prompts.map((_p, k) => {
+                if (k === 0) return { globalIdx: 0, savedFiles: ['/img-s1.png'], success: true };
+                return { globalIdx: 1, savedFiles: [], success: true };
+            }),
+        }),
+        i2vReturn: ({ items }) => ({
+            success: true,
+            results: items.map((_it, k) => ({ globalIdx: k, savedFile: '/i2v-s1.mp4', success: true })),
+        }),
+    });
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.composeWithVideoScenes({
+        script: 'hello',
+        scenes: [
+            { scene_id: 1, image_prompt: 'p1', video_prompt: 'v1', duration_s: 3 },
+            { scene_id: 2, image_prompt: 'p2', video_prompt: 'v2', duration_s: 4 },
+        ],
+        max_attempts: 1,
+        max_attempts_i2v: 1,
+    }, { stat: (p) => sizes[p] != null ? { size: sizes[p] } : null });
+
+    // I2V was only asked about scene 1's image.
+    assert.strictEqual(calls.i2v.length, 1);
+    assert.strictEqual(calls.i2v[0].items.length, 1);
+    assert.strictEqual(calls.i2v[0].items[0].imagePath, '/img-s1.png');
+
+    // videoPerSceneStatus lists scene 2 as skipped (planning-stage skip).
+    const byScene = Object.fromEntries(out.videoPerSceneStatus.map((s) => [s.scene_id, s]));
+    assert.strictEqual(byScene[1].status, 'generated');
+    assert.strictEqual(byScene[2].status, 'skipped');
+    assert.match(byScene[2].reason, /no usable hero image/);
+});
+
+test('composeWithVideoScenes: allow_partial=false aborts before I2V if any image fell back', async () => {
+    const sizes = {
+        '/img-s1.png': 80_000,
+        // s2 image fails
+    };
+    const { api, calls } = fakeAPIForVideo({
+        imageReturn: ({ prompts }) => ({
+            success: true,
+            results: prompts.map((_p, k) => {
+                if (k === 0) return { globalIdx: 0, savedFiles: ['/img-s1.png'], success: true };
+                return { globalIdx: 1, savedFiles: [], success: true };
+            }),
+        }),
+    });
+    const bridge = new StoryboardBridge(api);
+    await assert.rejects(
+        bridge.composeWithVideoScenes({
+            script: 'hi',
+            scenes: [
+                { scene_id: 1, image_prompt: 'p1', video_prompt: 'v1', duration_s: 3 },
+                { scene_id: 2, image_prompt: 'p2', video_prompt: 'v2', duration_s: 4 },
+            ],
+            max_attempts: 1,
+            allow_partial: false,
+        }, { stat: (p) => sizes[p] != null ? { size: sizes[p] } : null }),
+        (err) => err && err.code === 'INCOMPLETE_BATCH',
+    );
+    // Composer + I2V never called when we abort early.
+    assert.strictEqual(calls.compose.length, 0);
+    assert.strictEqual(calls.i2v.length, 0);
+});
+
+test('composeWithVideoScenes: throws if electronAPI.i2v.generate is missing', async () => {
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => Promise.resolve({}) },
+        producer: { composeShort: () => Promise.resolve({}) },
+        i2v: {},
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    await assert.rejects(
+        bridge.composeWithVideoScenes({ script: 'x', scenes: [] }),
+        /electronAPI\.i2v\.generate is unavailable/,
+    );
+});
+
+test('composeWithVideoScenes: forwards i2v_config when caller supplies it', async () => {
+    const sizes = { '/img-s1.png': 80_000, '/i2v-s1.mp4': 500_000 };
+    const { api, calls } = fakeAPIForVideo({
+        imageReturn: ({ prompts }) => ({
+            success: true,
+            results: prompts.map((_p, k) => ({ globalIdx: k, savedFiles: ['/img-s1.png'], success: true })),
+        }),
+        i2vReturn: ({ items }) => ({
+            success: true,
+            results: items.map((_it, k) => ({ globalIdx: k, savedFile: '/i2v-s1.mp4', success: true })),
+        }),
+    });
+    const bridge = new StoryboardBridge(api);
+    await bridge.composeWithVideoScenes({
+        script: 'hi',
+        scenes: [{ scene_id: 1, image_prompt: 'p1', video_prompt: 'v1', duration_s: 3 }],
+        max_attempts: 1,
+        max_attempts_i2v: 1,
+        i2v_config: { aspectRatio: '9:16', motionScale: 1.5 },
+    }, { stat: (p) => sizes[p] != null ? { size: sizes[p] } : null });
+    assert.deepStrictEqual(calls.i2v[0].config, { aspectRatio: '9:16', motionScale: 1.5 });
+});
