@@ -468,6 +468,20 @@ storyboard → AutoGrok → compose handoff. See
 walkthrough — including a curl-only path that drives `/producer/short`
 directly with images saved by the AutoGrok harness.
 
+For a one-command verifier, the bundled
+`scripts/e2e_compose_with_scene_assets.js` picks the ≥ 50 KB images out
+of an AutoGrok output directory, spawns / reuses the sidecar, POSTs
+`/producer/short`, and asserts `scenes_used == n`, `scenes_missing == 0`,
+`warnings == []`:
+
+```bash
+node scripts/e2e_compose_with_scene_assets.js \
+  --input-dir e2e-output/<timestamp>
+```
+
+Pair it with `e2e_autogrok_image.js` to chain a full
+AutoGrok → compose smoke from a single shell.
+
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
 `{ prompts: object[], count, account }`, but the IPC handler
