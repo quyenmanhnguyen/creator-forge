@@ -239,6 +239,105 @@ test("validateShortResponse: missing response object → exit 4", () => {
     assert.strictEqual(r.exitCode, 4);
 });
 
+// ── PR-17: --allow-partial flag ─────────────────────────────────────────────
+
+test("parseArgs: --allow-partial parsed as boolean", () => {
+    const a = harness.parseArgs(["--input-dir", "x", "--allow-partial"]);
+    assert.strictEqual(a["allow-partial"], true);
+});
+
+test("validateShortResponse: --allow-partial downgrades scenes_missing to notice", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "/out/short.mp4",
+            scenes_used: 2,
+            scenes_missing: 1,
+            warnings: [],
+        },
+        3,
+        { allowPartial: true },
+    );
+    assert.strictEqual(r.ok, true, "ok=true under allow_partial");
+    assert.strictEqual(r.exitCode, 0);
+    assert.ok(Array.isArray(r.notices) && r.notices.length === 1, "1 notice");
+    assert.match(r.notices[0], /scenes_missing=1/);
+});
+
+test("validateShortResponse: --allow-partial downgrades warnings to notice", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "/out/short.mp4",
+            scenes_used: 3,
+            scenes_missing: 0,
+            warnings: ["scene 2 fell back to gradient"],
+        },
+        3,
+        { allowPartial: true },
+    );
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.exitCode, 0);
+    assert.ok(r.notices.length === 1);
+    assert.match(r.notices[0], /scene 2 fell back/);
+});
+
+test("validateShortResponse: --allow-partial still fails on empty mp4_path", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "",
+            scenes_used: 0,
+            scenes_missing: 3,
+            warnings: ["everything failed"],
+        },
+        3,
+        { allowPartial: true },
+    );
+    assert.strictEqual(r.ok, false, "mp4_path empty is non-negotiable");
+    assert.strictEqual(r.exitCode, 4);
+});
+
+test("validateShortResponse: --allow-partial accepts scenes_used <= expected (partial)", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "/out/short.mp4",
+            scenes_used: 2,
+            scenes_missing: 1,
+            warnings: [],
+        },
+        3,
+        { allowPartial: true },
+    );
+    assert.strictEqual(r.ok, true);
+});
+
+test("validateShortResponse: --allow-partial rejects scenes_used > expected", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "/out/short.mp4",
+            scenes_used: 5,
+            scenes_missing: 0,
+            warnings: [],
+        },
+        3,
+        { allowPartial: true },
+    );
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.exitCode, 6);
+});
+
+test("validateShortResponse: without --allow-partial, scenes_missing > 0 still fails", () => {
+    const r = harness.validateShortResponse(
+        {
+            mp4_path: "/out/short.mp4",
+            scenes_used: 2,
+            scenes_missing: 1,
+            warnings: [],
+        },
+        3,
+    );
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.exitCode, 5);
+});
+
 // ── results ─────────────────────────────────────────────────────────────────
 
 console.log("");

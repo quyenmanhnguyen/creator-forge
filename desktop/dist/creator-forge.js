@@ -808,17 +808,21 @@
         $('ps-result').innerHTML = html;
     }
 
-    // ─── Storyboard: Compose with AutoGrok (PR-16) ─────────────────────────
+    // ─── Storyboard: Compose with AutoGrok (PR-16, retries+partial in PR-17) ─
     // One-click drives the full pipeline:
-    //   image:generate (1 image per scene)
+    //   image:generate (1 image per scene, with scene-level retry)
     //   → pick first ≥50KB savedFile per scene (PR-9 blur threshold)
     //   → producer:composeShort with scene_assets[]
-    // Loading state explicitly flips between the two phases so the user
-    // sees "generating images" → "composing MP4" rather than one opaque spinner.
+    // Loading state flips between phases AND updates per retry attempt so
+    // the user sees progress during the 30–120s image generation phase.
     async function runStoryboardCompose() {
         const helpers = (typeof window !== 'undefined' && window.StoryboardComposeHelpers) || null;
         if (!helpers) {
             showError('swc-result', { message: 'storyboard_compose_helpers.js failed to load (check the renderer console).' });
+            return;
+        }
+        if (typeof helpers.orchestrateImageGenerationWithRetries !== 'function') {
+            showError('swc-result', { message: 'storyboard_compose_helpers.js is out of date — rebuild Electron (missing orchestrateImageGenerationWithRetries).' });
             return;
         }
         if (!api || !api.image || typeof api.image.generate !== 'function') {
@@ -845,13 +849,15 @@
             return;
         }
 
-        // ── Phase 1: image:generate ────────────────────────────────────
-        // Plan first so the loading message reflects the actual number of
-        // prompts that will be sent (skipped scenes shouldn't inflate the
-        // count the user sees during the 30–120s wait).
-        const { prompts, indexMap, skipped: planSkipped } = helpers.planPromptsFromScenes(scenes);
-        if (!prompts.length) {
-            const skipDetail = planSkipped
+        // PR-17 form fields. Default to 2 attempts (1 retry) + allow_partial=true.
+        const maxAttempts = Math.max(1, Math.min(5, parseInt($('swc-max-attempts').value, 10) || 2));
+        const allowPartial = !!$('swc-allow-partial').checked;
+
+        // Preflight: catch the "no usable scenes at all" case before starting
+        // the long-running orchestration so the error message is actionable.
+        const planned = helpers.planPromptsFromScenes(scenes);
+        if (!planned.prompts.length) {
+            const skipDetail = planned.skipped
                 .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
                 .join('; ');
             showError('swc-result', {
@@ -860,54 +866,79 @@
             });
             return;
         }
-
-        const skipNote = planSkipped.length
-            ? ` (${planSkipped.length} scene${planSkipped.length === 1 ? '' : 's'} skipped — missing image_prompt or duration_s)`
+        const skipNote = planned.skipped.length
+            ? ` (${planned.skipped.length} scene${planned.skipped.length === 1 ? '' : 's'} skipped — missing image_prompt or duration_s)`
             : '';
-        showLoading('swc-result', `Generating ${prompts.length} Grok image(s) — one per usable scene${skipNote} (this can take 30–120s, requires an active Grok session)...`);
+
+        // ── Phase 1: image:generate (with retries) ──────────────────────
+        showLoading('swc-result',
+            `Generating ${planned.prompts.length} Grok image(s) — attempt 1 / ${maxAttempts}${skipNote} (this can take 30–120s, requires an active Grok session)...`);
 
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty($('swc-aspect').value);
         if (aspect) config.aspectRatio = aspect;
 
-        let imageGenerate;
+        const imageGenerateFn = async (prompts, ctx) => {
+            const attemptNumber = (ctx && ctx.attemptNumber) || 1;
+            if (attemptNumber > 1) {
+                showLoading('swc-result',
+                    `Retrying ${prompts.length} scene(s) that didn't produce a usable image — attempt ${attemptNumber} / ${maxAttempts}...`);
+            }
+            return api.image.generate({ prompts, config });
+        };
+
+        let orchestration;
         try {
-            imageGenerate = await api.image.generate({ prompts, config });
+            orchestration = await helpers.orchestrateImageGenerationWithRetries(
+                scenes, imageGenerateFn, (p) => api.statBytes(p),
+                { maxAttempts },
+            );
         } catch (err) {
-            showError('swc-result', { message: `image:generate IPC threw: ${err && err.message ? err.message : String(err)}` });
+            showError('swc-result', { message: `Orchestration threw: ${err && err.message ? err.message : String(err)}` });
             return;
         }
 
-        if (!imageGenerate || imageGenerate.success === false) {
-            const why = (imageGenerate && imageGenerate.error)
-                ? imageGenerate.error
-                : 'Unknown — most common cause is no active Grok session. Open the Login panel, sign in, then retry.';
+        const { sceneAssets, perSceneStatus, retryCount, imageGenerate } = orchestration;
+        const fallbackCount = helpers.countFallbackScenes(perSceneStatus);
+
+        // Surface a Grok-session-down error early — first-attempt success=false
+        // with no usable assets is almost always "not logged in".
+        if (imageGenerate && imageGenerate.success === false && sceneAssets.length === 0) {
+            const why = imageGenerate.error || 'Unknown — most common cause is no active Grok session. Open the Login panel, sign in, then retry.';
             showError('swc-result', { message: `Grok image generation failed: ${why}` });
             return;
         }
 
-        // ── Phase 2: pick ≥50KB files + compose ────────────────────────
-        showLoading('swc-result', 'Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)...');
-
-        const statBytesAsync = (p) => api.statBytes(p);
-        const { sceneAssets, skipped: pickSkipped } = await helpers.buildSceneAssetsFromImageBatch(
-            scenes, imageGenerate, statBytesAsync,
-        );
-
-        if (!sceneAssets.length) {
-            // Inline the per-scene skip reasons so the user sees "all blur" /
-            // "no files" instead of the misleading generic "sidecar down"
-            // friendly message that showError() falls back to. Avoid stuffing
-            // the full imageGenerate response into err.body — it can be huge
-            // and showError stringifies it on top of the message.
-            const skipDetail = (pickSkipped || [])
-                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
+        // Strict mode: any scene in `fallback` blocks the compose call.
+        if (!allowPartial && fallbackCount > 0) {
+            const detail = perSceneStatus
+                .filter((s) => s.status === 'fallback')
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason || 'no usable image'}`)
                 .join('; ');
             showError('swc-result', {
-                message: `No scenes had a usable Grok image (every result < 50 KB or empty). Composer would just be gradient — aborting so you can retry image generation. ${skipDetail ? '(' + skipDetail + ')' : ''}`,
+                message: `${fallbackCount} scene(s) missing usable images after ${maxAttempts} attempt(s) and "Allow partial compose" is off — aborting before composer. (${detail})`,
             });
             return;
         }
+
+        // Pure no-asset case (every scene either skipped or fallback) —
+        // composing would just be gradient + narration, almost never what
+        // the user wanted. Show a targeted error instead.
+        if (sceneAssets.length === 0) {
+            const detail = perSceneStatus
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.status}${s.reason ? ' (' + s.reason + ')' : ''}`)
+                .join('; ');
+            showError('swc-result', {
+                message: `No scenes produced a usable Grok image after ${maxAttempts} attempt(s). Composer would just be gradient — retry image generation. (${detail})`,
+            });
+            return;
+        }
+
+        // ── Phase 2: compose ────────────────────────────────────────────
+        const phase2Note = fallbackCount > 0
+            ? ` (${fallbackCount} scene${fallbackCount === 1 ? '' : 's'} will be gradient-filled)`
+            : '';
+        showLoading('swc-result', `Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)${phase2Note}...`);
 
         const composePayload = {
             script,
@@ -930,21 +961,35 @@
         renderStoryboardCompose({
             compose,
             sceneAssets,
-            skipped: pickSkipped,
-            promptCount: prompts.length,
+            perSceneStatus,
+            retryCount,
+            maxAttempts,
+            fallbackCount,
+            allowPartial,
+            promptCount: planned.prompts.length,
             sceneCount: scenes.length,
-            indexMap,
         });
     }
 
-    function renderStoryboardCompose({ compose, sceneAssets, skipped, promptCount, sceneCount }) {
+    // PR-17 status → human label mapping for the per-scene table.
+    const STATUS_LABEL = {
+        generated: 'generated',
+        retried:   'retried',
+        fallback:  'fallback (gradient)',
+        skipped:   'skipped',
+    };
+
+    function renderStoryboardCompose({ compose, sceneAssets, perSceneStatus, retryCount, maxAttempts, fallbackCount, allowPartial, promptCount, sceneCount }) {
         const d = compose || {};
         let html = '';
         html += `<div class="stats-row">
             <span>Scenes total<b>${escapeHtml(sceneCount)}</b></span>
             <span>Prompts sent<b>${escapeHtml(promptCount)}</b></span>
             <span>scenes_used<b>${escapeHtml(d.scenes_used != null ? d.scenes_used : sceneAssets.length)}</b></span>
-            <span>scenes_missing<b>${escapeHtml(d.scenes_missing != null ? d.scenes_missing : 0)}</b></span>
+            <span>scenes_missing<b>${escapeHtml(d.scenes_missing != null ? d.scenes_missing : (fallbackCount || 0))}</b></span>
+            <span>retry_count<b>${escapeHtml(retryCount || 0)}</b></span>
+            <span>max_attempts<b>${escapeHtml(maxAttempts || 1)}</b></span>
+            <span>allow_partial<b>${escapeHtml(allowPartial ? 'yes' : 'no')}</b></span>
             <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
         </div>`;
@@ -964,16 +1009,30 @@
             html += renderEmpty('No mp4 produced. Check warnings — image generate may have all been < 50 KB.');
         }
 
-        if (sceneAssets && sceneAssets.length) {
-            html += `<div class="scene-card"><div class="scene-title">Scene assets used (${sceneAssets.length})</div>`;
-            sceneAssets.forEach((sa) => {
-                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(sa.scene_id != null ? sa.scene_id : '?')}: ${escapeHtml(sa.start_s)}–${escapeHtml((sa.start_s + sa.duration_s).toFixed ? (sa.start_s + sa.duration_s).toFixed(3) : (sa.start_s + sa.duration_s))}s</span><code>${escapeHtml(sa.image_path)}</code></div>`;
+        // Per-scene status table — the headline diagnostic for PR-17. Shows
+        // every scene with its eventual status (generated / retried /
+        // fallback / skipped), how many attempts it took, and either the
+        // image_path or skip reason.
+        if (Array.isArray(perSceneStatus) && perSceneStatus.length) {
+            html += `<div class="scene-card"><div class="scene-title">Per-scene status (${perSceneStatus.length})</div>`;
+            perSceneStatus.forEach((s) => {
+                const label = STATUS_LABEL[s.status] || s.status || '?';
+                const detail = s.image_path
+                    ? `<code>${escapeHtml(s.image_path)}</code>`
+                    : `<span class="muted">${escapeHtml(s.reason || '')}</span>`;
+                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')} · ${escapeHtml(label)} · ${escapeHtml(s.attempts || 0)} attempt${s.attempts === 1 ? '' : 's'}</span>${detail}</div>`;
             });
             html += `</div>`;
         }
-        if (skipped && skipped.length) {
-            const items = skipped.map((s) => `<li>scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')}: ${escapeHtml(s.reason || '')}</li>`).join('');
-            html += `<div class="warning-list"><div class="warning-title">Scenes skipped (${skipped.length})</div><ul>${items}</ul></div>`;
+
+        if (sceneAssets && sceneAssets.length) {
+            html += `<div class="scene-card"><div class="scene-title">Scene assets used (${sceneAssets.length})</div>`;
+            sceneAssets.forEach((sa) => {
+                const end = (sa.start_s + sa.duration_s);
+                const endStr = (typeof end === 'number' && !isNaN(end)) ? end.toFixed(3) : String(end);
+                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(sa.scene_id != null ? sa.scene_id : '?')}: ${escapeHtml(sa.start_s)}–${escapeHtml(endStr)}s</span><code>${escapeHtml(sa.image_path)}</code></div>`;
+            });
+            html += `</div>`;
         }
         html += renderWarnings(d.warnings);
         html += renderRawJson(d);

@@ -305,3 +305,231 @@ test('composeWithScenes: throws on missing/whitespace script', async () => {
     );
 });
 
+// ─── PR-17: scene-level retry + allow_partial ──────────────────────────
+//
+// `imageGenerateFn` is invoked once per attempt. Tests below stub it with
+// a stateful function that varies its response between attempts to model
+// a transient Grok failure (e.g. moderation hit on the first try, success
+// on the second).
+
+/** Build a stateful image:generate stub from a list of per-attempt responses. */
+function scriptedImageReturn(attempts) {
+    let n = 0;
+    return () => {
+        const slot = attempts[Math.min(n, attempts.length - 1)];
+        n++;
+        return slot;
+    };
+}
+
+test('composeWithScenes: first attempt fails for one scene, retry succeeds → status=retried', async () => {
+    const { api, calls } = fakeAPI({
+        imageReturn: scriptedImageReturn([
+            // Attempt 1: 2 prompts → scene A blur (<50KB), scene B ok.
+            {
+                success: true,
+                results: [
+                    { globalIdx: 0, savedFiles: ['/img/a_blur.jpg'], success: true },
+                    { globalIdx: 1, savedFiles: ['/img/b_ok.jpg'],   success: true },
+                ],
+            },
+            // Attempt 2: orchestrator should resend ONLY scene A's prompt.
+            // globalIdx=0 here is the retry slot for scene A.
+            {
+                success: true,
+                results: [
+                    { globalIdx: 0, savedFiles: ['/img/a_retry_ok.jpg'], success: true },
+                ],
+            },
+        ]),
+    });
+    const bridge = new StoryboardBridge(api);
+    const sizeMap = {
+        '/img/a_blur.jpg':       1024,         // < 50KB → reject
+        '/img/b_ok.jpg':         80 * 1024,
+        '/img/a_retry_ok.jpg':   120 * 1024,
+    };
+
+    const out = await bridge.composeWithScenes({
+        script: 'Hi.',
+        scenes: [
+            { scene_id: 1, image_prompt: 'A', duration_s: 3 },
+            { scene_id: 2, image_prompt: 'B', duration_s: 4 },
+        ],
+        max_attempts: 2,
+    }, { stat: (p) => ({ size: sizeMap[p] || 0 }) });
+
+    assert.strictEqual(calls.image.length, 2, 'image:generate must be called twice (1 bulk + 1 retry)');
+    assert.deepStrictEqual(calls.image[0].prompts, ['A', 'B']);
+    assert.deepStrictEqual(calls.image[1].prompts, ['A'], 'retry must only re-send the failing scene');
+
+    assert.deepStrictEqual(calls.compose[0].scene_assets, [
+        { image_path: '/img/a_retry_ok.jpg', start_s: 0, duration_s: 3 },
+        { image_path: '/img/b_ok.jpg',       start_s: 3, duration_s: 4 },
+    ]);
+    assert.strictEqual(out.retryCount, 1, '1 scene was retried');
+    assert.strictEqual(out.maxAttempts, 2);
+
+    const statuses = out.perSceneStatus.map((s) => [s.scene_id, s.status, s.attempts]);
+    assert.deepStrictEqual(statuses, [
+        [1, 'retried',   2],
+        [2, 'generated', 1],
+    ]);
+});
+
+test('composeWithScenes: all attempts fail for one scene → status=fallback, allow_partial=true (default) still composes', async () => {
+    const { api, calls } = fakeAPI({
+        imageReturn: scriptedImageReturn([
+            // Bulk: scene A blur, scene B ok.
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur1.jpg'], success: true },
+                { globalIdx: 1, savedFiles: ['/img/b_ok.jpg'],    success: true },
+            ]},
+            // Retry: scene A blur again.
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur2.jpg'], success: true },
+            ]},
+            // 3rd attempt: still blur.
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur3.jpg'], success: true },
+            ]},
+        ]),
+    });
+    const bridge = new StoryboardBridge(api);
+    const sizeMap = {
+        '/img/a_blur1.jpg': 1024,
+        '/img/a_blur2.jpg': 2048,
+        '/img/a_blur3.jpg': 3072,
+        '/img/b_ok.jpg':    80 * 1024,
+    };
+
+    const out = await bridge.composeWithScenes({
+        script: 'Hi.',
+        scenes: [
+            { scene_id: 1, image_prompt: 'A', duration_s: 3 },
+            { scene_id: 2, image_prompt: 'B', duration_s: 4 },
+        ],
+        max_attempts: 3,
+    }, { stat: (p) => ({ size: sizeMap[p] || 0 }) });
+
+    assert.strictEqual(calls.image.length, 3, '1 bulk + 2 retries');
+    // Compose still happens — scene 1 falls back to gradient, scene 2 covered.
+    assert.deepStrictEqual(calls.compose[0].scene_assets, [
+        { image_path: '/img/b_ok.jpg', start_s: 3, duration_s: 4 },
+    ]);
+    assert.strictEqual(out.retryCount, 2);
+    const statuses = out.perSceneStatus.map((s) => [s.scene_id, s.status, s.attempts]);
+    assert.deepStrictEqual(statuses, [
+        [1, 'fallback',  3],
+        [2, 'generated', 1],
+    ]);
+    // Warnings should mention the fallback scene + retry count.
+    assert.ok(out.warnings.some((w) => /scene\(s\) fell back to gradient/.test(w)), 'fallback warning');
+    assert.ok(out.warnings.some((w) => /Issued 2 retry attempt/.test(w)),            'retry warning');
+});
+
+test('composeWithScenes: allow_partial=false throws INCOMPLETE_BATCH instead of composing', async () => {
+    const { api, calls } = fakeAPI({
+        imageReturn: scriptedImageReturn([
+            // Bulk: scene A blur, scene B ok.
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur.jpg'], success: true },
+                { globalIdx: 1, savedFiles: ['/img/b_ok.jpg'],   success: true },
+            ]},
+            // Retry: still blur.
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur.jpg'], success: true },
+            ]},
+        ]),
+    });
+    const bridge = new StoryboardBridge(api);
+    const sizeMap = { '/img/a_blur.jpg': 1024, '/img/b_ok.jpg': 80 * 1024 };
+
+    let thrown = null;
+    try {
+        await bridge.composeWithScenes({
+            script: 'Hi.',
+            scenes: [
+                { scene_id: 1, image_prompt: 'A', duration_s: 3 },
+                { scene_id: 2, image_prompt: 'B', duration_s: 4 },
+            ],
+            max_attempts: 2,
+            allow_partial: false,
+        }, { stat: (p) => ({ size: sizeMap[p] || 0 }) });
+    } catch (err) {
+        thrown = err;
+    }
+
+    assert.ok(thrown, 'expected throw');
+    assert.strictEqual(thrown.code, 'INCOMPLETE_BATCH');
+    assert.match(thrown.message, /1 scene\(s\) missing/);
+    // Compose must NOT have been called when allow_partial=false.
+    assert.strictEqual(calls.compose.length, 0, 'composeShort must not be invoked when batch is incomplete and allow_partial=false');
+    // Diagnostic info on the error.
+    assert.strictEqual(thrown.retryCount, 1);
+    assert.ok(Array.isArray(thrown.perSceneStatus));
+    assert.strictEqual(thrown.perSceneStatus.find((s) => s.scene_id === 1).status, 'fallback');
+});
+
+test('composeWithScenes: max_attempts=1 disables retry entirely', async () => {
+    const { api, calls } = fakeAPI({
+        imageReturn: scriptedImageReturn([
+            { success: true, results: [
+                { globalIdx: 0, savedFiles: ['/img/a_blur.jpg'], success: true },
+            ]},
+        ]),
+    });
+    const bridge = new StoryboardBridge(api);
+
+    const out = await bridge.composeWithScenes({
+        script: 'Hi.',
+        scenes: [{ scene_id: 1, image_prompt: 'A', duration_s: 3 }],
+        max_attempts: 1,
+    }, { stat: () => ({ size: 1024 }) });
+
+    assert.strictEqual(calls.image.length, 1, 'no retry when max_attempts=1');
+    assert.strictEqual(out.retryCount, 0);
+    assert.strictEqual(out.perSceneStatus[0].status, 'fallback');
+    assert.strictEqual(out.perSceneStatus[0].attempts, 1);
+});
+
+test('composeWithScenes: image:generate IPC throwing on first attempt is caught + retried', async () => {
+    const calls = { image: [], compose: [] };
+    let n = 0;
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: {
+            generate: async (params) => {
+                calls.image.push(params);
+                n++;
+                if (n === 1) throw new Error('socket hangup');
+                return {
+                    success: true,
+                    results: [
+                        { globalIdx: 0, savedFiles: ['/img/recovered.jpg'], success: true },
+                    ],
+                };
+            },
+        },
+        producer: {
+            composeShort: async (params) => {
+                calls.compose.push(params);
+                return { mp4_path: '/tmp/x.mp4', scenes_used: 1, scenes_missing: 0, warnings: [] };
+            },
+        },
+        i2v: { generate: () => null },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+
+    const out = await bridge.composeWithScenes({
+        script: 'Hi.',
+        scenes: [{ scene_id: 1, image_prompt: 'A', duration_s: 3 }],
+        max_attempts: 2,
+    }, { stat: () => ({ size: 80 * 1024 }) });
+
+    assert.strictEqual(calls.image.length, 2, 'thrown attempt counts as one — orchestrator retries');
+    assert.strictEqual(out.perSceneStatus[0].status, 'retried');
+    assert.strictEqual(out.sceneAssets.length, 1);
+});
+

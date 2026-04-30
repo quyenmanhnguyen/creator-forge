@@ -115,20 +115,58 @@ wraps the same orchestration as `StoryboardBridge.composeWithScenes`:
    WPM) → click **Break into scenes**. The renderer captures the latest
    `scenes[]` in memory.
 3. Scroll to **Compose with AutoGrok** → pick a voice / gradient style /
-   optional aspect ratio → click **Compose with AutoGrok**.
-4. The result card shows `scenes_used`, `scenes_missing`, the resolved
-   `scene_assets[]` (per-scene `image_path` + window), the output folder,
-   and any per-scene skip reasons.
+   optional aspect ratio / **Max attempts per scene** (default 2) /
+   **Allow partial compose** (default on) → click
+   **Compose with AutoGrok**.
+4. The result card shows `scenes_used`, `scenes_missing`, **`retry_count`**,
+   **per-scene status** (`generated` / `retried` / `skipped` / `fallback`),
+   the resolved `scene_assets[]` (per-scene `image_path` + window), the
+   output folder, and any warnings.
 
-Loading state explicitly flips between two phases so you can tell whether
+Loading state explicitly flips between phases so you can tell whether
 the slow part is image generation or the ffmpeg compose:
 
-- *"Generating N Grok image(s) — one per scene (this can take 30–120s, requires an active Grok session)..."*
+- *"Generating N Grok image(s) — attempt 1 / M (this can take 30–120s,
+  requires an active Grok session)..."*
+- *"Retrying K scene(s) that didn't produce a usable image — attempt
+  2 / M..."* — only when one or more scenes were rejected on attempt 1
+  (PR-17 retry).
 - *"Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)..."*
 
 Friendly errors call out the most common pitfalls (no scenes captured,
-empty script, no Grok session, every image < 50 KB) instead of throwing
-into the renderer console.
+empty script, no Grok session, every image < 50 KB after retries)
+instead of throwing into the renderer console.
+
+#### Retry behaviour and partial compose (PR-17)
+
+The orchestrator behind the button (`orchestrateImageGenerationWithRetries`
+in `desktop/dist/storyboard_compose_helpers.js`) tracks per-scene state
+across attempts:
+
+| Status     | Meaning                                                            |
+| ---------- | ------------------------------------------------------------------ |
+| `generated`| Got a ≥ 50 KB image on attempt 1.                                  |
+| `retried`  | Got a ≥ 50 KB image on attempt ≥ 2 after a failure on attempt 1.   |
+| `skipped`  | Missing `image_prompt` or non-positive `duration_s` (never sent).  |
+| `fallback` | Exhausted all `max_attempts` without a ≥ 50 KB result.             |
+
+Only the failed scenes are re-sent to `image:generate` on retry — scenes
+that already produced a usable image are NOT regenerated. The retry
+attempt counts toward `retry_count` exposed on the result.
+
+**Allow partial compose** controls what happens when one or more scenes
+end up in `fallback`:
+
+- **on** (default): the composer runs anyway. Fallback scenes are
+  gradient-filled (violet-pink / sunset / etc) inside the mp4 using the
+  audio timeline window that scene would have occupied. `scenes_missing`
+  reflects the count of fallback scenes.
+- **off** (strict): the bridge throws `INCOMPLETE_BATCH` instead of
+  composing. The renderer surfaces it as
+  *"K scene(s) missing usable images after M attempt(s) and 'Allow
+  partial compose' is off — aborting before composer."*. Use this when
+  you specifically want the run to fail loudly so you can refresh the
+  Grok session and retry. The `compose` IPC is not invoked.
 
 ### Driving the pipeline from the renderer DevTools
 
@@ -199,19 +237,43 @@ on a healthy run.
 
 ### `scenes_used = 0` even though `image:generate` succeeded
 
-Every saved file is < 50 KB. Either Grok flagged your prompts and
-returned blurred / moderation placeholders, or the WebSocket disconnected
-before the high-resolution upsampler finished. Check
-`result.skippedScenes` for the per-scene reason.
+Every saved file is < 50 KB across all retries. Either Grok flagged your
+prompts and returned blurred / moderation placeholders, or the WebSocket
+disconnected before the high-resolution upsampler finished. Check
+`result.perSceneStatus` (PR-17) for the per-scene reason.
 
 Mitigations:
 
-1. Re-run — Grok occasionally flakes, especially during the upsampler
-   stage. The persistent profile means no re-login needed.
-2. Soften the `image_prompt` text (avoid words that trigger the
+1. **Bump Max attempts per scene** to 3 — the orchestrator only re-sends
+   the prompts that failed, so this just adds one or two more chances
+   without re-running successful scenes.
+2. Re-run the whole flow — Grok occasionally flakes, especially during
+   the upsampler stage. The persistent profile means no re-login needed.
+3. Soften the `image_prompt` text (avoid words that trigger the
    moderation classifier).
-3. Confirm `enablePro: false` is in effect (Pro mode rate-limits to 1
+4. Confirm `enablePro: false` is in effect (Pro mode rate-limits to 1
    image per request — verified by PR-9).
+
+### Some scenes show `status: retried` in the result card
+
+Expected — those scenes failed on attempt 1 (blur/moderation) and
+succeeded on attempt 2. The mp4 still uses the retry's image, so
+nothing's wrong. If you see this consistently for the same scene, see
+the mitigations above.
+
+### Some scenes show `status: fallback`
+
+Those scenes exhausted `max_attempts` without producing a ≥ 50 KB image.
+What happens next depends on **Allow partial compose**:
+
+- **on** (default) — the mp4 was still produced, with gradient backgrounds
+  for the fallback scenes during their audio windows. Look at
+  `warnings[]` in the result card for the specific count
+  (`N scene(s) fell back to gradient...`). If you don't want this, flip
+  the toggle off and re-run.
+- **off** (strict) — the renderer aborted before composing. No mp4 is
+  produced. Refresh your Grok session (`scripts/e2e_autogrok_image.js`)
+  or soften the prompts and re-run.
 
 ### `image:generate IPC failed` warning, gradient mp4
 
@@ -286,6 +348,7 @@ Common overrides:
 | `--limit <n>` | Use only the first N images (e.g. for a 2-image smoke test from a 4-image AutoGrok output). | unlimited |
 | `--port <n>` | Sidecar port. | `$CREATOR_FORGE_RESEARCH_PORT` or `5050` |
 | `--keep-sidecar` | Don't tear down the sidecar on exit. | tears down |
+| `--allow-partial` (PR-17) | Treat `scenes_missing > 0` and non-empty `warnings[]` as advisory notices instead of failures. `mp4_path` empty is still a failure. Useful when intentionally testing the gradient-fallback path. | strict (off) |
 
 If you'd rather drive `/producer/short` by hand, the equivalent curl looks
 like this — useful when iterating on the request shape:

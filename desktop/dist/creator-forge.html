@@ -696,8 +696,14 @@
                     <label>Output dir (blank = ~/.creator-forge/output/short-&lt;ts&gt;/)
                         <input id="swc-output-dir" type="text" placeholder="auto" />
                     </label>
+                    <label>Max attempts per scene
+                        <input id="swc-max-attempts" type="number" min="1" max="5" step="1" value="2" />
+                    </label>
                     <label class="checkbox-row">
                         <input id="swc-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
+                    </label>
+                    <label class="checkbox-row">
+                        <input id="swc-allow-partial" type="checkbox" checked /> Allow partial compose (gradient-fill missing scenes)
                     </label>
                 </div>
                 <div class="actions">

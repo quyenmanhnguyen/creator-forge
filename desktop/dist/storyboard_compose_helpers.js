@@ -192,6 +192,151 @@
     }
 
     /**
+     * Drive image:generate with **scene-level retries** (PR-17).
+     *
+     * Behavior:
+     *   1. First attempt — bulk-call `imageGenerateFn` with one prompt per
+     *      *eligible* scene (scenes missing `image_prompt` or with
+     *      non-positive `duration_s` are pre-marked `skipped` and never sent).
+     *   2. After picking ≥ minBytes files per scene, identify scenes that
+     *      didn't get a usable hero image. For attempts 2..maxAttempts,
+     *      re-invoke `imageGenerateFn` with **only those scenes' prompts**.
+     *      A scene that succeeds on attempt ≥ 2 is marked `retried`.
+     *   3. After the final attempt, any scene still without a hero image
+     *      is marked `fallback` (the composer will gradient-fill its
+     *      window — the audio cursor still advances so the timeline stays
+     *      in sync).
+     *
+     * `imageGenerateFn(prompts, ctx)` is async, returns a normal
+     * `image:generate` response shape (`{ success, results: [{ globalIdx,
+     * savedFiles[] }, ...] }`). `ctx = { attemptNumber, sceneIds }` lets
+     * tests / callers log or rate-limit per attempt.
+     *
+     * `statBytesFn(path)` is the same async stat-bytes contract used by
+     * `pickFirstUsableSavedFile`.
+     *
+     * @returns {Promise<{
+     *   sceneAssets: Array<{image_path:string,start_s:number,duration_s:number,scene_id?:number}>,
+     *   perSceneStatus: Array<{scene_id?:number, status:'generated'|'retried'|'skipped'|'fallback', attempts:number, reason?:string, image_path?:string}>,
+     *   retryCount: number,           // # of extra attempts beyond the first bulk call
+     *   imageGenerate: object|null,   // raw response from the FIRST attempt (legacy)
+     *   maxAttempts: number,
+     * }>}
+     */
+    async function orchestrateImageGenerationWithRetries(scenes, imageGenerateFn, statBytesFn, opts = {}) {
+        const list = Array.isArray(scenes) ? scenes : [];
+        const maxAttempts = Math.max(1, Number(opts.maxAttempts) || 2);
+        const minBytes = typeof opts.minBytes === 'number' ? opts.minBytes : MIN_USABLE_IMAGE_BYTES;
+
+        // Per-scene state tracker — lives across attempts so we don't re-issue
+        // prompts for scenes that already produced a usable image.
+        const sceneState = list.map((s) => {
+            const prompt = typeof (s && s.image_prompt) === 'string' ? s.image_prompt.trim() : '';
+            const duration = Number(s && s.duration_s);
+            if (!prompt) {
+                return { scene_id: s && s.scene_id, status: 'skipped', attempts: 0, reason: 'missing image_prompt', duration: duration > 0 ? duration : 0 };
+            }
+            if (!(duration > 0)) {
+                return { scene_id: s && s.scene_id, status: 'skipped', attempts: 0, reason: 'invalid duration_s', duration: 0 };
+            }
+            return { scene_id: s && s.scene_id, status: 'pending', attempts: 0, prompt, duration, image_path: null, last_reason: null };
+        });
+
+        let firstResp = null;
+        let retryCount = 0;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            // Pending = had a prompt + duration, no asset chosen yet.
+            const pending = [];
+            for (let i = 0; i < sceneState.length; i++) {
+                if (sceneState[i].status === 'pending') pending.push({ idx: i, st: sceneState[i] });
+            }
+            if (!pending.length) break;
+
+            const prompts = pending.map((p) => p.st.prompt);
+            const sceneIds = pending.map((p) => p.st.scene_id);
+            let resp;
+            try {
+                resp = await imageGenerateFn(prompts, { attemptNumber: attempt, sceneIds });
+            } catch (err) {
+                // Hard IPC failure on this attempt — treat as "no results"
+                // so the next attempt (if any) gets a clean shot.
+                resp = { success: false, error: err && err.message ? err.message : String(err), results: [] };
+            }
+            if (attempt === 1) firstResp = resp;
+            if (attempt > 1) retryCount += pending.length;
+
+            const grouped = groupSavedFilesByPromptIndex(resp, prompts.length);
+            for (let k = 0; k < pending.length; k++) {
+                pending[k].st.attempts = attempt;
+                const candidates = grouped.get(k) || [];
+                const pick = await pickFirstUsableSavedFile(candidates, statBytesFn, { minBytes });
+                if (pick.chosen) {
+                    pending[k].st.status = attempt === 1 ? 'generated' : 'retried';
+                    pending[k].st.image_path = pick.chosen.filePath;
+                    pending[k].st.bytes = pick.chosen.bytes;
+                    pending[k].st.last_reason = null;
+                } else {
+                    pending[k].st.last_reason = pick.reason;
+                }
+            }
+        }
+
+        // Anything still pending after maxAttempts → 'fallback' (composer
+        // will gradient-fill that window). This matches what the user sees
+        // in the result card and in the docs/troubleshooting flow.
+        for (const st of sceneState) {
+            if (st.status === 'pending') {
+                st.status = 'fallback';
+                if (!st.reason) st.reason = st.last_reason || 'image:generate did not return a ≥50KB file after all retries';
+            }
+        }
+
+        // Build sceneAssets in scene order with cumulative start_s. Audio
+        // cursor advances even for skipped/fallback scenes so subsequent
+        // scenes line up with the narration.
+        const sceneAssets = [];
+        let cursor = 0;
+        for (let i = 0; i < list.length; i++) {
+            const st = sceneState[i];
+            const duration = Number(list[i] && list[i].duration_s);
+            if (st.status === 'generated' || st.status === 'retried') {
+                sceneAssets.push({
+                    image_path: st.image_path,
+                    start_s: Number(cursor.toFixed(3)),
+                    duration_s: Number(duration.toFixed(3)),
+                    scene_id: st.scene_id,
+                });
+            }
+            if (duration > 0) cursor += duration;
+        }
+
+        const perSceneStatus = sceneState.map((st) => {
+            const out = { scene_id: st.scene_id, status: st.status, attempts: st.attempts };
+            if (st.reason) out.reason = st.reason;
+            if (st.image_path) out.image_path = st.image_path;
+            if (typeof st.bytes === 'number') out.bytes = st.bytes;
+            return out;
+        });
+
+        return {
+            sceneAssets,
+            perSceneStatus,
+            retryCount,
+            imageGenerate: firstResp,
+            maxAttempts,
+        };
+    }
+
+    /**
+     * Convenience: count scenes that ended up in `fallback` (composer
+     * will gradient-fill them) given a `perSceneStatus[]`.
+     */
+    function countFallbackScenes(perSceneStatus) {
+        return (perSceneStatus || []).filter((s) => s && s.status === 'fallback').length;
+    }
+
+    /**
      * Strip the renderer-only `scene_id` annotation before crossing the
      * `producer:composeShort` IPC boundary (sidecar's SceneAssetSpec only
      * knows about image_path / start_s / duration_s).
@@ -208,6 +353,8 @@
         groupSavedFilesByPromptIndex,
         pickFirstUsableSavedFile,
         buildSceneAssetsFromImageBatch,
+        orchestrateImageGenerationWithRetries,
+        countFallbackScenes,
         stripSceneAssetForComposer,
     };
 }));
