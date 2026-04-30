@@ -782,7 +782,7 @@
         const d = data || {};
         let html = '';
         html += `<div class="stats-row">
-            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed ? d.duration_s.toFixed(2) : d.duration_s)}s</b></span>
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
             <span>Engine<b>${escapeHtml(d.engine || '')}</b></span>
             <span>Style<b>${escapeHtml(d.style || '')}</b></span>
@@ -930,7 +930,7 @@
             <span>Prompts sent<b>${escapeHtml(promptCount)}</b></span>
             <span>scenes_used<b>${escapeHtml(d.scenes_used != null ? d.scenes_used : sceneAssets.length)}</b></span>
             <span>scenes_missing<b>${escapeHtml(d.scenes_missing != null ? d.scenes_missing : 0)}</b></span>
-            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed ? d.duration_s.toFixed(2) : d.duration_s)}s</b></span>
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
         </div>`;
 
