@@ -884,19 +884,87 @@
             ? ` (${planned.skipped.length} scene${planned.skipped.length === 1 ? '' : 's'} skipped — missing image_prompt or duration_s)`
             : '';
 
-        // ── Phase 1: image:generate (with retries) ──────────────────────
-        showLoading('swc-result',
-            `Generating ${planned.prompts.length} Grok image(s) — attempt 1 / ${maxAttempts}${skipNote} (this can take 30–120s, requires an active Grok session)...`);
+        // ── PR-20C: per-scene table view ────────────────────────────────
+        // The table is the single source of UI truth from this point on:
+        // every phase mutates `tableState` and re-renders. We keep the
+        // existing scene-level retry / fallback orchestration unchanged
+        // and just plumb its progress + final settle through the table.
+        const tableHelpers = (typeof window !== 'undefined' && window.StoryboardComposeTableHelpers) || null;
+        if (!tableHelpers) {
+            showError('swc-result', { message: 'storyboard_compose_table_helpers.js failed to load — rebuild Electron to pick up PR-20C.' });
+            return;
+        }
+        let tableState = tableHelpers.initRowsFromScenes(scenes);
+        // planPromptsFromScenes returns prompts in scene order with
+        // skipped scenes filtered out — the orchestrator's sceneIds
+        // match this filtered list. Recompute the eligible ids from
+        // `planned.skipped` so the table phase setup is robust.
+        const skippedImageIds = new Set((planned.skipped || []).map((s) => String(s.scene_id)));
+        const eligibleImageIds = scenes
+            .filter((s) => !skippedImageIds.has(String(s.scene_id)))
+            .map((s) => s.scene_id);
+        tableState = tableHelpers.startImagePhase(tableState, eligibleImageIds, planned.skipped || []);
 
+        // Render context (shared across phases). `compose` and the
+        // I2V orchestration outputs are filled in as phases complete.
+        const renderCtx = {
+            scenes,
+            sceneCount: scenes.length,
+            promptCount: planned.prompts.length,
+            maxAttempts,
+            allowPartial,
+            useI2V,
+            maxAttemptsI2V,
+            phase: 'image',
+            phaseNote: '',
+            compose: null,
+            sceneAssets: null,
+            videoSceneAssets: null,
+            retryCount: 0,
+            fallbackCount: 0,
+            videoRetryCount: 0,
+            videoFallbackCount: 0,
+            videoMaxAttempts: 1,
+        };
+        const repaint = () => renderSwcTable(tableState, renderCtx);
+        repaint();
+
+        // Wire `job:progress` so each row's progress bar moves live.
+        // The IPC payload's `globalIdx` indexes into the *current
+        // batch*, not the original scene list, so we keep the
+        // current batch's sceneIds in closure and look up scene_id
+        // from the batch index when an event fires.
+        let currentImageBatchSceneIds = eligibleImageIds.slice();
+        let currentI2VBatchSceneIds = [];
+        const progressListener = (data) => {
+            if (!data || !data.progress) return;
+            const { jobId, progress } = data;
+            const idx = (progress && typeof progress.globalIdx === 'number') ? progress.globalIdx : -1;
+            if (jobId === 'image' && idx >= 0 && idx < currentImageBatchSceneIds.length) {
+                tableState = tableHelpers.applyImageProgress(tableState, currentImageBatchSceneIds[idx], progress);
+                repaint();
+            } else if (jobId === 'i2v' && idx >= 0 && idx < currentI2VBatchSceneIds.length) {
+                tableState = tableHelpers.applyI2VProgress(tableState, currentI2VBatchSceneIds[idx], progress);
+                repaint();
+            }
+        };
+        if (typeof api.onProgress === 'function') api.onProgress(progressListener);
+        const cleanup = () => {
+            if (typeof api.removeProgressListener === 'function') api.removeProgressListener();
+        };
+
+        // ── Phase 1: image:generate (with retries) ──────────────────────
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty($('swc-aspect').value);
         if (aspect) config.aspectRatio = aspect;
 
         const imageGenerateFn = async (prompts, ctx) => {
             const attemptNumber = (ctx && ctx.attemptNumber) || 1;
+            const sceneIds = (ctx && Array.isArray(ctx.sceneIds)) ? ctx.sceneIds.slice() : [];
+            currentImageBatchSceneIds = sceneIds;
             if (attemptNumber > 1) {
-                showLoading('swc-result',
-                    `Retrying ${prompts.length} scene(s) that didn't produce a usable image — attempt ${attemptNumber} / ${maxAttempts}...`);
+                tableState = tableHelpers.startImageRetry(tableState, sceneIds, attemptNumber);
+                repaint();
             }
             return api.image.generate({ prompts, config });
         };
@@ -908,6 +976,7 @@
                 { maxAttempts },
             );
         } catch (err) {
+            cleanup();
             showError('swc-result', { message: `Orchestration threw: ${err && err.message ? err.message : String(err)}` });
             return;
         }
@@ -915,45 +984,56 @@
         const { sceneAssets, perSceneStatus, retryCount, imageGenerate } = orchestration;
         const fallbackCount = helpers.countFallbackScenes(perSceneStatus);
 
-        // Surface a Grok-session-down error early — first-attempt success=false
-        // with no usable assets is almost always "not logged in".
+        // Settle every image row from the orchestrator's final
+        // per-scene status table.
+        for (const s of perSceneStatus) {
+            tableState = tableHelpers.applyImageResult(tableState, s.scene_id, {
+                status: s.status,
+                attempts: s.attempts,
+                image_path: s.image_path != null ? s.image_path : null,
+                reason: s.reason != null ? s.reason : null,
+            });
+        }
+        renderCtx.sceneAssets = sceneAssets;
+        renderCtx.retryCount = retryCount;
+        renderCtx.fallbackCount = fallbackCount;
+        repaint();
+        // Resolve thumbnail file:// URLs for any newly-settled image
+        // rows; non-blocking so the table stays responsive.
+        resolveThumbnailUrls(tableState, repaint).catch(() => {});
+
+        // Surface a Grok-session-down error early.
         if (imageGenerate && imageGenerate.success === false && sceneAssets.length === 0) {
+            cleanup();
             const why = imageGenerate.error || 'Unknown — most common cause is no active Grok session. Open the Login panel, sign in, then retry.';
-            showError('swc-result', { message: `Grok image generation failed: ${why}` });
+            renderCtx.errorMessage = `Grok image generation failed: ${why}`;
+            repaint();
             return;
         }
 
         // Strict mode: any scene in `fallback` blocks the compose call.
         if (!allowPartial && fallbackCount > 0) {
+            cleanup();
             const detail = perSceneStatus
                 .filter((s) => s.status === 'fallback')
                 .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason || 'no usable image'}`)
                 .join('; ');
-            showError('swc-result', {
-                message: `${fallbackCount} scene(s) missing usable images after ${maxAttempts} attempt(s) and "Allow partial compose" is off — aborting before composer. (${detail})`,
-            });
+            renderCtx.errorMessage = `${fallbackCount} scene(s) missing usable images after ${maxAttempts} attempt(s) and "Allow partial compose" is off — aborting before composer. (${detail})`;
+            repaint();
             return;
         }
 
-        // Pure no-asset case (every scene either skipped or fallback) —
-        // composing would just be gradient + narration, almost never what
-        // the user wanted. Show a targeted error instead.
         if (sceneAssets.length === 0) {
+            cleanup();
             const detail = perSceneStatus
                 .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.status}${s.reason ? ' (' + s.reason + ')' : ''}`)
                 .join('; ');
-            showError('swc-result', {
-                message: `No scenes produced a usable Grok image after ${maxAttempts} attempt(s). Composer would just be gradient — retry image generation. (${detail})`,
-            });
+            renderCtx.errorMessage = `No scenes produced a usable Grok image after ${maxAttempts} attempt(s). Composer would just be gradient — retry image generation. (${detail})`;
+            repaint();
             return;
         }
 
         // ── Phase 2 (optional, PR-20B): i2v:generate per scene ──────────
-        // Only runs when "Use I2V motion clips" is on. We feed each
-        // generated hero image plus its scene's video_prompt into
-        // i2v:generate; failed scenes naturally fall back to the still
-        // image (already validated in Phase 1) via the composer's
-        // layered fallback chain.
         let videoSceneAssets = [];
         let videoPerSceneStatus = [];
         let videoRetryCount = 0;
@@ -963,14 +1043,18 @@
         if (useI2V && sceneAssets.length > 0) {
             const { jobs, skipped: i2vPlanSkipped } = videoHelpers
                 .planI2VJobsFromScenesAndAssets(scenes, sceneAssets);
+            // Surface I2V-eligible vs. plan-skipped rows in the table.
+            tableState = tableHelpers.startI2VPhase(tableState, jobs.map((j) => j.scene_id), i2vPlanSkipped || []);
+            renderCtx.phase = 'i2v';
+            repaint();
             if (jobs.length > 0) {
-                showLoading('swc-result',
-                    `Generating ${jobs.length} I2V motion clip(s) — attempt 1 / ${maxAttemptsI2V} (each clip ~30–90s, requires an active Grok session)...`);
                 const i2vGenerateFn = async (items, ctx) => {
                     const attemptNumber = (ctx && ctx.attemptNumber) || 1;
+                    const sceneIds = (ctx && Array.isArray(ctx.sceneIds)) ? ctx.sceneIds.slice() : [];
+                    currentI2VBatchSceneIds = sceneIds;
                     if (attemptNumber > 1) {
-                        showLoading('swc-result',
-                            `Retrying ${items.length} I2V scene(s) that didn't return a usable mp4 — attempt ${attemptNumber} / ${maxAttemptsI2V}...`);
+                        tableState = tableHelpers.startI2VRetry(tableState, sceneIds, attemptNumber);
+                        repaint();
                     }
                     return api.i2v.generate({ items });
                 };
@@ -981,7 +1065,9 @@
                         { maxAttempts: maxAttemptsI2V },
                     );
                 } catch (err) {
-                    showError('swc-result', { message: `I2V orchestration threw: ${err && err.message ? err.message : String(err)}` });
+                    cleanup();
+                    renderCtx.errorMessage = `I2V orchestration threw: ${err && err.message ? err.message : String(err)}`;
+                    repaint();
                     return;
                 }
                 videoSceneAssets = videoOrch.videoSceneAssets;
@@ -999,17 +1085,32 @@
                 });
             }
             videoFallbackCount = videoHelpers.countFallbackI2VScenes(videoPerSceneStatus);
+
+            // Settle every I2V row from the orchestrator's status.
+            for (const s of videoPerSceneStatus) {
+                tableState = tableHelpers.applyI2VResult(tableState, s.scene_id, {
+                    status: s.status,
+                    attempts: s.attempts,
+                    video_path: s.video_path != null ? s.video_path : null,
+                    reason: s.reason != null ? s.reason : null,
+                });
+            }
+            renderCtx.videoSceneAssets = videoSceneAssets;
+            renderCtx.videoRetryCount = videoRetryCount;
+            renderCtx.videoFallbackCount = videoFallbackCount;
+            renderCtx.videoMaxAttempts = videoMaxAttempts;
+            renderCtx.i2vFirstResp = i2vFirstResp;
+            repaint();
+            resolveThumbnailUrls(tableState, repaint).catch(() => {});
         }
 
         // ── Phase 3: compose ────────────────────────────────────────────
         const phaseNoteParts = [];
         if (fallbackCount > 0) phaseNoteParts.push(`${fallbackCount} scene${fallbackCount === 1 ? '' : 's'} gradient-filled`);
         if (useI2V && videoFallbackCount > 0) phaseNoteParts.push(`${videoFallbackCount} I2V scene${videoFallbackCount === 1 ? '' : 's'} fall back to still image`);
-        const phase3Note = phaseNoteParts.length ? ` (${phaseNoteParts.join('; ')})` : '';
-        const composeLabel = useI2V
-            ? `Composing 9:16 mp4 (TTS + captions + I2V motion clips over Grok images)${phase3Note}...`
-            : `Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)${phase3Note}...`;
-        showLoading('swc-result', composeLabel);
+        renderCtx.phase = 'compose';
+        renderCtx.phaseNote = phaseNoteParts.length ? phaseNoteParts.join('; ') : '';
+        repaint();
 
         const composePayload = {
             script,
@@ -1029,148 +1130,220 @@
         try {
             compose = await api.producer.composeShort(composePayload);
         } catch (err) {
-            showError('swc-result', { message: `producer:composeShort IPC threw: ${err && err.message ? err.message : String(err)}` });
+            cleanup();
+            renderCtx.errorMessage = `producer:composeShort IPC threw: ${err && err.message ? err.message : String(err)}`;
+            repaint();
             return;
         }
 
-        renderStoryboardCompose({
-            compose,
-            sceneAssets,
-            perSceneStatus,
-            retryCount,
-            maxAttempts,
-            fallbackCount,
-            allowPartial,
-            promptCount: planned.prompts.length,
-            sceneCount: scenes.length,
-            // PR-20B additions
-            useI2V,
-            videoSceneAssets,
-            videoPerSceneStatus,
-            videoRetryCount,
-            videoMaxAttempts,
-            videoFallbackCount,
-            i2vFirstResp,
-        });
+        cleanup();
+        renderCtx.phase = 'done';
+        renderCtx.compose = compose;
+        repaint();
     }
 
-    // PR-17 status → human label mapping for the per-scene table.
-    const STATUS_LABEL = {
-        generated: 'generated',
-        retried:   'retried',
-        fallback:  'fallback (gradient)',
-        skipped:   'skipped',
-    };
-    // PR-20B I2V status mapping. Note ``fallback`` here means
-    // "fall back to still image" (the image phase already validated
-    // a usable hero image), NOT "gradient" — the composer's layered
-    // chain (gradient < image < video) keeps the image visible.
-    const I2V_STATUS_LABEL = {
-        generated: 'video (generated)',
-        retried:   'video (retried)',
-        fallback:  'image (I2V failed → still hero)',
-        skipped:   'image (no hero / no prompt)',
-    };
+    /**
+     * Async post-processor: for every settled row that has an
+     * image_path or video_path but no resolved file:// URL, ask the
+     * main process for a URL via `file:getFileUrl` and patch the row
+     * in place. Calls `repaint()` after each batch update so the
+     * thumbnails appear without blocking the orchestration loop.
+     */
+    async function resolveThumbnailUrls(rows, repaint) {
+        if (!api || typeof api.getFileUrl !== 'function') return;
+        const tasks = [];
+        rows.forEach((row, idx) => {
+            if (row.image && row.image.image_path && !row.image.url) {
+                tasks.push(api.getFileUrl(row.image.image_path).then((res) => {
+                    if (res && res.success && res.url) row.image.url = res.url;
+                }).catch(() => {}));
+            }
+            if (row.i2v && row.i2v.video_path && !row.i2v.url) {
+                tasks.push(api.getFileUrl(row.i2v.video_path).then((res) => {
+                    if (res && res.success && res.url) row.i2v.url = res.url;
+                }).catch(() => {}));
+            }
+        });
+        if (!tasks.length) return;
+        await Promise.all(tasks);
+        if (typeof repaint === 'function') repaint();
+    }
 
-    function renderStoryboardCompose({
-        compose, sceneAssets, perSceneStatus, retryCount, maxAttempts,
-        fallbackCount, allowPartial, promptCount, sceneCount,
-        // PR-20B
-        useI2V, videoSceneAssets, videoPerSceneStatus, videoRetryCount,
-        videoMaxAttempts, videoFallbackCount, i2vFirstResp,
-    }) {
-        const d = compose || {};
+    /**
+     * PR-20C: render the per-scene "Compose with AutoGrok" table.
+     * This replaces the old three-card layout with a single table
+     * that updates live during the run.
+     */
+    function renderSwcTable(rows, ctx) {
+        const tableHelpers = window.StoryboardComposeTableHelpers;
+        const summary = tableHelpers.summarizeRows(rows);
+        const compose = ctx.compose || {};
         let html = '';
+
+        // Phase / status banner.
+        if (ctx.errorMessage) {
+            html += `<div class="error" role="alert"><b>Error</b><pre>${escapeHtml(ctx.errorMessage)}</pre></div>`;
+        } else if (ctx.phase === 'image') {
+            html += `<div class="loading">Phase 1 — generating Grok images (${summary.image_generated + summary.image_retried}/${ctx.promptCount} settled, max attempts ${ctx.maxAttempts}). Requires an active Grok session.</div>`;
+        } else if (ctx.phase === 'i2v') {
+            const planned = summary.i2v_generated + summary.i2v_retried + summary.i2v_fallback;
+            const total = summary.total - summary.i2v_skipped;
+            html += `<div class="loading">Phase 2 — generating I2V motion clips (${planned}/${total} settled, max attempts ${ctx.maxAttemptsI2V}).</div>`;
+        } else if (ctx.phase === 'compose') {
+            const note = ctx.phaseNote ? ` (${ctx.phaseNote})` : '';
+            html += `<div class="loading">Phase 3 — composing 9:16 mp4${note}...</div>`;
+        }
+
+        // Stats row(s).
         html += `<div class="stats-row">
-            <span>Scenes total<b>${escapeHtml(sceneCount)}</b></span>
-            <span>Prompts sent<b>${escapeHtml(promptCount)}</b></span>
-            <span>scenes_used<b>${escapeHtml(d.scenes_used != null ? d.scenes_used : sceneAssets.length)}</b></span>
-            <span>scenes_missing<b>${escapeHtml(d.scenes_missing != null ? d.scenes_missing : (fallbackCount || 0))}</b></span>
-            <span>retry_count<b>${escapeHtml(retryCount || 0)}</b></span>
-            <span>max_attempts<b>${escapeHtml(maxAttempts || 1)}</b></span>
-            <span>allow_partial<b>${escapeHtml(allowPartial ? 'yes' : 'no')}</b></span>
-            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
-            <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
+            <span>Scenes total<b>${escapeHtml(ctx.sceneCount)}</b></span>
+            <span>Prompts sent<b>${escapeHtml(ctx.promptCount)}</b></span>
+            <span>scenes_used<b>${escapeHtml(compose.scenes_used != null ? compose.scenes_used : (ctx.sceneAssets ? ctx.sceneAssets.length : summary.image_generated + summary.image_retried))}</b></span>
+            <span>scenes_missing<b>${escapeHtml(compose.scenes_missing != null ? compose.scenes_missing : summary.image_fallback)}</b></span>
+            <span>retry_count<b>${escapeHtml(ctx.retryCount || 0)}</b></span>
+            <span>max_attempts<b>${escapeHtml(ctx.maxAttempts || 1)}</b></span>
+            <span>allow_partial<b>${escapeHtml(ctx.allowPartial ? 'yes' : 'no')}</b></span>
+            <span>Duration<b>${escapeHtml((compose.duration_s || 0).toFixed ? compose.duration_s.toFixed(2) : (compose.duration_s || 0))}s</b></span>
+            <span>Captions<b>${escapeHtml(compose.captions_count || 0)}</b></span>
         </div>`;
-        if (useI2V) {
+        if (ctx.useI2V) {
             html += `<div class="stats-row">
                 <span>I2V<b>on</b></span>
-                <span>videos_used<b>${escapeHtml(d.videos_used != null ? d.videos_used : (videoSceneAssets ? videoSceneAssets.length : 0))}</b></span>
-                <span>videos_missing<b>${escapeHtml(d.videos_missing != null ? d.videos_missing : 0)}</b></span>
-                <span>i2v retry_count<b>${escapeHtml(videoRetryCount || 0)}</b></span>
-                <span>i2v max_attempts<b>${escapeHtml(videoMaxAttempts || 1)}</b></span>
-                <span>i2v fallback (→image)<b>${escapeHtml(videoFallbackCount || 0)}</b></span>
+                <span>videos_used<b>${escapeHtml(compose.videos_used != null ? compose.videos_used : (ctx.videoSceneAssets ? ctx.videoSceneAssets.length : summary.i2v_generated + summary.i2v_retried))}</b></span>
+                <span>videos_missing<b>${escapeHtml(compose.videos_missing != null ? compose.videos_missing : 0)}</b></span>
+                <span>i2v retry_count<b>${escapeHtml(ctx.videoRetryCount || 0)}</b></span>
+                <span>i2v max_attempts<b>${escapeHtml(ctx.videoMaxAttempts || 1)}</b></span>
+                <span>i2v fallback (→image)<b>${escapeHtml(ctx.videoFallbackCount || 0)}</b></span>
             </div>`;
         }
 
+        // Final mp4 card.
         const paths = [
-            ['mp4', d.mp4_path],
-            ['voice.mp3', d.audio_path],
-            ['captions.srt', d.srt_path],
+            ['mp4', compose.mp4_path],
+            ['voice.mp3', compose.audio_path],
+            ['captions.srt', compose.srt_path],
         ].filter(([, p]) => !!p);
         if (paths.length) {
             html += `<div class="scene-card"><div class="scene-title">Output files</div>`;
             paths.forEach(([label, p]) => {
-                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code></div>`;
+                const actions = renderPathActions(p);
+                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code>${actions}</div>`;
             });
-            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
-        } else {
-            html += renderEmpty('No mp4 produced. Check warnings — image generate may have all been < 50 KB.');
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(compose.output_dir || '')}</code> ${renderPathActions(compose.output_dir, true)}</div></div>`;
         }
 
-        // Per-scene status table — the headline diagnostic for PR-17. Shows
-        // every scene with its eventual status (generated / retried /
-        // fallback / skipped), how many attempts it took, and either the
-        // image_path or skip reason.
-        if (Array.isArray(perSceneStatus) && perSceneStatus.length) {
-            html += `<div class="scene-card"><div class="scene-title">Per-scene status (${perSceneStatus.length})</div>`;
-            perSceneStatus.forEach((s) => {
-                const label = STATUS_LABEL[s.status] || s.status || '?';
-                const detail = s.image_path
-                    ? `<code>${escapeHtml(s.image_path)}</code>`
-                    : `<span class="muted">${escapeHtml(s.reason || '')}</span>`;
-                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')} · ${escapeHtml(label)} · ${escapeHtml(s.attempts || 0)} attempt${s.attempts === 1 ? '' : 's'}</span>${detail}</div>`;
-            });
-            html += `</div>`;
+        // Per-scene table.
+        html += `<table class="swc-table"><thead><tr>
+            <th>#</th>
+            <th>Scene</th>
+            <th>Image prompt</th>
+            <th>Image</th>
+            <th>Video prompt</th>
+            <th>Video</th>
+            <th>Actions</th>
+        </tr></thead><tbody>`;
+        if (rows.length === 0) {
+            html += `<tr><td colspan="7" class="empty">No scenes captured. Run "Break into scenes" first.</td></tr>`;
         }
+        for (const r of rows) {
+            html += renderSwcTableRow(r, ctx);
+        }
+        html += `</tbody></table>`;
 
-        if (sceneAssets && sceneAssets.length) {
-            html += `<div class="scene-card"><div class="scene-title">Scene assets used (${sceneAssets.length})</div>`;
-            sceneAssets.forEach((sa) => {
-                const end = (sa.start_s + sa.duration_s);
-                const endStr = (typeof end === 'number' && !isNaN(end)) ? end.toFixed(3) : String(end);
-                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(sa.scene_id != null ? sa.scene_id : '?')}: ${escapeHtml(sa.start_s)}–${escapeHtml(endStr)}s</span><code>${escapeHtml(sa.image_path)}</code></div>`;
-            });
-            html += `</div>`;
-        }
-
-        // PR-20B I2V per-scene status. Shows what each scene's window
-        // ended up rendering — video clip vs. still hero image vs.
-        // gradient (skipped/fallback chains all the way down).
-        if (useI2V && Array.isArray(videoPerSceneStatus) && videoPerSceneStatus.length) {
-            html += `<div class="scene-card"><div class="scene-title">I2V per-scene status (${videoPerSceneStatus.length})</div>`;
-            videoPerSceneStatus.forEach((s) => {
-                const label = I2V_STATUS_LABEL[s.status] || s.status || '?';
-                const detail = s.video_path
-                    ? `<code>${escapeHtml(s.video_path)}</code>`
-                    : `<span class="muted">${escapeHtml(s.reason || '')}</span>`;
-                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')} · ${escapeHtml(label)} · ${escapeHtml(s.attempts || 0)} attempt${s.attempts === 1 ? '' : 's'}</span>${detail}</div>`;
-            });
-            html += `</div>`;
-        }
-        if (useI2V && Array.isArray(videoSceneAssets) && videoSceneAssets.length) {
-            html += `<div class="scene-card"><div class="scene-title">Video scene assets used (${videoSceneAssets.length})</div>`;
-            videoSceneAssets.forEach((va) => {
-                const end = (va.start_s + va.duration_s);
-                const endStr = (typeof end === 'number' && !isNaN(end)) ? end.toFixed(3) : String(end);
-                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(va.scene_id != null ? va.scene_id : '?')}: ${escapeHtml(va.start_s)}–${escapeHtml(endStr)}s</span><code>${escapeHtml(va.video_path)}</code></div>`;
-            });
-            html += `</div>`;
-        }
-        html += renderWarnings(d.warnings);
-        html += renderRawJson(d);
+        html += renderWarnings(compose.warnings);
+        if (ctx.compose) html += renderRawJson(compose);
         $('swc-result').innerHTML = html;
     }
+
+    function renderSwcTableRow(row, ctx) {
+        const tableHelpers = window.StoryboardComposeTableHelpers;
+        const order = row.order;
+        const sceneId = row.scene_id != null ? row.scene_id : '?';
+        const title = row.title || '';
+        const dur = (typeof row.duration_s === 'number') ? row.duration_s.toFixed(1) : row.duration_s;
+
+        // Image cell: pill + (thumb when generated/retried) + reason.
+        const imgLabel = tableHelpers.imageStatusLabel(row.image.status);
+        const imgClass = tableHelpers.statusClass(row.image.status);
+        let imgCell = `<span class="pill ${escapeHtml(imgClass)}">${escapeHtml(imgLabel)} (${escapeHtml(row.image.attempts || 0)}x)</span>`;
+        if (row.image.url) {
+            imgCell = `<div class="thumb-cell"><img src="${escapeHtml(row.image.url)}" alt="scene ${escapeHtml(sceneId)}" />${imgCell}</div>`;
+        } else if (row.image.image_path && (row.image.status === 'generated' || row.image.status === 'retried')) {
+            imgCell = `<div class="thumb-cell"><div class="thumb-placeholder">loading…</div>${imgCell}</div>`;
+        } else if (row.image.status === 'generating' || row.image.status === 'retrying') {
+            imgCell = `${imgCell}<div class="progress-bar"><div style="width:${escapeHtml(row.image.progress || 0)}%"></div></div>`;
+        }
+        if (row.image.reason && (row.image.status === 'fallback' || row.image.status === 'skipped')) {
+            imgCell += `<div class="reason">${escapeHtml(row.image.reason)}</div>`;
+        }
+
+        // Video cell: only meaningful when useI2V or row already has state.
+        const v2Label = tableHelpers.i2vStatusLabel(row.i2v.status);
+        const v2Class = tableHelpers.statusClass(row.i2v.status);
+        let videoCell = `<span class="pill ${escapeHtml(v2Class)}">${escapeHtml(v2Label)} (${escapeHtml(row.i2v.attempts || 0)}x)</span>`;
+        if (row.i2v.url) {
+            videoCell = `<div class="thumb-cell"><video src="${escapeHtml(row.i2v.url)}" muted playsinline preload="metadata"></video>${videoCell}</div>`;
+        } else if (row.i2v.video_path && (row.i2v.status === 'generated' || row.i2v.status === 'retried')) {
+            videoCell = `<div class="thumb-cell"><div class="thumb-placeholder">loading…</div>${videoCell}</div>`;
+        } else if (row.i2v.status === 'generating' || row.i2v.status === 'retrying') {
+            videoCell = `${videoCell}<div class="progress-bar"><div style="width:${escapeHtml(row.i2v.progress || 0)}%"></div></div>`;
+        }
+        if (row.i2v.reason && (row.i2v.status === 'fallback' || row.i2v.status === 'skipped')) {
+            videoCell += `<div class="reason">${escapeHtml(row.i2v.reason)}</div>`;
+        }
+
+        // Action buttons (PR-20C bonus): open file / show in folder.
+        const actions = [];
+        if (row.image.image_path) actions.push(renderPathActions(row.image.image_path));
+        if (row.i2v.video_path) actions.push(renderPathActions(row.i2v.video_path));
+        const actionsHtml = actions.length ? actions.join('') : '<span class="muted">—</span>';
+
+        return `<tr>
+            <td class="scene-num">${escapeHtml(order)}</td>
+            <td><b>scene ${escapeHtml(sceneId)}</b><div class="reason">${escapeHtml(title)} · ${escapeHtml(dur)}s</div></td>
+            <td class="prompt-cell">${escapeHtml(row.image_prompt || '')}</td>
+            <td>${imgCell}</td>
+            <td class="prompt-cell">${escapeHtml(row.video_prompt || '')}</td>
+            <td>${videoCell}</td>
+            <td class="actions">${actionsHtml}</td>
+        </tr>`;
+    }
+
+    /**
+     * Render the small per-row action chips: "open" (uses
+     * shell.openPath via electronAPI.openPath) and "show" (uses
+     * shell.showItemInFolder). Falls back to a copy-path link if
+     * the IPC isn't available — the path stays useful even without
+     * shell access.
+     */
+    function renderPathActions(path, dirOnly) {
+        if (!path) return '';
+        const safe = String(path).replace(/"/g, '&quot;');
+        if (api && typeof api.openPath === 'function') {
+            const html = [];
+            if (!dirOnly) html.push(`<a href="#" data-swc-open="${safe}">open</a>`);
+            html.push(`<a href="#" data-swc-show="${safe}">show in folder</a>`);
+            return `<span class="actions">${html.join(' ')}</span>`;
+        }
+        return '';
+    }
+
+    // Delegate clicks on action chips so we don't have to attach
+    // listeners to every row on every repaint.
+    document.addEventListener('click', (e) => {
+        const t = e.target;
+        if (!t || !t.matches) return;
+        if (t.matches('a[data-swc-open]')) {
+            e.preventDefault();
+            const p = t.getAttribute('data-swc-open');
+            if (api && typeof api.openPath === 'function') api.openPath(p).catch(() => {});
+        } else if (t.matches('a[data-swc-show]')) {
+            e.preventDefault();
+            const p = t.getAttribute('data-swc-show');
+            if (api && typeof api.showItemInFolder === 'function') api.showItemInFolder(p).catch(() => {});
+        }
+    });
+
 
     async function populateStoryboardComposeVoicePicker() {
         if (!api) return;
