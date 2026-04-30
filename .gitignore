@@ -70,6 +70,11 @@ desktop/i2v-input/
 desktop/logs/
 # E2E AutoGrok image-generate harness output (scripts/e2e_autogrok_image.js).
 e2e-output/
+# Per-user runtime dir written by the packaged app at
+# `~/.creator-forge/output/short-<ts>/short.mp4` (compose pipeline) and
+# `~/.creator-forge/grok-profile/` (default Grok session if
+# GROK_PROFILE_DIR is not set). Always user-local; never commit.
+.creator-forge/
 
 # --- IDE / OS ---
 .vscode/

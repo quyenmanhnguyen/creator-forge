@@ -39,6 +39,26 @@ function findRepoRoot(start) {
     return null;
 }
 
+/**
+ * Locate the bundled research/ source when the app is packaged by
+ * electron-builder. The build config in `desktop/electron-builder.yml`
+ * copies `research/` into `extraResources` so it lands at
+ * `<process.resourcesPath>/research/api/main.py` inside the installed
+ * app. In dev mode `process.resourcesPath` points at Electron's own
+ * resources dir (which doesn't have research/), so this returns null
+ * and we fall through to the regular `findRepoRoot` walk-up.
+ *
+ * Pure function — accepts the resources path explicitly so the offline
+ * test suite can hit every branch without touching `process`.
+ */
+function locatePackagedSidecarRoot(resourcesPath, fsImpl = fs) {
+    if (!resourcesPath || typeof resourcesPath !== 'string') return null;
+    if (!fsImpl.existsSync(path.join(resourcesPath, 'research', 'api', 'main.py'))) {
+        return null;
+    }
+    return resourcesPath;
+}
+
 function pythonExecutable() {
     if (process.env.CREATOR_FORGE_PYTHON) return process.env.CREATOR_FORGE_PYTHON;
     return process.platform === 'win32' ? 'python' : 'python3';
@@ -127,7 +147,20 @@ async function start({ port = DEFAULT_PORT, repoRoot } = {}) {
         );
     }
 
-    const root = repoRoot || findRepoRoot(__dirname);
+    // Resolution order:
+    //  1. caller-supplied repoRoot (tests / programmatic embedders)
+    //  2. CREATOR_FORGE_REPO_ROOT env (dev override)
+    //  3. process.resourcesPath/research (packaged by electron-builder)
+    //  4. walk up from __dirname looking for research/api/main.py (dev)
+    const root =
+        repoRoot ||
+        (process.env.CREATOR_FORGE_REPO_ROOT && fs.existsSync(
+            path.join(process.env.CREATOR_FORGE_REPO_ROOT, 'research', 'api', 'main.py'),
+        )
+            ? process.env.CREATOR_FORGE_REPO_ROOT
+            : null) ||
+        locatePackagedSidecarRoot(process.resourcesPath) ||
+        findRepoRoot(__dirname);
     if (!root) {
         throw new Error(
             'researchSidecar: cannot locate research/api/main.py. ' +
@@ -197,4 +230,12 @@ function getPort() {
     return actualPort;
 }
 
-module.exports = { start, stop, getPort, setLogSink };
+module.exports = {
+    start,
+    stop,
+    getPort,
+    setLogSink,
+    // Exported for offline tests (test_research_sidecar_lookup.js):
+    findRepoRoot,
+    locatePackagedSidecarRoot,
+};
