@@ -1,0 +1,19 @@
+{
+    "_comment": "Pinned python-build-standalone (astral-sh) runtime used by scripts/fetch-python-runtime.js. Bump release_tag + python_version + the per-platform sha256 in lockstep. SHA256 hashes come from the SHA256SUMS file at https://github.com/astral-sh/python-build-standalone/releases/download/<release_tag>/SHA256SUMS.",
+    "release_tag": "20250918",
+    "python_version": "3.12.11",
+    "platforms": {
+        "win32-x64": {
+            "triple": "x86_64-pc-windows-msvc",
+            "asset_suffix": "install_only.tar.gz",
+            "sha256": "919257921a6c75bb8cec70ed2b3fe946f5be1395641ae8301154abf567a55cf5",
+            "interpreter_relpath": "python/python.exe"
+        },
+        "linux-x64": {
+            "triple": "x86_64-unknown-linux-gnu",
+            "asset_suffix": "install_only.tar.gz",
+            "sha256": "ece4001b4fe88f5fb0dea8a08d84853bad13ebb7077b862a654ea9f2e01f48e6",
+            "interpreter_relpath": "python/bin/python3"
+        }
+    }
+}

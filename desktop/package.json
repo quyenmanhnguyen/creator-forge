@@ -18,7 +18,9 @@
     "start": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "dist:win": "electron-builder --win --x64",
+    "prefetch:python:win": "node ../scripts/fetch-python-runtime.js --platform win32 --arch x64",
+    "prefetch:python:linux": "node ../scripts/fetch-python-runtime.js --platform linux --arch x64",
+    "dist:win": "npm run prefetch:python:win && electron-builder --win --x64",
     "dist:mac": "electron-builder --mac --x64 --arm64",
     "dist:linux": "electron-builder --linux --x64"
   },

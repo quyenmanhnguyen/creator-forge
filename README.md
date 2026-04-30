@@ -240,18 +240,61 @@ purpose:
   Node binaries, the user's `.venv/`, the Python interpreter, or any
   `e2e-output/` / `~/.creator-forge/` artifacts.
 
-### Python sidecar at runtime
+### Bundled Python interpreter (PR-19, Windows-only)
 
-`electron-builder` does NOT bundle the Python interpreter or
-`research/requirements.txt` deps — the packaged app still spawns
-`python3 -m uvicorn research.api.main:app` against the bundled
-`research/` source on first launch. Users of the installer therefore
-need:
+Since PR-19, the **Windows** installer ships a self-contained Python
+3.12.11 runtime (sourced from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone))
+under `<resourcesPath>/python/python.exe`. End users do **not** need to
+install Python before launching the Windows build.
+
+The build pipeline pulls the runtime down on the build host:
+
+```bash
+# Run before npm run dist:win — it's chained automatically by the
+# `dist:win` script, but you can call it standalone to seed the cache.
+cd desktop
+npm run prefetch:python:win
+# → desktop/build/python-runtime/win32-x64/python/python.exe (cached)
+# → pip install -r research/requirements.txt against that interpreter
+```
+
+`scripts/fetch-python-runtime.js` is the orchestration:
+
+- Pin lives in `scripts/python-runtime.config.json` (release tag,
+  Python version, per-platform sha256). Bump this file in lockstep
+  when upgrading.
+- Idempotent — caches the install_only tarball under
+  `desktop/build/python-runtime/.cache/`, verifies SHA256 against the
+  pinned hash, only re-extracts when missing or `--force`.
+- `--skip-deps` lets you grab just the runtime without running
+  `pip install` (useful when iterating on packaging).
+- Linux is a smoke target only — `npm run prefetch:python:linux` works
+  and is what CI/Devin uses, but the Linux/macOS installers are NOT
+  yet wired to ship a bundled runtime. Follow-up PR.
+
+`desktop/electron/researchSidecar.js` resolves the interpreter in this
+order at runtime:
+
+1. `CREATOR_FORGE_PYTHON` env (always wins; lets users override with a
+   venv even on the bundled-runtime build).
+2. **Packaged** `<process.resourcesPath>/python/<python.exe|bin/python3>`
+   — what the installer lays down.
+3. **Dev-mode bundled** `desktop/build/python-runtime/<key>/python/...`
+   — populated by the prefetch script.
+4. PATH `python` (Windows) / `python3` (mac/linux) — the pre-PR-19
+   fallback.
+
+### macOS / Linux runtime requirement (until follow-up PR)
+
+The macOS DMG and Linux AppImage builds shipped from this PR's config
+do NOT bundle Python. Users of those builds still need:
 
 1. Python 3.10+ on `PATH` (or pinned via `CREATOR_FORGE_PYTHON`).
-2. `pip install -r research/requirements.txt` against that interpreter
-   (the same one the dev workflow uses).
-3. `ffmpeg` on `PATH` for the compose pipeline.
+2. `pip install -r research/requirements.txt` against that interpreter.
+3. `ffmpeg` on `PATH` for the compose pipeline (PR-19 does not bundle
+   ffmpeg on any platform — `imageio-ffmpeg` from the requirements
+   pulls down a static binary on first import as a safety net).
 
 The first launch fails fast with a friendly error (`researchSidecar:
 cannot locate research/api/main.py` or `python3: command not found`)
@@ -606,16 +649,23 @@ node scripts/e2e_compose_with_scene_assets.js \
     --allow-partial
 ```
 
-### Packaged app launches but the sidecar dot stays red (PR-18)
+### Packaged app launches but the sidecar dot stays red (PR-18 / PR-19)
 
 The installer ships the Python sidecar source under
-`<install-dir>/resources/research/`, but you still need a Python
-interpreter on the host. The most common causes:
+`<install-dir>/resources/research/`. On **Windows** (PR-19) it also
+ships a bundled interpreter at `<install-dir>/resources/python/`. The
+most common causes when the dot is red:
 
-- **`python3` (or `python` on Windows) is not on PATH.** Install Python
-  3.10+ from python.org and re-launch the app.
-- **Python is on PATH but `research/requirements.txt` isn't installed.**
-  From a shell with the same Python on PATH:
+- **Windows: bundled python missing or corrupted.** Re-run the
+  installer. If `<install-dir>/resources/python/python.exe` is absent
+  the build is incomplete — check the build host ran
+  `npm run prefetch:python:win` (it's chained automatically by
+  `npm run dist:win`).
+- **macOS / Linux: `python3` is not on PATH.** Install Python 3.10+
+  from python.org (or your distro's package manager) and re-launch.
+  The non-Windows builds do NOT yet ship bundled Python (follow-up).
+- **macOS / Linux: Python on PATH but `research/requirements.txt`
+  isn't installed.** From a shell with the same Python on PATH:
   `pip install -r <install-dir>/resources/research/requirements.txt`
   (or point `CREATOR_FORGE_PYTHON` at a venv that already has them).
 - **Port 5050 is taken by an unrelated service.** Set

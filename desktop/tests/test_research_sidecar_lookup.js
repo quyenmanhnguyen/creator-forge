@@ -90,6 +90,140 @@ test('findRepoRoot: walks up from a deep child into the actual repo root', () =>
     assert.ok(root.endsWith('creator-forge') || root.endsWith('creator-forge/'), 'unexpected root: ' + root);
 });
 
+// ── resolvePythonExecutable (PR-19) ─────────────────────────────────────────
+
+test('resolvePythonExecutable: CREATOR_FORGE_PYTHON env wins over everything', () => {
+    const got = sidecar.resolvePythonExecutable({
+        env: { CREATOR_FORGE_PYTHON: '/opt/venv/bin/python' },
+        platform: 'win32',
+        arch: 'x64',
+        resourcesPath: '/Applications/Creator Forge.app/Contents/Resources',
+        repoRoot: '/home/dev/repo',
+        fsImpl: makeFs([
+            // even with packaged AND dev-mode bundled present, env wins
+            '/Applications/Creator Forge.app/Contents/Resources/python/python.exe',
+            '/home/dev/repo/desktop/build/python-runtime/win32-x64/python/python.exe',
+        ]),
+    });
+    assert.strictEqual(got, '/opt/venv/bin/python');
+});
+
+test('resolvePythonExecutable: Windows packaged → resources/python/python.exe', () => {
+    const resources = 'C:\\Program Files\\Creator Forge\\resources';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'win32',
+        arch: 'x64',
+        resourcesPath: resources,
+        repoRoot: null,
+        fsImpl: makeFs([resources + '\\python\\python.exe']),
+    });
+    // path.join on the test host normalises separators; just check the
+    // last few components match the expected layout.
+    assert.ok(/python[\\/]python\.exe$/.test(got), 'unexpected: ' + got);
+    assert.ok(got.includes(resources), 'unexpected: ' + got);
+});
+
+test('resolvePythonExecutable: Linux packaged → resources/python/bin/python3', () => {
+    const resources = '/Applications/Creator Forge.app/Contents/Resources';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'linux',
+        arch: 'x64',
+        resourcesPath: resources,
+        repoRoot: null,
+        fsImpl: makeFs([resources + '/python/bin/python3']),
+    });
+    assert.strictEqual(got, resources + '/python/bin/python3');
+});
+
+test('resolvePythonExecutable: dev-mode bundled (Windows) when packaged path missing', () => {
+    const repoRoot = '/home/dev/creator-forge';
+    const expected = repoRoot + '/desktop/build/python-runtime/win32-x64/python/python.exe';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'win32',
+        arch: 'x64',
+        resourcesPath: null,
+        repoRoot,
+        fsImpl: makeFs([expected]),
+    });
+    assert.strictEqual(got.replace(/\\/g, '/'), expected);
+});
+
+test('resolvePythonExecutable: dev-mode bundled (Linux)', () => {
+    const repoRoot = '/home/dev/creator-forge';
+    const expected = repoRoot + '/desktop/build/python-runtime/linux-x64/python/bin/python3';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'linux',
+        arch: 'x64',
+        resourcesPath: null,
+        repoRoot,
+        fsImpl: makeFs([expected]),
+    });
+    assert.strictEqual(got, expected);
+});
+
+test('resolvePythonExecutable: PATH fallback (Windows)', () => {
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'win32',
+        arch: 'x64',
+        resourcesPath: null,
+        repoRoot: null,
+        fsImpl: makeFs([]),
+    });
+    assert.strictEqual(got, 'python');
+});
+
+test('resolvePythonExecutable: PATH fallback (Linux/macOS)', () => {
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'darwin',
+        arch: 'arm64',
+        resourcesPath: null,
+        repoRoot: null,
+        fsImpl: makeFs([]),
+    });
+    assert.strictEqual(got, 'python3');
+});
+
+test('resolvePythonExecutable: dev-mode skipped on darwin (PR-19 Windows-only)', () => {
+    const repoRoot = '/home/dev/creator-forge';
+    // Even if a darwin-shaped runtime tree exists locally, the lookup
+    // must not pick it up — we don't have a pinned darwin entry yet.
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'darwin',
+        arch: 'x64',
+        resourcesPath: null,
+        repoRoot,
+        fsImpl: makeFs([
+            repoRoot + '/desktop/build/python-runtime/darwin-x64/python/bin/python3',
+        ]),
+    });
+    assert.strictEqual(got, 'python3');
+});
+
+test('resolvePythonExecutable: packaged path present takes precedence over dev-mode', () => {
+    const resources = 'C:\\app\\resources';
+    const repoRoot = 'C:\\dev\\creator-forge';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'win32',
+        arch: 'x64',
+        resourcesPath: resources,
+        repoRoot,
+        fsImpl: makeFs([
+            resources + '\\python\\python.exe',
+            repoRoot + '\\desktop\\build\\python-runtime\\win32-x64\\python\\python.exe',
+        ]),
+    });
+    assert.ok(got.includes('resources'), 'expected packaged path, got: ' + got);
+    assert.ok(!got.includes('build'), 'should not pick dev-mode when packaged is present');
+});
+
 // ── exports ─────────────────────────────────────────────────────────────────
 
 test('module exports public + private helpers expected by callers/tests', () => {
@@ -99,6 +233,8 @@ test('module exports public + private helpers expected by callers/tests', () => 
     assert.strictEqual(typeof sidecar.setLogSink, 'function');
     assert.strictEqual(typeof sidecar.findRepoRoot, 'function');
     assert.strictEqual(typeof sidecar.locatePackagedSidecarRoot, 'function');
+    assert.strictEqual(typeof sidecar.resolvePythonExecutable, 'function');
+    assert.strictEqual(typeof sidecar.pythonExecutable, 'function');
 });
 
 // ── results ─────────────────────────────────────────────────────────────────

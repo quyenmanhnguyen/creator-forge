@@ -76,6 +76,13 @@ e2e-output/
 # GROK_PROFILE_DIR is not set). Always user-local; never commit.
 .creator-forge/
 
+# python-build-standalone runtime tree fetched by
+# `scripts/fetch-python-runtime.js` (PR-19). Each platform-arch pair
+# lives under desktop/build/python-runtime/<key>/python/ and weighs
+# ~30-50 MB compressed before pip install, ~250 MB after — strictly
+# regenerable from the pinned config. Tarballs cached under .cache/.
+desktop/build/python-runtime/
+
 # --- IDE / OS ---
 .vscode/
 .idea/
