@@ -16,13 +16,18 @@
  */
 
 // Reuse the renderer-side helpers in Node — same retry / picking logic as
-// the UI panel, single source of truth (PR-17).
+// the UI panel, single source of truth (PR-17 / PR-20B).
 const composeHelpers = require('../../dist/storyboard_compose_helpers.js');
+const videoComposeHelpers = require('../../dist/storyboard_video_compose_helpers.js');
 
 // Minimum useful image size (matches PR-9 MIN_BLOB_LEN in ImageService —
 // anything smaller is almost certainly a blur preview / moderation
 // placeholder and would render as noise in the composed mp4).
 const MIN_USABLE_IMAGE_BYTES = composeHelpers.MIN_USABLE_IMAGE_BYTES;
+// Minimum useful I2V mp4 size — generous floor for catching empty/
+// truncated downloads. Real Grok I2V output is multi-hundred-KB to
+// multi-MB.
+const MIN_USABLE_VIDEO_BYTES = videoComposeHelpers.MIN_USABLE_VIDEO_BYTES;
 
 class StoryboardBridge {
     constructor(electronAPI = (typeof window !== 'undefined' ? window.electronAPI : null)) {
@@ -298,6 +303,255 @@ class StoryboardBridge {
             perSceneStatus,
             retryCount,
             maxAttempts: effectiveMaxAttempts,
+            allowPartial: !!allow_partial,
+            warnings,
+        };
+    }
+
+    /**
+     * Full pipeline with motion clips (PR-20B):
+     *
+     *   scenes → image:generate (per-scene retries)
+     *          → i2v:generate (per-scene retries on the hero images)
+     *          → /producer/short with both ``scene_assets[]`` (image
+     *            fallback per window) AND ``video_scene_assets[]``.
+     *
+     * The composer's layered fallback chain (``gradient < image < video``,
+     * see :func:`research.core.pixelle.composer.make_short`) means a
+     * scene that succeeds at I2V renders motion, a scene that fails I2V
+     * but succeeded image_generate renders the still hero image (Ken
+     * Burns), and a scene that failed both renders the gradient — no
+     * black gaps even on partial batches.
+     *
+     * Diff vs :meth:`composeWithScenes`:
+     *
+     *   - Adds a Phase-2 i2v:generate orchestration after the image
+     *     orchestration. ``max_attempts_i2v`` is independent of
+     *     ``max_attempts`` (image) so the user can be more or less
+     *     aggressive on each side.
+     *   - Forwards both lists to ``producer.composeShort``.
+     *   - ``allow_partial`` semantics extend to *images* (fallback to
+     *     gradient) but the I2V layer is **always** partial-tolerant:
+     *     a failed I2V scene falls back to the underlying image
+     *     (already validated by the image phase). Setting
+     *     ``allow_partial=false`` only blocks if the *image* phase
+     *     can't satisfy every scene.
+     *
+     * @param {{
+     *   script: string,
+     *   scenes: Array,
+     *   voice?: string, style?: string, output_dir?: string,
+     *   write_srt?: boolean, account?: string,
+     *   aspectRatio?: string, enablePro?: boolean,
+     *   max_attempts?: number,        // image attempts per scene (default 2)
+     *   max_attempts_i2v?: number,    // i2v attempts per scene (default 2)
+     *   allow_partial?: boolean,      // gates image-fallback windows (default true)
+     *   i2v_config?: object,          // optional override forwarded to i2v:generate
+     * }} params
+     * @param {{
+     *   stat?: (p:string)=>{size:number}|null,
+     *   statBytes?: (p:string)=>Promise<{exists:boolean,size:number}|null>,
+     * }} [hooks]
+     * @returns {Promise<{
+     *   compose: object,
+     *   sceneAssets: Array,
+     *   videoSceneAssets: Array,
+     *   imagePerSceneStatus: Array,
+     *   videoPerSceneStatus: Array,
+     *   imageRetryCount: number,
+     *   videoRetryCount: number,
+     *   imageMaxAttempts: number,
+     *   videoMaxAttempts: number,
+     *   allowPartial: boolean,
+     *   warnings: string[],
+     * }>}
+     */
+    async composeWithVideoScenes(params = {}, hooks = {}) {
+        const {
+            script,
+            scenes,
+            voice,
+            style,
+            output_dir,
+            write_srt,
+            account,
+            aspectRatio,
+            enablePro,
+            max_attempts = 2,
+            max_attempts_i2v = 2,
+            allow_partial = true,
+            i2v_config,
+        } = params;
+
+        if (!this.producer || typeof this.producer.composeShort !== 'function') {
+            throw new Error('StoryboardBridge.composeWithVideoScenes: electronAPI.producer.composeShort is unavailable.');
+        }
+        if (!this.i2v || typeof this.i2v.generate !== 'function') {
+            throw new Error('StoryboardBridge.composeWithVideoScenes: electronAPI.i2v.generate is unavailable.');
+        }
+        if (typeof script !== 'string' || !script.trim()) {
+            throw new Error('StoryboardBridge.composeWithVideoScenes: script is required.');
+        }
+
+        // statBytesAsync(path) → { exists, size }. Same hook contract as
+        // composeWithScenes so tests can share fakes.
+        let statBytesAsync;
+        if (typeof hooks.statBytes === 'function') {
+            statBytesAsync = hooks.statBytes;
+        } else if (typeof hooks.stat === 'function') {
+            statBytesAsync = async (p) => {
+                const st = hooks.stat(p);
+                return { exists: !!st, size: st && typeof st.size === 'number' ? st.size : 0 };
+            };
+        } else {
+            statBytesAsync = async (p) => {
+                try {
+                    const fs = require('fs');
+                    const st = fs.statSync(p);
+                    return { exists: true, size: Number(st.size) || 0 };
+                } catch (_) {
+                    return { exists: false, size: 0 };
+                }
+            };
+        }
+
+        const warnings = [];
+
+        // ── Phase 1: image generation (with retries) ────────────────────
+        const imageGenerateFn = async (prompts, _ctx) => {
+            const config = { imageGenerationCount: 1 };
+            if (aspectRatio) config.aspectRatio = aspectRatio;
+            if (typeof enablePro === 'boolean') config.enablePro = enablePro;
+            return this.image.generate({ prompts, config, account });
+        };
+        const imageOrchestration = await composeHelpers.orchestrateImageGenerationWithRetries(
+            scenes,
+            imageGenerateFn,
+            statBytesAsync,
+            { maxAttempts: max_attempts, minBytes: MIN_USABLE_IMAGE_BYTES },
+        );
+        const {
+            sceneAssets,
+            perSceneStatus: imagePerSceneStatus,
+            retryCount: imageRetryCount,
+            imageGenerate,
+            maxAttempts: imageMaxAttempts,
+        } = imageOrchestration;
+
+        if (imageGenerate && imageGenerate.success === false) {
+            warnings.push(
+                `image:generate IPC failed on first attempt${imageGenerate.error ? ': ' + imageGenerate.error : ''}; orchestrator continued with retries.`
+            );
+        }
+        const imageFallbackCount = composeHelpers.countFallbackScenes(imagePerSceneStatus);
+        if (imageRetryCount > 0) {
+            warnings.push(`Image phase: issued ${imageRetryCount} retry attempt(s) across scenes that didn't produce a ≥${MIN_USABLE_IMAGE_BYTES}-byte image on the first pass.`);
+        }
+        if (imageFallbackCount > 0) {
+            warnings.push(`Image phase: ${imageFallbackCount} scene(s) fell back to gradient after ${imageMaxAttempts} attempt(s).`);
+        }
+
+        // Strict mode: if the user opted out of partial composition, an
+        // image fallback blocks the whole pipeline (no point running
+        // I2V on missing images).
+        if (!allow_partial && imageFallbackCount > 0) {
+            const err = new Error(
+                `StoryboardBridge.composeWithVideoScenes: ${imageFallbackCount} scene(s) missing usable images after ${imageMaxAttempts} attempt(s) and allow_partial=false.`
+            );
+            err.code = 'INCOMPLETE_BATCH';
+            err.imagePerSceneStatus = imagePerSceneStatus;
+            err.sceneAssets = sceneAssets;
+            err.imageRetryCount = imageRetryCount;
+            err.imageGenerate = imageGenerate;
+            err.warnings = warnings;
+            throw err;
+        }
+
+        // ── Phase 2: i2v generation (with retries) ──────────────────────
+        // Only scenes that produced a hero image are eligible — scenes
+        // that fell back to gradient cannot drive i2v.
+        const { jobs, skipped: i2vPlanSkipped } = videoComposeHelpers
+            .planI2VJobsFromScenesAndAssets(scenes, sceneAssets);
+
+        const i2vGenerateFn = async (items, _ctx) => {
+            const payload = { items };
+            if (i2v_config && typeof i2v_config === 'object') payload.config = i2v_config;
+            return this.i2v.generate(payload);
+        };
+
+        let videoSceneAssets = [];
+        let videoPerSceneStatus = [];
+        let videoRetryCount = 0;
+        let i2vFirstResp = null;
+        let videoMaxAttempts = Math.max(1, Number(max_attempts_i2v) || 2);
+
+        if (jobs.length > 0) {
+            const videoOrchestration = await videoComposeHelpers.orchestrateI2VWithRetries(
+                jobs,
+                i2vGenerateFn,
+                statBytesAsync,
+                { maxAttempts: max_attempts_i2v, minBytes: MIN_USABLE_VIDEO_BYTES },
+            );
+            videoSceneAssets = videoOrchestration.videoSceneAssets;
+            videoPerSceneStatus = videoOrchestration.perSceneStatus;
+            videoRetryCount = videoOrchestration.retryCount;
+            i2vFirstResp = videoOrchestration.i2vGenerate;
+            videoMaxAttempts = videoOrchestration.maxAttempts;
+        }
+
+        // Reflect plan-level skips (scene with no image OR no prompt) in
+        // the per-scene status table — surface them so the UI doesn't
+        // appear to silently drop scenes.
+        for (const sk of i2vPlanSkipped) {
+            videoPerSceneStatus.push({
+                scene_id: sk.scene_id,
+                status: 'skipped',
+                attempts: 0,
+                reason: sk.reason,
+            });
+        }
+
+        if (i2vFirstResp && i2vFirstResp.success === false) {
+            warnings.push(
+                `i2v:generate IPC failed on first attempt${i2vFirstResp.error ? ': ' + i2vFirstResp.error : ''}; orchestrator continued with retries.`
+            );
+        }
+        const videoFallbackCount = videoComposeHelpers.countFallbackI2VScenes(videoPerSceneStatus);
+        if (videoRetryCount > 0) {
+            warnings.push(`I2V phase: issued ${videoRetryCount} retry attempt(s) across scenes that didn't produce a usable mp4 on the first pass.`);
+        }
+        if (videoFallbackCount > 0) {
+            warnings.push(
+                `I2V phase: ${videoFallbackCount} scene(s) fell back to image after ${videoMaxAttempts} attempt(s); composer will render the still hero frame for those windows.`
+            );
+        }
+
+        // ── Phase 3: compose ────────────────────────────────────────────
+        const composePayload = {
+            script,
+            scene_assets: composeHelpers.stripSceneAssetForComposer(sceneAssets),
+        };
+        if (videoSceneAssets.length > 0) {
+            composePayload.video_scene_assets = videoComposeHelpers
+                .stripVideoSceneAssetForComposer(videoSceneAssets);
+        }
+        if (voice) composePayload.voice = voice;
+        if (style) composePayload.style = style;
+        if (output_dir) composePayload.output_dir = output_dir;
+        if (typeof write_srt === 'boolean') composePayload.write_srt = write_srt;
+
+        const compose = await this.producer.composeShort(composePayload);
+
+        return {
+            compose,
+            sceneAssets,
+            videoSceneAssets,
+            imagePerSceneStatus,
+            videoPerSceneStatus,
+            imageRetryCount,
+            videoRetryCount,
+            imageMaxAttempts,
+            videoMaxAttempts,
             allowPartial: !!allow_partial,
             warnings,
         };

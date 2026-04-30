@@ -483,9 +483,21 @@ def test_video_scene_clips_skips_unprobeable_sources(monkeypatch, tmp_path):
     created[0].close.assert_called_once()
 
 
-def test_make_short_video_assets_take_priority_over_image_assets(monkeypatch, tmp_path):
-    """When both ``video_scene_assets`` and ``scene_assets`` are passed,
-    only the video path runs (no Ken-Burns'd ImageClips).
+def test_make_short_video_and_image_assets_layer_for_per_scene_fallback(monkeypatch, tmp_path):
+    """Per-scene fallback (PR-20B): when both ``video_scene_assets`` and
+    ``scene_assets`` are passed, the composer layers them so each window
+    resolves to its highest-priority asset.
+
+    Concretely the layer stack is ``gradient (base) < image clips <
+    video clips``: where a video covers a window its frames hide the
+    image; where the I2V batch dropped a scene the image clip is still
+    visible; where both batches dropped a scene the gradient base is
+    the safety net (no black gaps).
+
+    Pre-PR-20B the composer was mutually-exclusive at list level (the
+    image path never ran when video_scene_assets was non-empty), which
+    produced black gaps for partial I2V batches — the bridge now relies
+    on layered fallback.
     """
     audio = tmp_path / "v.mp3"
     audio.write_bytes(b"fake-mp3")
@@ -510,7 +522,10 @@ def test_make_short_video_assets_take_priority_over_image_assets(monkeypatch, tm
     ):
         getattr(video_clip, method).return_value = video_clip
 
-    fake_image_clip_factory = MagicMock()  # should never fire
+    fake_image_clip = MagicMock()
+    for method in ("set_start", "set_duration", "set_position", "resize"):
+        getattr(fake_image_clip, method).return_value = fake_image_clip
+    fake_image_clip_factory = MagicMock(return_value=fake_image_clip)
 
     fake_composite = MagicMock()
     fake_composite.set_duration.return_value = fake_composite
@@ -547,10 +562,88 @@ def test_make_short_video_assets_take_priority_over_image_assets(monkeypatch, tm
         captions=None,
     )
 
-    # Video path ran exactly once.
+    # Video path ran exactly once for the supplied VideoSceneAsset.
     assert fake_module.VideoFileClip.call_count == 1
-    # Image path did NOT run despite ``scene_assets`` being passed.
-    fake_image_clip_factory.assert_not_called()
+    # Image path runs twice now: once for the gradient base layer, once
+    # for the supplied SceneAsset's Ken-Burns clip. Pre-PR-20B both were
+    # skipped — this is the contract change.
+    assert fake_image_clip_factory.call_count == 2
+    # Layer order is preserved (gradient -> image -> video) so the
+    # composite renders the highest-priority asset on top per window.
+    composite_args, _ = fake_module.CompositeVideoClip.call_args
+    layers = composite_args[0]
+    assert len(layers) == 3, layers
+
+
+def test_make_short_per_scene_mixed_coverage(monkeypatch, tmp_path):
+    """Heterogeneous timeline: scene 1 has video only, scene 2 has image
+    only, scene 3 has neither. Composer must build clips for both lists
+    independently — the gradient base covers scene 3 — and never throw."""
+    audio = tmp_path / "v.mp3"
+    audio.write_bytes(b"fake-mp3")
+    out = tmp_path / "out.mp4"
+
+    fake_audio = MagicMock()
+    fake_audio.duration = 9.0
+    fake_audio.close = MagicMock()
+
+    video_clip = MagicMock()
+    video_clip.duration = 4.0
+    video_clip.w = 640
+    video_clip.h = 480
+    for method in (
+        "without_audio", "subclip", "fx", "resize",
+        "set_start", "set_duration", "set_position",
+    ):
+        getattr(video_clip, method).return_value = video_clip
+
+    fake_image_clip = MagicMock()
+    for method in ("set_start", "set_duration", "set_position", "resize"):
+        getattr(fake_image_clip, method).return_value = fake_image_clip
+    fake_image_clip_factory = MagicMock(return_value=fake_image_clip)
+
+    fake_composite = MagicMock()
+    fake_composite.set_duration.return_value = fake_composite
+    fake_composite.set_audio.return_value = fake_composite
+    fake_composite.write_videofile = MagicMock()
+    fake_composite.close = MagicMock()
+
+    fake_module = types.ModuleType("moviepy.editor")
+    fake_module.AudioFileClip = MagicMock(return_value=fake_audio)
+    fake_module.ImageClip = fake_image_clip_factory
+    fake_module.VideoFileClip = MagicMock(return_value=video_clip)
+    fake_module.vfx = types.SimpleNamespace(loop="LOOP_FX")
+    fake_module.CompositeVideoClip = MagicMock(return_value=fake_composite)
+    monkeypatch.setitem(sys.modules, "moviepy.editor", fake_module)
+
+    monkeypatch.setattr(composer, "_render_gradient_background", lambda *a, **k: None)
+
+    img = tmp_path / "scene_02.png"
+    img.write_bytes(b"x")
+    video = tmp_path / "scene_01.mp4"
+    video.write_bytes(b"y")
+
+    composer.make_short(
+        audio,
+        out,
+        scene_assets=[
+            composer.SceneAsset(image_path=img, start_s=3.0, duration_s=3.0),
+        ],
+        video_scene_assets=[
+            composer.VideoSceneAsset(video_path=video, start_s=0.0, duration_s=3.0),
+        ],
+        captions=None,
+    )
+
+    # Exactly one VideoFileClip + one Ken-Burns ImageClip + one gradient
+    # ImageClip → 1 video, 2 images.
+    assert fake_module.VideoFileClip.call_count == 1
+    assert fake_image_clip_factory.call_count == 2
+
+    composite_args, _ = fake_module.CompositeVideoClip.call_args
+    layers = composite_args[0]
+    # gradient base + 1 scene image + 1 scene video.
+    assert len(layers) == 3
 
 
 # ─── Path overlap test for caption layout (math, not rendering) ─────────────

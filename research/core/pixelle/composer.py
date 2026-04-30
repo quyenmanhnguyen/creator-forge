@@ -143,10 +143,46 @@ def make_short(
     cleanup_paths: list[Path] = []
     layers: list = []
 
-    if video_scene_assets:
-        # Priority: video clips > image clips > gradient. Video clips
-        # already carry motion, so the composer skips Ken Burns and
-        # only handles cropping / fitting.
+    if video_scene_assets and scene_assets:
+        # Per-scene fallback (PR-20B): caller supplied both lists. Layer
+        # images underneath videos so each window resolves to its
+        # highest-priority asset:
+        #
+        #   gradient (base, full timeline) < image clips < video clips
+        #
+        # Where a video covers a window, its frames sit on top and hide
+        # the image. Where the I2V batch dropped a scene, the image clip
+        # still shows. Where neither asset list reaches (e.g. partial
+        # AutoGrok image batch + partial I2V batch), the gradient base
+        # is the safety net — composer never produces a black gap.
+        bg_image_path = output_path.with_suffix(".bg.png")
+        _render_gradient_background(bg_image_path, opts.width, opts.height, style)
+        cleanup_paths.append(bg_image_path)
+        layers.append(
+            ImageClip(str(bg_image_path))
+            .set_duration(duration)
+            .set_position(("center", "center"))
+        )
+        layers.extend(
+            _scene_clips(
+                scene_assets,
+                opts=opts,
+                total_duration=duration,
+            )
+        )
+        layers.extend(
+            _video_scene_clips(
+                video_scene_assets,
+                opts=opts,
+                total_duration=duration,
+            )
+        )
+    elif video_scene_assets:
+        # Video-only timeline. Caller did not provide image fallbacks —
+        # gaps between video clips will resolve to whatever the
+        # composite root renders (typically black). The bridge avoids
+        # this case by always pairing video_scene_assets with
+        # scene_assets when running the full image+I2V flow.
         layers.extend(
             _video_scene_clips(
                 video_scene_assets,

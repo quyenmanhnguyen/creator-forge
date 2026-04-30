@@ -696,14 +696,20 @@
                     <label>Output dir (blank = ~/.creator-forge/output/short-&lt;ts&gt;/)
                         <input id="swc-output-dir" type="text" placeholder="auto" />
                     </label>
-                    <label>Max attempts per scene
+                    <label>Max attempts per scene (image)
                         <input id="swc-max-attempts" type="number" min="1" max="5" step="1" value="2" />
+                    </label>
+                    <label>Max attempts per scene (I2V)
+                        <input id="swc-max-attempts-i2v" type="number" min="1" max="5" step="1" value="2" />
                     </label>
                     <label class="checkbox-row">
                         <input id="swc-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
                     </label>
                     <label class="checkbox-row">
                         <input id="swc-allow-partial" type="checkbox" checked /> Allow partial compose (gradient-fill missing scenes)
+                    </label>
+                    <label class="checkbox-row">
+                        <input id="swc-use-i2v" type="checkbox" /> Use I2V motion clips (image → I2V → compose; PR-20B)
                     </label>
                 </div>
                 <div class="actions">
@@ -750,6 +756,7 @@
         </section>
     </main>
     <script src="storyboard_compose_helpers.js"></script>
+    <script src="storyboard_video_compose_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>

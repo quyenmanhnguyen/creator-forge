@@ -852,6 +852,20 @@
         // PR-17 form fields. Default to 2 attempts (1 retry) + allow_partial=true.
         const maxAttempts = Math.max(1, Math.min(5, parseInt($('swc-max-attempts').value, 10) || 2));
         const allowPartial = !!$('swc-allow-partial').checked;
+        // PR-20B fields — opt-in I2V motion clips.
+        const useI2V = !!($('swc-use-i2v') && $('swc-use-i2v').checked);
+        const maxAttemptsI2V = Math.max(1, Math.min(5, parseInt(($('swc-max-attempts-i2v') || {}).value, 10) || 2));
+        const videoHelpers = (typeof window !== 'undefined' && window.StoryboardVideoComposeHelpers) || null;
+        if (useI2V) {
+            if (!videoHelpers || typeof videoHelpers.orchestrateI2VWithRetries !== 'function') {
+                showError('swc-result', { message: 'storyboard_video_compose_helpers.js failed to load — rebuild Electron to pick up PR-20B.' });
+                return;
+            }
+            if (!api.i2v || typeof api.i2v.generate !== 'function') {
+                showError('swc-result', { message: 'electronAPI.i2v.generate is unavailable — preload.js out of date (rebuild Electron) or I2V provider not wired.' });
+                return;
+            }
+        }
 
         // Preflight: catch the "no usable scenes at all" case before starting
         // the long-running orchestration so the error message is actionable.
@@ -934,11 +948,68 @@
             return;
         }
 
-        // ── Phase 2: compose ────────────────────────────────────────────
-        const phase2Note = fallbackCount > 0
-            ? ` (${fallbackCount} scene${fallbackCount === 1 ? '' : 's'} will be gradient-filled)`
-            : '';
-        showLoading('swc-result', `Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)${phase2Note}...`);
+        // ── Phase 2 (optional, PR-20B): i2v:generate per scene ──────────
+        // Only runs when "Use I2V motion clips" is on. We feed each
+        // generated hero image plus its scene's video_prompt into
+        // i2v:generate; failed scenes naturally fall back to the still
+        // image (already validated in Phase 1) via the composer's
+        // layered fallback chain.
+        let videoSceneAssets = [];
+        let videoPerSceneStatus = [];
+        let videoRetryCount = 0;
+        let videoFallbackCount = 0;
+        let videoMaxAttempts = 1;
+        let i2vFirstResp = null;
+        if (useI2V && sceneAssets.length > 0) {
+            const { jobs, skipped: i2vPlanSkipped } = videoHelpers
+                .planI2VJobsFromScenesAndAssets(scenes, sceneAssets);
+            if (jobs.length > 0) {
+                showLoading('swc-result',
+                    `Generating ${jobs.length} I2V motion clip(s) — attempt 1 / ${maxAttemptsI2V} (each clip ~30–90s, requires an active Grok session)...`);
+                const i2vGenerateFn = async (items, ctx) => {
+                    const attemptNumber = (ctx && ctx.attemptNumber) || 1;
+                    if (attemptNumber > 1) {
+                        showLoading('swc-result',
+                            `Retrying ${items.length} I2V scene(s) that didn't return a usable mp4 — attempt ${attemptNumber} / ${maxAttemptsI2V}...`);
+                    }
+                    return api.i2v.generate({ items });
+                };
+                let videoOrch;
+                try {
+                    videoOrch = await videoHelpers.orchestrateI2VWithRetries(
+                        jobs, i2vGenerateFn, (p) => api.statBytes(p),
+                        { maxAttempts: maxAttemptsI2V },
+                    );
+                } catch (err) {
+                    showError('swc-result', { message: `I2V orchestration threw: ${err && err.message ? err.message : String(err)}` });
+                    return;
+                }
+                videoSceneAssets = videoOrch.videoSceneAssets;
+                videoPerSceneStatus = videoOrch.perSceneStatus;
+                videoRetryCount = videoOrch.retryCount;
+                videoMaxAttempts = videoOrch.maxAttempts;
+                i2vFirstResp = videoOrch.i2vGenerate;
+            }
+            for (const sk of i2vPlanSkipped) {
+                videoPerSceneStatus.push({
+                    scene_id: sk.scene_id,
+                    status: 'skipped',
+                    attempts: 0,
+                    reason: sk.reason,
+                });
+            }
+            videoFallbackCount = videoHelpers.countFallbackI2VScenes(videoPerSceneStatus);
+        }
+
+        // ── Phase 3: compose ────────────────────────────────────────────
+        const phaseNoteParts = [];
+        if (fallbackCount > 0) phaseNoteParts.push(`${fallbackCount} scene${fallbackCount === 1 ? '' : 's'} gradient-filled`);
+        if (useI2V && videoFallbackCount > 0) phaseNoteParts.push(`${videoFallbackCount} I2V scene${videoFallbackCount === 1 ? '' : 's'} fall back to still image`);
+        const phase3Note = phaseNoteParts.length ? ` (${phaseNoteParts.join('; ')})` : '';
+        const composeLabel = useI2V
+            ? `Composing 9:16 mp4 (TTS + captions + I2V motion clips over Grok images)${phase3Note}...`
+            : `Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)${phase3Note}...`;
+        showLoading('swc-result', composeLabel);
 
         const composePayload = {
             script,
@@ -947,6 +1018,10 @@
             style: $('swc-style').value || 'violet-pink',
             write_srt: !!$('swc-write-srt').checked,
         };
+        if (useI2V && videoSceneAssets.length > 0) {
+            composePayload.video_scene_assets = videoHelpers
+                .stripVideoSceneAssetForComposer(videoSceneAssets);
+        }
         const outDir = asNonEmpty($('swc-output-dir').value);
         if (outDir) composePayload.output_dir = outDir;
 
@@ -968,6 +1043,14 @@
             allowPartial,
             promptCount: planned.prompts.length,
             sceneCount: scenes.length,
+            // PR-20B additions
+            useI2V,
+            videoSceneAssets,
+            videoPerSceneStatus,
+            videoRetryCount,
+            videoMaxAttempts,
+            videoFallbackCount,
+            i2vFirstResp,
         });
     }
 
@@ -978,8 +1061,24 @@
         fallback:  'fallback (gradient)',
         skipped:   'skipped',
     };
+    // PR-20B I2V status mapping. Note ``fallback`` here means
+    // "fall back to still image" (the image phase already validated
+    // a usable hero image), NOT "gradient" — the composer's layered
+    // chain (gradient < image < video) keeps the image visible.
+    const I2V_STATUS_LABEL = {
+        generated: 'video (generated)',
+        retried:   'video (retried)',
+        fallback:  'image (I2V failed → still hero)',
+        skipped:   'image (no hero / no prompt)',
+    };
 
-    function renderStoryboardCompose({ compose, sceneAssets, perSceneStatus, retryCount, maxAttempts, fallbackCount, allowPartial, promptCount, sceneCount }) {
+    function renderStoryboardCompose({
+        compose, sceneAssets, perSceneStatus, retryCount, maxAttempts,
+        fallbackCount, allowPartial, promptCount, sceneCount,
+        // PR-20B
+        useI2V, videoSceneAssets, videoPerSceneStatus, videoRetryCount,
+        videoMaxAttempts, videoFallbackCount, i2vFirstResp,
+    }) {
         const d = compose || {};
         let html = '';
         html += `<div class="stats-row">
@@ -993,6 +1092,16 @@
             <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
         </div>`;
+        if (useI2V) {
+            html += `<div class="stats-row">
+                <span>I2V<b>on</b></span>
+                <span>videos_used<b>${escapeHtml(d.videos_used != null ? d.videos_used : (videoSceneAssets ? videoSceneAssets.length : 0))}</b></span>
+                <span>videos_missing<b>${escapeHtml(d.videos_missing != null ? d.videos_missing : 0)}</b></span>
+                <span>i2v retry_count<b>${escapeHtml(videoRetryCount || 0)}</b></span>
+                <span>i2v max_attempts<b>${escapeHtml(videoMaxAttempts || 1)}</b></span>
+                <span>i2v fallback (→image)<b>${escapeHtml(videoFallbackCount || 0)}</b></span>
+            </div>`;
+        }
 
         const paths = [
             ['mp4', d.mp4_path],
@@ -1031,6 +1140,30 @@
                 const end = (sa.start_s + sa.duration_s);
                 const endStr = (typeof end === 'number' && !isNaN(end)) ? end.toFixed(3) : String(end);
                 html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(sa.scene_id != null ? sa.scene_id : '?')}: ${escapeHtml(sa.start_s)}–${escapeHtml(endStr)}s</span><code>${escapeHtml(sa.image_path)}</code></div>`;
+            });
+            html += `</div>`;
+        }
+
+        // PR-20B I2V per-scene status. Shows what each scene's window
+        // ended up rendering — video clip vs. still hero image vs.
+        // gradient (skipped/fallback chains all the way down).
+        if (useI2V && Array.isArray(videoPerSceneStatus) && videoPerSceneStatus.length) {
+            html += `<div class="scene-card"><div class="scene-title">I2V per-scene status (${videoPerSceneStatus.length})</div>`;
+            videoPerSceneStatus.forEach((s) => {
+                const label = I2V_STATUS_LABEL[s.status] || s.status || '?';
+                const detail = s.video_path
+                    ? `<code>${escapeHtml(s.video_path)}</code>`
+                    : `<span class="muted">${escapeHtml(s.reason || '')}</span>`;
+                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')} · ${escapeHtml(label)} · ${escapeHtml(s.attempts || 0)} attempt${s.attempts === 1 ? '' : 's'}</span>${detail}</div>`;
+            });
+            html += `</div>`;
+        }
+        if (useI2V && Array.isArray(videoSceneAssets) && videoSceneAssets.length) {
+            html += `<div class="scene-card"><div class="scene-title">Video scene assets used (${videoSceneAssets.length})</div>`;
+            videoSceneAssets.forEach((va) => {
+                const end = (va.start_s + va.duration_s);
+                const endStr = (typeof end === 'number' && !isNaN(end)) ? end.toFixed(3) : String(end);
+                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(va.scene_id != null ? va.scene_id : '?')}: ${escapeHtml(va.start_s)}–${escapeHtml(endStr)}s</span><code>${escapeHtml(va.video_path)}</code></div>`;
             });
             html += `</div>`;
         }
