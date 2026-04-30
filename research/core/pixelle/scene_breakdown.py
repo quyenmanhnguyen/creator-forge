@@ -535,7 +535,12 @@ def _default_chat_fn() -> Callable[[str, str], str]:
         from core.llm import chat as default_chat  # type: ignore[no-redef]
 
     def chat_fn(user: str, system: str) -> str:
-        return default_chat(user, system=system, temperature=0.5)
+        # Match the legacy ``generate_scene_breakdown`` default (0.6).
+        # Callers that want a different temperature (e.g. the DNA
+        # extractor wants something more deterministic) pass their own
+        # ``chat_fn``; the route layer already does this via
+        # ``producer._make_chat_fn``.
+        return default_chat(user, system=system, temperature=0.6)
 
     return chat_fn
 
