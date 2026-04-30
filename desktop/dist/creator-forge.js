@@ -850,10 +850,12 @@
 
         const { prompts, indexMap, skipped: planSkipped } = helpers.planPromptsFromScenes(scenes);
         if (!prompts.length) {
+            const skipDetail = planSkipped
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
+                .join('; ');
             showError('swc-result', {
                 status: 422,
-                message: 'No usable scenes — every scene is missing image_prompt or duration_s.',
-                body: { skipped: planSkipped },
+                message: `No usable scenes — every scene is missing image_prompt or duration_s. ${skipDetail ? '(' + skipDetail + ')' : ''}`,
             });
             return;
         }
@@ -887,9 +889,16 @@
         );
 
         if (!sceneAssets.length) {
+            // Inline the per-scene skip reasons so the user sees "all blur" /
+            // "no files" instead of the misleading generic "sidecar down"
+            // friendly message that showError() falls back to. Avoid stuffing
+            // the full imageGenerate response into err.body — it can be huge
+            // and showError stringifies it on top of the message.
+            const skipDetail = (pickSkipped || [])
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
+                .join('; ');
             showError('swc-result', {
-                message: 'No scenes had a usable Grok image (every result < 50 KB or empty). Composer would just be gradient — aborting so you can retry image generation.',
-                body: { skipped: pickSkipped, imageGenerate },
+                message: `No scenes had a usable Grok image (every result < 50 KB or empty). Composer would just be gradient — aborting so you can retry image generation. ${skipDetail ? '(' + skipDetail + ')' : ''}`,
             });
             return;
         }
