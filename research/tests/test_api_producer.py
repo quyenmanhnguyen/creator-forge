@@ -1240,3 +1240,258 @@ def test_short_ffprobe_missing_surfaces_single_warning(monkeypatch, tmp_path):
     ffprobe_warnings = [w for w in body["warnings"] if "ffprobe is not on PATH" in w]
     assert len(ffprobe_warnings) == 1, f"expected one ffprobe-missing warning, got {ffprobe_warnings}"
     assert body["videos_used"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-23 — TTS provider routing tests.
+# ---------------------------------------------------------------------------
+
+
+def test_short_routes_through_make_tts_adapter_when_factory_is_default(
+    monkeypatch, tmp_path
+):
+    """When ``_tts_adapter_factory`` is the un-monkeypatched default
+    (``EdgeTTSAdapter``), :func:`_resolve_tts_adapter` must delegate to
+    :func:`make_tts_adapter` so that ``tts_provider`` from the request
+    actually picks the engine.
+    """
+    from research.core.pixelle.tts import EdgeTTSAdapter as RealEdgeTTSAdapter
+
+    captured: dict[str, Any] = {}
+
+    class FakePiper:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["engine_called"] = self.name
+            captured["voice"] = voice
+            output_path = Path(output_path).with_suffix(".wav")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 32)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=2.5,
+                voice=voice,
+                engine=self.name,
+            )
+
+    def fake_make_tts_adapter(provider):
+        captured["provider_arg"] = provider
+        if provider == "piper-tts":
+            return FakePiper()
+        return RealEdgeTTSAdapter()
+
+    monkeypatch.setattr(producer_route, "_tts_factory_func", fake_make_tts_adapter)
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **k: Path(k.get("output_path") or a[1]).write_bytes(b"\x00" * 32) or Path(k.get("output_path") or a[1]),
+    )
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "voice": "vi_VN-vais1000-medium",
+            "output_dir": str(tmp_path / "out_piper"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["provider_arg"] == "piper-tts"
+    assert captured["engine_called"] == "piper-tts"
+    assert body["engine"] == "piper-tts"
+    # PR-23: when piper writes a .wav file, the response must reflect it.
+    assert body["audio_path"].endswith(".wav")
+
+
+def test_short_unknown_tts_provider_falls_back_to_default(monkeypatch, tmp_path):
+    captured: dict[str, Any] = {}
+
+    class FakeEdge:
+        name = "edge-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["engine"] = self.name
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 8)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=1.5,
+                voice=voice,
+                engine=self.name,
+            )
+
+    monkeypatch.setattr(
+        producer_route, "_tts_factory_func", lambda provider: FakeEdge()
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **k: Path(k.get("output_path") or a[1]).write_bytes(b"\x00" * 16) or Path(k.get("output_path") or a[1]),
+    )
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "kokoro",  # not in KNOWN_TTS_PROVIDERS
+            "output_dir": str(tmp_path / "out_unknown"),
+        },
+    )
+    # Route must NOT 422 on unknown provider — UI may be stale.
+    assert r.status_code == 200, r.text
+    assert captured["engine"] == "edge-tts"
+
+
+def test_providers_endpoint_lists_tts_providers():
+    r = client.get("/producer/providers")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "tts_providers" in body
+    names = [p["name"] for p in body["tts_providers"]]
+    assert "edge-tts" in names
+    assert "piper-tts" in names
+    assert body["tts_default"] == "edge-tts"
+    # Each entry has the renderer-friendly shape.
+    for p in body["tts_providers"]:
+        assert "name" in p and "label" in p and "is_configured" in p
+
+
+def test_short_keeps_explicit_factory_monkeypatch_for_back_compat(
+    monkeypatch, tmp_path
+):
+    """PR-20E tests still monkeypatch ``_tts_adapter_factory`` directly.
+    That contract MUST keep working — _resolve_tts_adapter only routes
+    through the registry when the factory is the un-patched default.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeTagged:
+        name = "fake-back-compat"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["called"] = True
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 8)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=1.0,
+                voice=voice,
+                engine=self.name,
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeTagged)
+    # Even though tts_provider says piper-tts, the explicit factory wins.
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **k: Path(k.get("output_path") or a[1]).write_bytes(b"\x00" * 16) or Path(k.get("output_path") or a[1]),
+    )
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "output_dir": str(tmp_path / "out_back_compat"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["called"] is True
+    assert body["engine"] == "fake-back-compat"
+
+
+def test_short_piper_request_skips_edge_tts_curated_voice_warning(monkeypatch, tmp_path):
+    """PR-23 — the curated voice list is Edge-TTS specific. Piper voices
+    (e.g. 'vi_VN-vais1000-medium') are NEVER in that list, so the
+    'passing through to Edge-TTS as-is' warning would fire on every
+    Piper request — misleading and noisy. Suppress it for non-edge-tts
+    providers.
+    """
+
+    class FakePiper:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            wav = Path(output_path).with_suffix(".wav")
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            wav.write_bytes(b"\x00" * 32)
+            return TTSResult(
+                audio_path=wav,
+                duration_seconds=2.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(
+        producer_route, "_tts_factory_func", lambda provider: FakePiper()
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **kw: Path(kw.get("output_path") or a[1]).write_bytes(b"\x00" * 16) or Path(kw.get("output_path") or a[1]),
+    )
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "voice": "vi_VN-vais1000-medium",
+            "output_dir": str(tmp_path / "out_piper_no_warn"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    edge_warnings = [w for w in body["warnings"] if "Edge-TTS" in w or "curated list" in w]
+    assert edge_warnings == [], f"unexpected Edge-TTS curated-voice warning on Piper request: {edge_warnings}"
+
+
+def test_short_zero_duration_warning_is_format_aware_for_wav(monkeypatch, tmp_path):
+    """PR-23 — when Piper produces a WAV and the duration probe returns
+    0, the warning must NOT mention `mutagen` (which is the MP3 probe
+    library; WAV is probed via stdlib `wave`).
+    """
+
+    class FakeWavAdapter:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            wav = Path(output_path).with_suffix(".wav")
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            wav.write_bytes(b"")  # truncated → wave probe returns 0
+            return TTSResult(
+                audio_path=wav,
+                duration_seconds=0.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeWavAdapter)
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **kw: pytest.fail("_make_short must not run when duration is 0"),
+    )
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "output_dir": str(tmp_path / "out_wav_warn"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_path"].endswith(".wav")
+    duration_warnings = [w for w in body["warnings"] if "duration probe returned 0" in w]
+    assert len(duration_warnings) == 1
+    # The misleading mutagen suggestion must NOT appear for WAV output.
+    assert "mutagen" not in duration_warnings[0]
+    assert "WAV" in duration_warnings[0] or "truncated" in duration_warnings[0]

@@ -37,7 +37,10 @@ from research.core.pixelle import (
     TEMPLATE_KEYS,
     Caption,
     ComposerOptions,
+    DEFAULT_TTS_PROVIDER,
+    KNOWN_TTS_PROVIDERS,
     EdgeTTSAdapter,
+    make_tts_adapter,
     LongFormScene,
     SceneAsset,
     VideoSceneAsset,
@@ -294,7 +297,26 @@ class VideoSceneAssetSpec(BaseModel):
 
 class ShortRequest(BaseModel):
     script: str = Field(..., min_length=1, description="Full narration script (single voice).")
-    voice: str = Field(_DEFAULT_VOICE, description="Edge-TTS voice short name (e.g. 'en-US-AriaNeural').")
+    tts_provider: str = Field(
+        DEFAULT_TTS_PROVIDER,
+        description=(
+            "TTS engine id. One of "
+            f"{list(KNOWN_TTS_PROVIDERS)}. "
+            "'edge-tts' (default) uses Microsoft's online voices, free and "
+            "requires internet. 'piper-tts' is a local, offline neural TTS "
+            "(install `piper-tts` and place an .onnx voice under "
+            "~/.creator-forge/piper-voices/<voice>.onnx). Unknown values "
+            "fall back to edge-tts."
+        ),
+    )
+    voice: str = Field(
+        _DEFAULT_VOICE,
+        description=(
+            "Voice id. For edge-tts: short name like 'en-US-AriaNeural'. "
+            "For piper-tts: an onnx model short name (e.g. "
+            "'vi_VN-vais1000-medium') or absolute path to an .onnx file."
+        ),
+    )
     style: str = Field(_DEFAULT_STYLE, description=f"Background gradient style. One of {sorted(STYLES)}.")
     output_dir: str | None = Field(None, description="Where to write voice.mp3 / captions.srt / short.mp4. Defaults to ~/.creator-forge/output/short-<ts>/.")
     visual_provider: str = Field(DEFAULT_PROVIDER_NAME, description="Visual provider id (image source). Today only 'placeholder' is wired into the composer; other providers are reported via /producer/providers.")
@@ -352,8 +374,30 @@ class ShortResponse(BaseModel):
 
 
 # Indirection for tests: monkeypatch these names on the module to swap in
-# fakes without touching ``research.core.pixelle``.
+# fakes without touching ``research.core.pixelle``. ``_tts_adapter_factory``
+# is preserved for back-compat with PR-20E tests; new code routes through
+# :func:`_resolve_tts_adapter` below, which honours the request's
+# ``tts_provider`` field while still allowing tests to monkeypatch
+# ``_tts_adapter_factory`` to short-circuit the registry.
 _tts_adapter_factory = EdgeTTSAdapter
+_tts_factory_func = make_tts_adapter
+
+
+def _resolve_tts_adapter(provider: str | None):
+    """Pick a TTS adapter for this request.
+
+    Tests can still monkeypatch ``_tts_adapter_factory`` and get the same
+    behaviour as before (factory is invoked with no args). When a request
+    asks for a non-default provider (and the factory hasn't been
+    monkeypatched), we route through :func:`make_tts_adapter` so the
+    Producer page can swap engines without code changes.
+    """
+    factory = _tts_adapter_factory
+    if factory is EdgeTTSAdapter:
+        return _tts_factory_func(provider)
+    return factory()
+
+
 _make_short = make_short
 _validate_video_output = validate_video_output
 
@@ -386,9 +430,13 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     else:
         style = req.style
 
-    if req.voice not in voice_short_names():
-        # Edge-TTS supports many voices outside our curated picker — pass
-        # the value through but flag it so the UI can show a hint.
+    # PR-23: only check the curated Edge-TTS voice list when the request
+    # actually targets edge-tts. The curated list is Edge-TTS specific
+    # (`voice_short_names()` returns Microsoft voices) so blindly applying
+    # it to Piper would emit a misleading "passing through to Edge-TTS"
+    # warning on every Piper call.
+    _provider_key = (req.tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
+    if _provider_key == "edge-tts" and req.voice not in voice_short_names():
         warnings.append(
             f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
         )
@@ -514,11 +562,17 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     engine_name = EdgeTTSAdapter.name
 
     try:
-        adapter = _tts_adapter_factory()
+        adapter = _resolve_tts_adapter(req.tts_provider)
         engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
         tts_result = adapter.synthesize_with_timing(
             script, output_path=audio_path, voice=req.voice
         )
+        # PR-23: Piper writes ``.wav`` next to the requested ``.mp3``
+        # path. Honour the actual ``audio_path`` reported by the
+        # adapter so downstream stages (compose, response payload) see
+        # the file that was actually written.
+        if isinstance(getattr(tts_result, "audio_path", None), Path):
+            audio_path = tts_result.audio_path
         audio_ok = audio_path.exists()
         duration_s = float(tts_result.duration_seconds or 0.0)
 
@@ -596,10 +650,22 @@ def compose_short(req: ShortRequest) -> ShortResponse:
             logger.warning(msg)
             warnings.append(msg)
     elif audio_ok and duration_s <= 0:
-        warnings.append(
-            "Audio rendered but duration probe returned 0 — install 'mutagen' for "
-            "MP3 duration probing or pass a non-zero duration upstream."
-        )
+        # PR-23: format-aware troubleshooting hint. Piper writes WAV
+        # (probed via stdlib `wave`, no extra dep) so suggesting
+        # `mutagen` would be misleading.
+        suffix = audio_path.suffix.lower()
+        if suffix == ".wav":
+            warnings.append(
+                "Audio rendered but duration probe returned 0 — the WAV file "
+                "may be truncated or corrupt; check the TTS log and confirm "
+                "the writer flushed the file."
+            )
+        else:
+            warnings.append(
+                "Audio rendered but duration probe returned 0 — install "
+                "'mutagen' for MP3 duration probing or pass a non-zero "
+                "duration upstream."
+            )
 
     return ShortResponse(
         mp4_path=str(mp4_path) if composed_ok else "",
@@ -688,6 +754,47 @@ def providers() -> dict:
     return {
         "providers": out,
         "default": DEFAULT_PROVIDER_NAME,
+        "tts_providers": _list_tts_providers(),
+        "tts_default": DEFAULT_TTS_PROVIDER,
         "warnings": warnings,
         "notes": "Provider config status comes from research.core.pixelle.visual_providers.",
     }
+
+
+def _list_tts_providers() -> list[dict]:
+    """Probe each known TTS engine for installation status.
+
+    Returns shape compatible with the renderer: ``[{name, label,
+    is_configured, missing_reason}, ...]``. Probing is read-only and
+    must NOT raise — failures are surfaced in ``missing_reason``.
+    """
+    import importlib.util
+    import shutil
+
+    out: list[dict] = []
+    # edge-tts: requires the ``edge_tts`` PyPI package + internet at
+    # call-time. We only check the import here; the actual TTS call
+    # surfaces network errors as warnings on /producer/short.
+    edge_ok = importlib.util.find_spec("edge_tts") is not None
+    out.append({
+        "name": "edge-tts",
+        "label": "Edge TTS (Microsoft, online, free)",
+        "is_configured": edge_ok,
+        "missing_reason": None if edge_ok else "edge_tts package not installed (`pip install edge-tts`).",
+    })
+    # piper-tts: requires the ``piper`` binary on PATH. Voice files
+    # are checked lazily per-call so absence here doesn't block the
+    # provider being selectable — the user gets a clear FileNotFound
+    # if they pick a voice they haven't downloaded.
+    piper_bin = shutil.which("piper")
+    out.append({
+        "name": "piper-tts",
+        "label": "Piper TTS (local, offline, ~25MB/voice)",
+        "is_configured": bool(piper_bin),
+        "missing_reason": (
+            None
+            if piper_bin
+            else "`piper` binary not on PATH — `pip install piper-tts` or download a release."
+        ),
+    })
+    return out

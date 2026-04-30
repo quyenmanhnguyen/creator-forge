@@ -145,6 +145,169 @@ def _probe_mp3_duration(path: Path) -> float:
         return 0.0
 
 
+def _probe_wav_duration(path: Path) -> float:
+    """Best-effort duration probe for a WAV file using stdlib only."""
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 1
+            return float(frames) / float(rate)
+    except Exception:
+        return 0.0
+
+
+class PiperTTSAdapter:
+    """Local Piper TTS adapter (https://github.com/rhasspy/piper).
+
+    Piper is a small (~25MB per voice), CPU-only neural TTS. Compared to
+    Edge-TTS it is fully offline and ships first-class Vietnamese voices,
+    at the cost of slightly more robotic output. We treat the
+    ``piper-tts`` PyPI package (and its bundled binary) as optional —
+    callers that don't have it installed get a ``RuntimeError`` with a
+    pointer to the install command, NOT an ``ImportError`` at module
+    import time. This keeps the Producer page importable on machines
+    without Piper.
+
+    Output format: WAV (Piper's native). The composer happily ingests
+    WAV + falls back to a duration of ``0.0`` if the probe fails. We do
+    NOT bundle voices — the user is expected to download ``.onnx`` +
+    ``.onnx.json`` files and pass an absolute ``voice`` path. The voice
+    short-name from the UI is mapped to a path via
+    :func:`resolve_piper_voice_path` below.
+    """
+
+    name = "piper-tts"
+
+    def __init__(
+        self,
+        *,
+        voices_dir: Path | None = None,
+        binary_path: str | None = None,
+    ) -> None:
+        self.voices_dir = Path(voices_dir) if voices_dir is not None else None
+        self.binary_path = binary_path  # explicit override; else "piper" on PATH
+
+    def synthesize(self, text: str, *, output_path: Path, voice: str) -> TTSResult:
+        if not text.strip():
+            raise ValueError("TTS text must be non-empty")
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        wav_path = output_path.with_suffix(".wav")
+        voice_path = resolve_piper_voice_path(voice, voices_dir=self.voices_dir)
+        self._run_piper(text=text, output_path=wav_path, voice_path=voice_path)
+        duration = _probe_wav_duration(wav_path)
+        return TTSResult(
+            audio_path=wav_path,
+            duration_seconds=duration,
+            voice=voice,
+            engine=self.name,
+        )
+
+    def synthesize_with_timing(
+        self, text: str, *, output_path: Path, voice: str
+    ) -> TTSResult:
+        # Piper does not surface word boundaries — fall back to the
+        # plain synthesizer; callers detect the empty word_boundaries
+        # list and use ``subtitles.fallback_captions_from_text``.
+        return self.synthesize(text=text, output_path=output_path, voice=voice)
+
+    def _run_piper(self, *, text: str, output_path: Path, voice_path: Path) -> None:
+        # Lazy import + lazy subprocess so unit tests can monkey-patch.
+        import shutil
+        import subprocess
+
+        binary = self.binary_path or shutil.which("piper")
+        if not binary:
+            raise RuntimeError(
+                "Piper binary not on PATH. Install with `pip install piper-tts` "
+                "or download a release from https://github.com/rhasspy/piper "
+                "and re-run with PATH including the `piper` executable."
+            )
+        # Piper accepts text on stdin and writes WAV to --output_file.
+        cmd = [
+            binary,
+            "--model",
+            str(voice_path),
+            "--output_file",
+            str(output_path),
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(
+                f"piper exited with code {proc.returncode}: {stderr or '<no stderr>'}"
+            )
+
+
+def resolve_piper_voice_path(
+    voice: str, *, voices_dir: Path | None = None
+) -> Path:
+    """Resolve a Piper voice short-name (or path) to an ``.onnx`` model.
+
+    Accepted forms:
+
+    - Absolute path to the ``.onnx`` model file → returned verbatim.
+    - Short name like ``vi_VN-vais1000-medium`` → looked up under
+      ``voices_dir`` (default: ``~/.creator-forge/piper-voices/``) as
+      ``<voices_dir>/<short>.onnx``.
+
+    Raises :class:`FileNotFoundError` if no matching ``.onnx`` exists —
+    we deliberately do NOT auto-download (network access in tests + the
+    Devin VM is unreliable; the desktop app downloads voices through a
+    separate, user-driven flow).
+    """
+    p = Path(voice).expanduser()
+    if p.is_absolute() and p.suffix == ".onnx" and p.exists():
+        return p
+    base = (
+        Path(voices_dir).expanduser()
+        if voices_dir is not None
+        else Path.home() / ".creator-forge" / "piper-voices"
+    )
+    candidate = base / f"{voice}.onnx"
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(
+        f"Piper voice '{voice}' not found at {candidate}. "
+        "Download from https://huggingface.co/rhasspy/piper-voices and "
+        f"place {voice}.onnx (and matching .onnx.json) under {base}/."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider registry / factory
+# ---------------------------------------------------------------------------
+
+
+KNOWN_TTS_PROVIDERS: tuple[str, ...] = ("edge-tts", "piper-tts")
+DEFAULT_TTS_PROVIDER: str = "edge-tts"
+
+
+def make_tts_adapter(provider: str | None) -> TTSAdapter:
+    """Instantiate the requested TTS adapter, falling back to edge-tts.
+
+    Unknown / empty providers map to :data:`DEFAULT_TTS_PROVIDER`. The
+    Producer route uses this factory so an HTTP request body can carry
+    a ``tts_provider`` string and the rest of the pipeline doesn't have
+    to care which engine ran.
+    """
+    key = (provider or "").strip().lower() or DEFAULT_TTS_PROVIDER
+    if key == "edge-tts":
+        return EdgeTTSAdapter()
+    if key == "piper-tts":
+        return PiperTTSAdapter()
+    # Unknown provider id — fall back to default rather than 4xx; UI
+    # validation should catch this earlier and show a friendlier error.
+    return EdgeTTSAdapter()
+
+
 def synthesize(text: str, *, output_path: Path, config: TTSConfig | None = None) -> TTSResult:
     """High-level convenience: read engine + voice from :class:`TTSConfig`."""
     cfg = config or TTSConfig()

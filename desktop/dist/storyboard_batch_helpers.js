@@ -27,26 +27,40 @@
      * @param {Array<Object>} scenes - scene_breakdown items.
      * @returns {Array<Object>} image-batch rows.
      */
-    function initImageRowsFromScenes(scenes) {
+    function initImageRowsFromScenes(scenes, opts) {
         if (!Array.isArray(scenes)) return [];
-        return scenes.map((s, i) => {
+        // PR-23: optional `imagesPerScene` expands every scene into N
+        // independent variant rows. Each row carries a unique `row_id`
+        // (`scene_id#variant_idx`) so progress / result events can target
+        // a single variant without bleeding across siblings; `scene_id`
+        // is kept for I2V pairing. Default 1 = legacy behaviour.
+        const variants = Math.max(1, Math.floor(Number((opts && opts.imagesPerScene) || 1)) || 1);
+        const out = [];
+        let order = 1;
+        scenes.forEach((s) => {
             const prompt = (s && typeof s.image_prompt === "string") ? s.image_prompt.trim() : "";
             const skipped = !prompt;
-            return {
-                order: i + 1,
-                scene_id: s ? s.scene_id : null,
-                title: (s && s.title) || "",
-                duration_s: (s && typeof s.duration_s === "number") ? s.duration_s : 0,
-                prompt,
-                status: skipped ? "skipped" : "pending",
-                progress: 0,
-                attempts: 0,
-                image_path: null,
-                bytes: 0,
-                reason: skipped ? "missing image_prompt" : null,
-                url: null,
-            };
+            const sceneId = s ? s.scene_id : null;
+            for (let v = 0; v < variants; v += 1) {
+                out.push({
+                    order: order++,
+                    scene_id: sceneId,
+                    variant_idx: v,
+                    row_id: `${sceneId == null ? "scene" : sceneId}#${v}`,
+                    title: (s && s.title) || "",
+                    duration_s: (s && typeof s.duration_s === "number") ? s.duration_s : 0,
+                    prompt,
+                    status: skipped ? "skipped" : "pending",
+                    progress: 0,
+                    attempts: 0,
+                    image_path: null,
+                    bytes: 0,
+                    reason: skipped ? "missing image_prompt" : null,
+                    url: null,
+                });
+            }
         });
+        return out;
     }
 
     /**
@@ -64,29 +78,38 @@
      * @param {Array<Object>} scenes
      * @returns {Array<Object>} video-batch rows.
      */
-    function initVideoRowsFromScenes(scenes) {
+    function initVideoRowsFromScenes(scenes, opts) {
         if (!Array.isArray(scenes)) return [];
-        return scenes.map((s, i) => {
+        const variants = Math.max(1, Math.floor(Number((opts && opts.videosPerScene) || 1)) || 1);
+        const out = [];
+        let order = 1;
+        scenes.forEach((s) => {
             const vp = (s && typeof s.video_prompt === "string") ? s.video_prompt.trim() : "";
             const fvp = (s && typeof s.flow_video_prompt === "string") ? s.flow_video_prompt.trim() : "";
             const prompt = vp || fvp;
             const skipped = !prompt;
-            return {
-                order: i + 1,
-                scene_id: s ? s.scene_id : null,
-                title: (s && s.title) || "",
-                duration_s: (s && typeof s.duration_s === "number") ? s.duration_s : 0,
-                prompt,
-                status: skipped ? "skipped" : "pending",
-                progress: 0,
-                attempts: 0,
-                image_path: null, // populated from the image table for I2V mode
-                video_path: null,
-                bytes: 0,
-                reason: skipped ? "missing video_prompt / flow_video_prompt" : null,
-                url: null,
-            };
+            const sceneId = s ? s.scene_id : null;
+            for (let v = 0; v < variants; v += 1) {
+                out.push({
+                    order: order++,
+                    scene_id: sceneId,
+                    variant_idx: v,
+                    row_id: `${sceneId == null ? "scene" : sceneId}#${v}`,
+                    title: (s && s.title) || "",
+                    duration_s: (s && typeof s.duration_s === "number") ? s.duration_s : 0,
+                    prompt,
+                    status: skipped ? "skipped" : "pending",
+                    progress: 0,
+                    attempts: 0,
+                    image_path: null, // populated from the image table for I2V mode
+                    video_path: null,
+                    bytes: 0,
+                    reason: skipped ? "missing video_prompt / flow_video_prompt" : null,
+                    url: null,
+                });
+            }
         });
+        return out;
     }
 
     /**
@@ -107,10 +130,20 @@
      * (generated/retried/fallback/skipped) ignore progress entirely
      * so a stray late event can't bump a terminal row's bar.
      */
-    function applyBatchProgress(rows, sceneId, payload) {
-        const sid = String(sceneId);
+    function applyBatchProgress(rows, key, payload) {
+        // PR-23: prefer matching by `row_id` so progress events for
+        // variant N do not bleed into variant N±1 of the same scene.
+        // Falls back to `scene_id` so legacy callers / tests keep
+        // working when the table was built with one row per scene
+        // (and so "broadcast a scene-level event to all its variants"
+        // — used by the renderer's row_id-first dispatch — still works
+        // when callers pass just the scene id).
+        const target = String(key);
+        const anyRowIdMatch = rows.some((row) => row.row_id != null && String(row.row_id) === target);
         return rows.map((row) => {
-            if (String(row.scene_id) !== sid) return row;
+            const matchById = row.row_id != null && String(row.row_id) === target;
+            const matchByScene = !anyRowIdMatch && String(row.scene_id) === target;
+            if (!matchById && !matchByScene) return row;
             if (row.status === "generated" || row.status === "retried"
                 || row.status === "fallback" || row.status === "skipped") return row;
             const p = (payload && typeof payload.progress === "number") ? payload.progress : null;
@@ -126,10 +159,18 @@
      * row's `bytes` is honored if non-zero so the renderer can show
      * file size next to the thumbnail.
      */
-    function applyBatchResult(rows, sceneId, result) {
-        const sid = String(sceneId);
+    function applyBatchResult(rows, key, result) {
+        // PR-23: same row_id-vs-scene_id matching contract as
+        // applyBatchProgress — when the table has variant rows, hit
+        // exactly the row that was settled. Falls back to scene_id
+        // when no row matches by row_id (legacy / scene-level
+        // broadcasts).
+        const target = String(key);
+        const anyRowIdMatch = rows.some((row) => row.row_id != null && String(row.row_id) === target);
         return rows.map((row) => {
-            if (String(row.scene_id) !== sid) return row;
+            const matchById = row.row_id != null && String(row.row_id) === target;
+            const matchByScene = !anyRowIdMatch && String(row.scene_id) === target;
+            if (!matchById && !matchByScene) return row;
             const status = (result && result.status) || "fallback";
             return Object.assign({}, row, {
                 status,
@@ -157,14 +198,24 @@
      *                          where possible.
      */
     function pairImagePathsForI2V(videoRows, imageRows) {
-        const byId = new Map();
+        // PR-23: with multiple image variants per scene, prefer the
+        // image with the lowest variant_idx that has settled. Falls
+        // back to the first settled image we encounter when no
+        // variant_idx is set (legacy 1-row-per-scene tables).
+        const bestByScene = new Map();
         for (const ir of imageRows) {
-            if (ir.image_path && (ir.status === "generated" || ir.status === "retried")) {
-                byId.set(String(ir.scene_id), ir.image_path);
+            if (!ir.image_path) continue;
+            if (ir.status !== "generated" && ir.status !== "retried") continue;
+            const key = String(ir.scene_id);
+            const cur = bestByScene.get(key);
+            const v = (typeof ir.variant_idx === "number") ? ir.variant_idx : 0;
+            if (!cur || v < cur.v) {
+                bestByScene.set(key, { v, image_path: ir.image_path });
             }
         }
         return videoRows.map((row) => {
-            const ip = byId.get(String(row.scene_id)) || null;
+            const entry = bestByScene.get(String(row.scene_id));
+            const ip = entry ? entry.image_path : null;
             if (ip === row.image_path) return row;
             return Object.assign({}, row, { image_path: ip });
         });
@@ -180,6 +231,10 @@
         return {
             prompts: eligible.map((r) => r.prompt),
             sceneIds: eligible.map((r) => r.scene_id),
+            // PR-23: row_ids[] runs in lock-step with prompts[] so the
+            // renderer can map a `globalIdx` from a progress event back
+            // to the exact variant row, not just the scene.
+            rowIds: eligible.map((r) => (r.row_id != null ? r.row_id : r.scene_id)),
         };
     }
 
@@ -193,13 +248,18 @@
      * @param {"i2v"|"t2v"} mode
      */
     function planVideoGenerate(rows, mode) {
-        const out = { mode, items: null, prompts: null, sceneIds: [], skipped: [] };
+        const out = { mode, items: null, prompts: null, sceneIds: [], rowIds: [], skipped: [] };
         if (mode === "t2v") {
             const eligible = rows.filter((r) => r.status !== "skipped" && r.prompt);
             const skipped = rows.filter((r) => r.status === "skipped" || !r.prompt);
             out.prompts = eligible.map((r) => r.prompt);
             out.sceneIds = eligible.map((r) => r.scene_id);
-            out.skipped = skipped.map((r) => ({ scene_id: r.scene_id, reason: r.reason || "missing prompt" }));
+            out.rowIds = eligible.map((r) => (r.row_id != null ? r.row_id : r.scene_id));
+            out.skipped = skipped.map((r) => ({
+                scene_id: r.scene_id,
+                row_id: r.row_id != null ? r.row_id : r.scene_id,
+                reason: r.reason || "missing prompt",
+            }));
             return out;
         }
         // I2V: need both image_path and prompt.
@@ -207,17 +267,26 @@
         const skipped = [];
         for (const r of rows) {
             if (r.status === "skipped" || !r.prompt) {
-                skipped.push({ scene_id: r.scene_id, reason: r.reason || "missing prompt" });
+                skipped.push({
+                    scene_id: r.scene_id,
+                    row_id: r.row_id != null ? r.row_id : r.scene_id,
+                    reason: r.reason || "missing prompt",
+                });
                 continue;
             }
             if (!r.image_path) {
-                skipped.push({ scene_id: r.scene_id, reason: "no image — generate or pick image first" });
+                skipped.push({
+                    scene_id: r.scene_id,
+                    row_id: r.row_id != null ? r.row_id : r.scene_id,
+                    reason: "no image — generate or pick image first",
+                });
                 continue;
             }
             eligible.push(r);
         }
         out.items = eligible.map((r) => ({ imagePath: r.image_path, prompt: r.prompt }));
         out.sceneIds = eligible.map((r) => r.scene_id);
+        out.rowIds = eligible.map((r) => (r.row_id != null ? r.row_id : r.scene_id));
         out.skipped = skipped;
         return out;
     }
@@ -243,19 +312,28 @@
      * @param {Array} sceneIds - scene_id ordering used in the request
      * @param {"image"|"video"} kind
      */
-    function mapBatchResponse(resp, sceneIds, kind) {
+    function mapBatchResponse(resp, sceneIds, kind, rowIds) {
         const out = [];
+        const ids = Array.isArray(sceneIds) ? sceneIds : [];
+        const rids = Array.isArray(rowIds) ? rowIds : null;
+        const rowIdAt = (i) => (rids && rids[i] != null ? rids[i] : ids[i]);
         if (!resp || !Array.isArray(resp.results)) {
-            for (const sid of sceneIds) {
-                out.push({ scene_id: sid, status: "fallback", reason: (resp && resp.error) || "no results" });
+            for (let i = 0; i < ids.length; i += 1) {
+                out.push({
+                    scene_id: ids[i],
+                    row_id: rowIdAt(i),
+                    status: "fallback",
+                    reason: (resp && resp.error) || "no results",
+                });
             }
             return out;
         }
-        for (let i = 0; i < sceneIds.length; i++) {
-            const sid = sceneIds[i];
+        for (let i = 0; i < ids.length; i++) {
+            const sid = ids[i];
+            const rid = rowIdAt(i);
             const r = resp.results[i];
             if (!r) {
-                out.push({ scene_id: sid, status: "fallback", reason: "no result for scene" });
+                out.push({ scene_id: sid, row_id: rid, status: "fallback", reason: "no result for scene" });
                 continue;
             }
             if (kind === "image") {
@@ -276,20 +354,21 @@
                     imagePath = r.outputPath;
                 }
                 if (imagePath) {
-                    out.push({ scene_id: sid, status: "generated", image_path: imagePath, bytes });
+                    out.push({ scene_id: sid, row_id: rid, status: "generated", image_path: imagePath, bytes });
                 } else {
-                    out.push({ scene_id: sid, status: "fallback", reason: r.error || "no usable image" });
+                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason: r.error || "no usable image" });
                 }
             } else {
                 if (r.success && (r.videoPath || r.savedFile)) {
                     out.push({
                         scene_id: sid,
+                        row_id: rid,
                         status: "generated",
                         video_path: r.videoPath || r.savedFile,
                         bytes: typeof r.bytes === "number" ? r.bytes : 0,
                     });
                 } else {
-                    out.push({ scene_id: sid, status: "fallback", reason: r.error || "video generation failed" });
+                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason: r.error || "video generation failed" });
                 }
             }
         }
@@ -321,10 +400,11 @@
     async function mapBatchResponseAsync(resp, sceneIds, kind, opts) {
         const o = opts || {};
         const validateFn = (kind === "video" && typeof o.validateFn === "function") ? o.validateFn : null;
+        const rowIds = Array.isArray(o.rowIds) ? o.rowIds : null;
         // When no validator is supplied, behavior matches the sync
         // variant — callers that don't care about ffprobe keep working.
-        if (!validateFn) return mapBatchResponse(resp, sceneIds, kind);
-        const base = mapBatchResponse(resp, sceneIds, kind);
+        if (!validateFn) return mapBatchResponse(resp, sceneIds, kind, rowIds);
+        const base = mapBatchResponse(resp, sceneIds, kind, rowIds);
         const out = [];
         for (const row of base) {
             if (row.status !== "generated" || !row.video_path) {
