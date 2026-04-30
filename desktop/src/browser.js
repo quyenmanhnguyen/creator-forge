@@ -141,7 +141,10 @@ async function setupAccount(account, accIdx) {
 
   console.log(`[${label}] 🔧 Launch: ${account.email}`);
 
-  const chromePath = findChromePath();
+  // Honor CHROME_EXECUTABLE_PATH (same fallback chain openManualLogin uses)
+  // so users on non-standard install locations don't get a half-working
+  // E2E flow where manual login succeeds but setupAccount throws.
+  const chromePath = process.env.CHROME_EXECUTABLE_PATH || findChromePath();
   if (!chromePath) {
     throw new Error(
       "Chrome/Edge not found on this machine. Please install Google Chrome or Microsoft Edge."

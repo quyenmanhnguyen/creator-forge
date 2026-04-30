@@ -184,7 +184,34 @@ assert.strictEqual(typeof browser.openManualLogin, "function", "openManualLogin 
     delete process.env.GROK_PROFILE_DIR;
     console.log("  ok  auth:openManualLogin default = <SESSIONS_DIR>/manual (not root)");
 
-    console.log("\n# results: 9 passed, 0 failed");
+    // ── test 9: regression — both setupAccount and openManualLogin honor
+    //           CHROME_EXECUTABLE_PATH. The E2E harness (and docs) advertise
+    //           that env as the way to override Chrome auto-detect; if only
+    //           one of the two functions checks it, manual login succeeds
+    //           but the subsequent setupAccount call throws "Chrome/Edge
+    //           not found" on systems with non-standard install paths.
+    const fs = require("fs");
+    const browserSrc = fs.readFileSync(
+        path.join(__dirname, "..", "src", "browser.js"),
+        "utf8"
+    );
+    const setupIdx = browserSrc.indexOf("async function setupAccount(");
+    const manualIdx = browserSrc.indexOf("async function openManualLogin(");
+    assert.ok(setupIdx >= 0, "setupAccount declaration found in browser.js");
+    assert.ok(manualIdx >= 0, "openManualLogin declaration found in browser.js");
+    const setupSlice = browserSrc.slice(setupIdx, setupIdx + 1500);
+    const manualSlice = browserSrc.slice(manualIdx, manualIdx + 1500);
+    assert.ok(
+        /process\.env\.CHROME_EXECUTABLE_PATH/.test(setupSlice),
+        "setupAccount must honor process.env.CHROME_EXECUTABLE_PATH"
+    );
+    assert.ok(
+        /process\.env\.CHROME_EXECUTABLE_PATH/.test(manualSlice),
+        "openManualLogin must honor process.env.CHROME_EXECUTABLE_PATH"
+    );
+    console.log("  ok  setupAccount + openManualLogin both honor CHROME_EXECUTABLE_PATH");
+
+    console.log("\n# results: 10 passed, 0 failed");
 })().catch((err) => {
     console.error("FAIL:", err && err.stack ? err.stack : err);
     process.exit(1);
