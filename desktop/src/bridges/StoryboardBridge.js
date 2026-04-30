@@ -15,10 +15,14 @@
  * the script/scenes in and gets back asset paths.
  */
 
+// Reuse the renderer-side helpers in Node — same retry / picking logic as
+// the UI panel, single source of truth (PR-17).
+const composeHelpers = require('../../dist/storyboard_compose_helpers.js');
+
 // Minimum useful image size (matches PR-9 MIN_BLOB_LEN in ImageService —
 // anything smaller is almost certainly a blur preview / moderation
 // placeholder and would render as noise in the composed mp4).
-const MIN_USABLE_IMAGE_BYTES = 50000;
+const MIN_USABLE_IMAGE_BYTES = composeHelpers.MIN_USABLE_IMAGE_BYTES;
 
 class StoryboardBridge {
     constructor(electronAPI = (typeof window !== 'undefined' ? window.electronAPI : null)) {
@@ -170,6 +174,13 @@ class StoryboardBridge {
             account,
             aspectRatio,
             enablePro,
+            // PR-17 — scene-level retries + partial compose.
+            // `max_attempts` is the TOTAL attempts per scene (1 = no retry).
+            // `allow_partial` (default true) lets the composer gradient-fill
+            // any scene that never produced a usable image; setting it false
+            // makes the bridge throw an "incomplete batch" error instead.
+            max_attempts = 2,
+            allow_partial = true,
         } = params;
 
         if (!this.producer || typeof this.producer.composeShort !== 'function') {
@@ -179,127 +190,97 @@ class StoryboardBridge {
             throw new Error('StoryboardBridge.composeWithScenes: script is required.');
         }
 
-        const stat = hooks.stat || ((p) => {
-            // Default: Node fs.statSync. Wrapped in try/catch so a missing
-            // file becomes "0 bytes" rather than throwing — matches the
-            // sidecar's "missing file → warning + skip" contract.
-            try {
-                // require('fs') lazily to keep the file usable in browser-only
-                // environments (renderer process running tests, etc.).
-                const fs = require('fs');
-                return fs.statSync(p);
-            } catch (_) {
-                return null;
-            }
-        });
-
-        const warnings = [];
-        const skipped = [];
-
-        // ── Step 1+2: build prompts, drive image:generate ───────────────
-        const promptsForScenes = [];
-        const indexMap = []; // promptsForScenes[i] → scenes[indexMap[i]]
-        for (let i = 0; i < scenes.length; i++) {
-            const s = scenes[i] || {};
-            const prompt = typeof s.image_prompt === 'string' ? s.image_prompt.trim() : '';
-            const duration = Number(s.duration_s);
-            if (!prompt || !(duration > 0)) {
-                skipped.push({ scene_id: s.scene_id, reason: !prompt ? 'missing image_prompt' : 'invalid duration_s' });
-                continue;
-            }
-            promptsForScenes.push(prompt);
-            indexMap.push(i);
+        // statBytesAsync(path) → { exists, size }. Tests can override via
+        // hooks.statBytes (new contract) or hooks.stat (pre-PR-17 sync
+        // contract returning `{size}`). Default uses Node fs.statSync.
+        let statBytesAsync;
+        if (typeof hooks.statBytes === 'function') {
+            statBytesAsync = hooks.statBytes;
+        } else if (typeof hooks.stat === 'function') {
+            statBytesAsync = async (p) => {
+                const st = hooks.stat(p);
+                return { exists: !!st, size: st && typeof st.size === 'number' ? st.size : 0 };
+            };
+        } else {
+            statBytesAsync = async (p) => {
+                try {
+                    const fs = require('fs');
+                    const st = fs.statSync(p);
+                    return { exists: true, size: Number(st.size) || 0 };
+                } catch (_) {
+                    return { exists: false, size: 0 };
+                }
+            };
         }
 
-        let imageGenerate = { success: true, results: [] };
-        if (promptsForScenes.length > 0) {
+        // Drive image:generate (with scene-level retries) via the shared
+        // helper module. Single source of truth with the renderer panel.
+        const imageGenerateFn = async (prompts, _ctx) => {
             const config = { imageGenerationCount: 1 };
             if (aspectRatio) config.aspectRatio = aspectRatio;
             if (typeof enablePro === 'boolean') config.enablePro = enablePro;
-            imageGenerate = await this.image.generate({ prompts: promptsForScenes, config, account });
-            if (!imageGenerate || imageGenerate.success === false) {
-                warnings.push(
-                    `image:generate IPC failed${imageGenerate && imageGenerate.error ? ': ' + imageGenerate.error : ''}; composing with gradient fallback only.`
-                );
-            }
-        } else {
-            warnings.push('No scenes had usable image_prompt + duration_s; composing with gradient fallback only.');
+            return this.image.generate({ prompts, config, account });
+        };
+
+        const orchestration = await composeHelpers.orchestrateImageGenerationWithRetries(
+            scenes,
+            imageGenerateFn,
+            statBytesAsync,
+            { maxAttempts: max_attempts, minBytes: MIN_USABLE_IMAGE_BYTES },
+        );
+
+        const { sceneAssets, perSceneStatus, retryCount, imageGenerate, maxAttempts: effectiveMaxAttempts } = orchestration;
+
+        // Derive legacy-shape `skippedScenes[]` (preserves the contract that
+        // pre-PR-17 callers / tests rely on: skipped includes both
+        // `skipped` (no prompt / bad duration) and `fallback` (image gen
+        // never produced ≥50KB after retries) entries).
+        const skippedScenes = perSceneStatus
+            .filter((s) => s.status === 'skipped' || s.status === 'fallback')
+            .map((s) => ({
+                scene_id: s.scene_id,
+                reason: s.reason || (s.status === 'fallback' ? 'image:generate did not return a ≥50KB file after retries' : 'unknown'),
+            }));
+
+        const warnings = [];
+        if (imageGenerate && imageGenerate.success === false) {
+            warnings.push(
+                `image:generate IPC failed on first attempt${imageGenerate.error ? ': ' + imageGenerate.error : ''}; orchestrator continued with retries.`
+            );
+        }
+        const fallbackCount = composeHelpers.countFallbackScenes(perSceneStatus);
+        if (fallbackCount > 0) {
+            warnings.push(
+                `${fallbackCount} scene(s) fell back to gradient after ${effectiveMaxAttempts} attempt(s); composer will fill those windows with the configured style.`
+            );
+        }
+        if (retryCount > 0) {
+            warnings.push(`Issued ${retryCount} retry attempt(s) across scenes that didn't produce a ≥${MIN_USABLE_IMAGE_BYTES}-byte image on the first pass.`);
+        }
+        if (sceneAssets.length === 0 && perSceneStatus.some((s) => s.status === 'fallback')) {
+            warnings.push('No scene produced a usable Grok image; entire mp4 will be gradient + narration.');
         }
 
-        // ── Step 3: pick first ≥50KB savedFile per scene ────────────────
-        // image:generate returns a flat results[] preserving input order
-        // (one block of size N per prompt with localIdx). We rely on the
-        // PR-9 contract: each prompt's results land contiguously and
-        // savedFiles[] is the list of files saved for that prompt.
-        const resultsByPrompt = new Map(); // promptIdx (in promptsForScenes) → savedFiles[]
-        const allResults = (imageGenerate && Array.isArray(imageGenerate.results)) ? imageGenerate.results : [];
-        for (const r of allResults) {
-            // localIdx is set by main.js's IPC handler relative to the per-account
-            // slice; globalIdx is the absolute index in the original prompts[].
-            const idx = (typeof r.globalIdx === 'number')
-                ? r.globalIdx
-                : (typeof r.localIdx === 'number' ? r.localIdx : null);
-            if (idx == null || idx < 0 || idx >= promptsForScenes.length) continue;
-            if (!resultsByPrompt.has(idx)) resultsByPrompt.set(idx, []);
-            const list = Array.isArray(r.savedFiles) ? r.savedFiles : [];
-            for (const f of list) resultsByPrompt.get(idx).push(f);
+        // Strict mode: any scene in `fallback` blocks the compose call.
+        if (!allow_partial && fallbackCount > 0) {
+            const err = new Error(
+                `StoryboardBridge.composeWithScenes: ${fallbackCount} scene(s) missing usable images after ${effectiveMaxAttempts} attempt(s) and allow_partial=false.`
+            );
+            err.code = 'INCOMPLETE_BATCH';
+            err.perSceneStatus = perSceneStatus;
+            err.sceneAssets = sceneAssets;
+            err.retryCount = retryCount;
+            err.imageGenerate = imageGenerate;
+            err.warnings = warnings;
+            throw err;
         }
 
-        // ── Step 4: compute cumulative start_s + build scene_assets ─────
-        const sceneAssets = [];
-        let cursor = 0.0;
-        for (let i = 0; i < scenes.length; i++) {
-            const s = scenes[i] || {};
-            const duration = Number(s.duration_s);
-            if (!(duration > 0) || typeof s.image_prompt !== 'string' || !s.image_prompt.trim()) {
-                // Already counted in `skipped` above. Cursor doesn't advance
-                // for invalid durations — but if image_prompt is missing yet
-                // duration is positive, advance the cursor so subsequent scenes
-                // line up correctly with the audio (this scene becomes a gap).
-                if (duration > 0) cursor += duration;
-                continue;
-            }
-
-            const promptIdx = indexMap.indexOf(i);
-            const candidates = (promptIdx >= 0 ? resultsByPrompt.get(promptIdx) : null) || [];
-            let chosen = null;
-            for (const filePath of candidates) {
-                const st = stat(filePath);
-                const bytes = st && typeof st.size === 'number' ? st.size : 0;
-                if (bytes >= MIN_USABLE_IMAGE_BYTES) {
-                    chosen = { filePath, bytes };
-                    break;
-                }
-            }
-
-            if (chosen) {
-                sceneAssets.push({
-                    image_path: chosen.filePath,
-                    start_s: Number(cursor.toFixed(3)),
-                    duration_s: Number(duration.toFixed(3)),
-                    scene_id: s.scene_id,
-                });
-            } else {
-                skipped.push({
-                    scene_id: s.scene_id,
-                    reason: candidates.length === 0
-                        ? 'image:generate returned no files for this scene'
-                        : `no candidate file ≥ ${MIN_USABLE_IMAGE_BYTES} bytes (likely blur/moderation placeholder)`,
-                });
-            }
-
-            cursor += duration;
-        }
-
-        // ── Step 5: compose ─────────────────────────────────────────────
+        // Compose. The composer gradient-fills any window not covered by
+        // `scene_assets[]` (so `fallback` scenes naturally render as
+        // gradient when allow_partial=true).
         const composePayload = {
             script,
-            // Strip our `scene_id` annotation before crossing the IPC
-            // boundary — the sidecar's SceneAssetSpec only knows about
-            // image_path / start_s / duration_s.
-            scene_assets: sceneAssets.map(({ image_path, start_s, duration_s }) => ({
-                image_path, start_s, duration_s,
-            })),
+            scene_assets: composeHelpers.stripSceneAssetForComposer(sceneAssets),
         };
         if (voice) composePayload.voice = voice;
         if (style) composePayload.style = style;
@@ -312,7 +293,12 @@ class StoryboardBridge {
             compose,
             imageGenerate,
             sceneAssets,
-            skippedScenes: skipped,
+            skippedScenes,
+            // PR-17 additions — older callers can ignore these safely.
+            perSceneStatus,
+            retryCount,
+            maxAttempts: effectiveMaxAttempts,
+            allowPartial: !!allow_partial,
             warnings,
         };
     }

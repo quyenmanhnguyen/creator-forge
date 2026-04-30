@@ -143,36 +143,59 @@ function buildSceneAssets(images, { duration = 4 } = {}) {
 
 /**
  * Validate a `/producer/short` ShortResponse against the supplied scene
- * count. Returns `{ ok, exitCode, problems[] }`.
+ * count. Returns `{ ok, exitCode, problems[], notices[] }`.
+ *
+ * `opts.allowPartial=true` (PR-17) downgrades `scenes_missing > 0` and
+ * non-empty `warnings[]` from PASS-blocking problems to advisory notices,
+ * and drops the strict `scenes_used == expectedSceneCount` check (only
+ * `<=` is enforced — the composer still must have rendered SOMETHING from
+ * the scene_assets we sent). `mp4_path` empty is always a failure.
  */
-function validateShortResponse(resp, expectedSceneCount) {
+function validateShortResponse(resp, expectedSceneCount, opts = {}) {
+    const allowPartial = !!opts.allowPartial;
     const problems = [];
+    const notices = [];
     let exitCode = 0;
     if (!resp || typeof resp !== "object") {
-        return { ok: false, exitCode: 4, problems: ["empty/invalid response"] };
+        return { ok: false, exitCode: 4, problems: ["empty/invalid response"], notices };
     }
-    // Order matters: more specific causes (missing files / upstream warnings)
-    // are checked before the count mismatch they would produce, so the exit
-    // code reflects the root cause, not the symptom.
+    // mp4_path is non-negotiable — even partial mode requires SOME output.
     if (!resp.mp4_path) {
         problems.push("mp4_path is empty (compose failed)");
         exitCode = exitCode || 4;
     }
     if (Number(resp.scenes_missing) > 0) {
-        problems.push(`scenes_missing=${resp.scenes_missing} (must be 0)`);
-        exitCode = exitCode || 5;
+        const msg = `scenes_missing=${resp.scenes_missing}`;
+        if (allowPartial) {
+            notices.push(msg + " (allowed by --allow-partial)");
+        } else {
+            problems.push(msg + " (must be 0; pass --allow-partial to accept partial output)");
+            exitCode = exitCode || 5;
+        }
     }
     if (Array.isArray(resp.warnings) && resp.warnings.length > 0) {
-        problems.push(`warnings: ${JSON.stringify(resp.warnings)}`);
-        exitCode = exitCode || 5;
+        const msg = `warnings: ${JSON.stringify(resp.warnings)}`;
+        if (allowPartial) {
+            notices.push(msg + " (allowed by --allow-partial)");
+        } else {
+            problems.push(msg);
+            exitCode = exitCode || 5;
+        }
     }
-    if (Number(resp.scenes_used) !== expectedSceneCount) {
+    if (allowPartial) {
+        if (Number(resp.scenes_used) > expectedSceneCount) {
+            problems.push(
+                `scenes_used=${resp.scenes_used} > expected ${expectedSceneCount} (composer used more than we sent)`
+            );
+            exitCode = exitCode || 6;
+        }
+    } else if (Number(resp.scenes_used) !== expectedSceneCount) {
         problems.push(
             `scenes_used=${resp.scenes_used} expected ${expectedSceneCount} (mismatch)`
         );
         exitCode = exitCode || 6;
     }
-    return { ok: problems.length === 0, exitCode, problems };
+    return { ok: problems.length === 0, exitCode, problems, notices };
 }
 
 /** POST a JSON body to `http://127.0.0.1:<port><path>` and return parsed JSON. */
@@ -249,6 +272,10 @@ Optional:
   --output-dir <dir>    Override sidecar output dir.
   --port <n>            Sidecar port. Default $CREATOR_FORGE_RESEARCH_PORT or 5050.
   --keep-sidecar        Don't tear down sidecar on exit (useful when iterating).
+  --allow-partial       Treat scenes_missing > 0 and non-empty warnings[] as
+                        advisory notices instead of failures (PR-17). mp4_path
+                        empty is always a failure regardless. Useful when
+                        intentionally testing the gradient-fallback path.
   -h, --help            Show this help.
 
 Exit codes: 0 ok | 2 no usable images | 3 sidecar unhealthy
@@ -385,11 +412,16 @@ async function main(argv) {
         log("  warnings        :", JSON.stringify(json.warnings || []));
         log("  output_dir      :", json.output_dir);
 
-        const verdict = validateShortResponse(json, sceneAssets.length);
+        const allowPartial = !!args["allow-partial"];
+        const verdict = validateShortResponse(json, sceneAssets.length, { allowPartial });
         log("─".repeat(72));
+        (verdict.notices || []).forEach((n) => log("    ⚠️ ", n));
         if (verdict.ok) {
-            log("✅ PASS — mp4 produced with", sceneAssets.length, "Grok-image scene_assets,",
-                "no missing scenes, no warnings.");
+            const partialNote = allowPartial && (verdict.notices || []).length
+                ? " (with " + verdict.notices.length + " advisory notice" + (verdict.notices.length === 1 ? "" : "s") + ")"
+                : "";
+            log("✅ PASS — mp4 produced with", sceneAssets.length,
+                "Grok-image scene_assets" + partialNote + ".");
         } else {
             log("❌ FAIL");
             verdict.problems.forEach((p) => log("    -", p));

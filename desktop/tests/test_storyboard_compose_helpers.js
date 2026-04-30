@@ -290,6 +290,184 @@ async function run() {
         assert.deepStrictEqual(helpers.stripSceneAssetForComposer([]), []);
     });
 
+    // ── orchestrateImageGenerationWithRetries (PR-17) ─────────────────────
+
+    function statBytesFromMap(map) {
+        return async (p) => ({ exists: p in map, size: map[p] || 0 });
+    }
+
+    test("orchestrate: happy path — every scene picks on attempt 1, no retries", async () => {
+        const calls = [];
+        const imageGenerateFn = async (prompts, ctx) => {
+            calls.push({ prompts, ctx });
+            return {
+                success: true,
+                results: prompts.map((_, i) => ({ globalIdx: i, savedFiles: [`/img/p${i}.jpg`], success: true })),
+            };
+        };
+        const stat = statBytesFromMap({ "/img/p0.jpg": 100 * 1024, "/img/p1.jpg": 100 * 1024 });
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [
+                { scene_id: 1, image_prompt: "A", duration_s: 3 },
+                { scene_id: 2, image_prompt: "B", duration_s: 4 },
+            ],
+            imageGenerateFn, stat,
+            { maxAttempts: 2 },
+        );
+
+        assert.strictEqual(calls.length, 1, "single bulk call when nothing fails");
+        assert.strictEqual(out.retryCount, 0);
+        assert.deepStrictEqual(out.sceneAssets.map((s) => s.image_path), ["/img/p0.jpg", "/img/p1.jpg"]);
+        const statuses = out.perSceneStatus.map((s) => s.status);
+        assert.deepStrictEqual(statuses, ["generated", "generated"]);
+    });
+
+    test("orchestrate: scene-level retry replaces a blur with a usable image", async () => {
+        let attempt = 0;
+        const calls = [];
+        const imageGenerateFn = async (prompts) => {
+            attempt++;
+            calls.push(prompts.slice());
+            if (attempt === 1) {
+                return { success: true, results: [
+                    { globalIdx: 0, savedFiles: ["/img/blur.jpg"],   success: true },
+                    { globalIdx: 1, savedFiles: ["/img/b_ok.jpg"],   success: true },
+                ]};
+            }
+            return { success: true, results: [
+                { globalIdx: 0, savedFiles: ["/img/a_retry.jpg"], success: true },
+            ]};
+        };
+        const stat = statBytesFromMap({
+            "/img/blur.jpg":     1024,
+            "/img/b_ok.jpg":     80 * 1024,
+            "/img/a_retry.jpg":  120 * 1024,
+        });
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [
+                { scene_id: 1, image_prompt: "A", duration_s: 2 },
+                { scene_id: 2, image_prompt: "B", duration_s: 5 },
+            ],
+            imageGenerateFn, stat,
+            { maxAttempts: 2 },
+        );
+
+        assert.strictEqual(calls.length, 2);
+        assert.deepStrictEqual(calls[0], ["A", "B"]);
+        assert.deepStrictEqual(calls[1], ["A"]);
+        assert.strictEqual(out.retryCount, 1);
+        assert.strictEqual(out.perSceneStatus[0].status, "retried");
+        assert.strictEqual(out.perSceneStatus[0].attempts, 2);
+        assert.strictEqual(out.perSceneStatus[1].status, "generated");
+        assert.deepStrictEqual(out.sceneAssets.map((s) => s.image_path), ["/img/a_retry.jpg", "/img/b_ok.jpg"]);
+    });
+
+    test("orchestrate: every attempt fails → status=fallback (no asset, cursor advances)", async () => {
+        let n = 0;
+        const imageGenerateFn = async (prompts) => {
+            n++;
+            return { success: true, results: prompts.map((_, i) => ({ globalIdx: i, savedFiles: [`/img/blur_${n}_${i}.jpg`], success: true })) };
+        };
+        const stat = async () => ({ exists: true, size: 1024 }); // every file < 50KB
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [
+                { scene_id: 1, image_prompt: "A", duration_s: 2 },
+                { scene_id: 2, image_prompt: "B", duration_s: 5 },
+            ],
+            imageGenerateFn, stat,
+            { maxAttempts: 3 },
+        );
+
+        assert.strictEqual(out.sceneAssets.length, 0, "no usable files anywhere");
+        assert.strictEqual(out.retryCount, 4, "2 scenes × 2 retries");
+        const statuses = out.perSceneStatus.map((s) => s.status);
+        assert.deepStrictEqual(statuses, ["fallback", "fallback"]);
+        for (const s of out.perSceneStatus) {
+            assert.strictEqual(s.attempts, 3);
+            assert.match(s.reason, /50000|≥/);
+        }
+    });
+
+    test("orchestrate: skipped scenes (missing prompt or duration) never call image:generate", async () => {
+        const calls = [];
+        const imageGenerateFn = async (prompts) => {
+            calls.push(prompts.slice());
+            return { success: true, results: prompts.map((_, i) => ({ globalIdx: i, savedFiles: [`/img/${i}.jpg`], success: true })) };
+        };
+        const stat = async () => ({ exists: true, size: 100 * 1024 });
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [
+                { scene_id: 1, image_prompt: "  ", duration_s: 3 }, // missing prompt
+                { scene_id: 2, image_prompt: "B",  duration_s: 0 }, // bad duration
+                { scene_id: 3, image_prompt: "C",  duration_s: 4 },
+            ],
+            imageGenerateFn, stat,
+            { maxAttempts: 2 },
+        );
+
+        assert.deepStrictEqual(calls[0], ["C"], "only the eligible prompt reaches image:generate");
+        assert.strictEqual(out.retryCount, 0);
+        const statuses = out.perSceneStatus.map((s) => [s.scene_id, s.status]);
+        assert.deepStrictEqual(statuses, [[1, "skipped"], [2, "skipped"], [3, "generated"]]);
+    });
+
+    test("orchestrate: maxAttempts=1 makes a single attempt with no retry", async () => {
+        let n = 0;
+        const imageGenerateFn = async (prompts) => {
+            n++;
+            return { success: true, results: prompts.map((_, i) => ({ globalIdx: i, savedFiles: ["/img/blur.jpg"], success: true })) };
+        };
+        const stat = async () => ({ exists: true, size: 1024 });
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [{ scene_id: 1, image_prompt: "A", duration_s: 3 }],
+            imageGenerateFn, stat,
+            { maxAttempts: 1 },
+        );
+
+        assert.strictEqual(n, 1, "no retry attempt");
+        assert.strictEqual(out.retryCount, 0);
+        assert.strictEqual(out.perSceneStatus[0].status, "fallback");
+        assert.strictEqual(out.perSceneStatus[0].attempts, 1);
+    });
+
+    test("orchestrate: imageGenerateFn throwing on attempt 1 still allows attempt 2 to recover", async () => {
+        let n = 0;
+        const imageGenerateFn = async (prompts) => {
+            n++;
+            if (n === 1) throw new Error("network hiccup");
+            return { success: true, results: prompts.map((_, i) => ({ globalIdx: i, savedFiles: ["/img/recovered.jpg"], success: true })) };
+        };
+        const stat = statBytesFromMap({ "/img/recovered.jpg": 80 * 1024 });
+
+        const out = await helpers.orchestrateImageGenerationWithRetries(
+            [{ scene_id: 1, image_prompt: "A", duration_s: 3 }],
+            imageGenerateFn, stat,
+            { maxAttempts: 2 },
+        );
+
+        assert.strictEqual(n, 2);
+        assert.strictEqual(out.perSceneStatus[0].status, "retried");
+        assert.strictEqual(out.sceneAssets.length, 1);
+    });
+
+    test("orchestrate: countFallbackScenes counts only fallback entries", () => {
+        const n = helpers.countFallbackScenes([
+            { scene_id: 1, status: "generated" },
+            { scene_id: 2, status: "fallback"  },
+            { scene_id: 3, status: "skipped"   },
+            { scene_id: 4, status: "fallback"  },
+            { scene_id: 5, status: "retried"   },
+        ]);
+        assert.strictEqual(n, 2);
+        assert.strictEqual(helpers.countFallbackScenes([]), 0);
+        assert.strictEqual(helpers.countFallbackScenes(null), 0);
+    });
+
     await Promise.all(pending);
     console.log("");
     console.log(`# results: ${passed} passed, ${failed} failed`);
