@@ -472,6 +472,116 @@
             /* keep neutral — IPC is in flight or returned an error;
              * we don't want to alarm the user before we have signal. */
         }
+        /* PR-22: Account Manager panel (parity with autogrok-veo3
+         * one-click auto-login, scoped to the Storyboard tab). */
+        .account-manager {
+            background: var(--bg-1);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin: 8px 0 12px;
+        }
+        .account-manager h3 {
+            margin: 0 0 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .account-manager h3 .pill {
+            font-size: 10px;
+            font-weight: 500;
+        }
+        .account-manager-rows {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 6px 0 8px;
+        }
+        .account-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 110px 32px;
+            gap: 6px;
+            align-items: center;
+            padding: 6px 8px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-0);
+        }
+        .account-row input {
+            background: transparent;
+            border: 1px solid transparent;
+            padding: 4px 6px;
+            color: var(--text);
+            font-size: 12px;
+            border-radius: 3px;
+        }
+        .account-row input:focus {
+            border-color: var(--accent);
+            outline: none;
+        }
+        .account-row .state {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+        .account-row .state.ready {
+            background: rgba(46, 213, 115, 0.1);
+            border-color: rgba(46, 213, 115, 0.4);
+            color: rgb(180, 240, 200);
+        }
+        .account-row .state.stale {
+            background: rgba(255, 193, 7, 0.1);
+            border-color: rgba(255, 193, 7, 0.4);
+            color: rgb(255, 224, 130);
+        }
+        .account-row .state.no-accounts {
+            background: rgba(255, 84, 84, 0.1);
+            border-color: rgba(255, 84, 84, 0.4);
+            color: rgb(255, 180, 180);
+        }
+        .account-row button.row-remove {
+            background: transparent;
+            color: var(--text-dim);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 6px;
+        }
+        .account-row button.row-remove:hover {
+            color: rgb(255, 180, 180);
+            border-color: rgba(255, 84, 84, 0.4);
+        }
+        .account-manager .actions {
+            margin-top: 8px;
+        }
+        .account-manager .desc {
+            margin: 0 0 8px;
+            font-size: 11px;
+        }
+        .account-log-feed {
+            max-height: 140px;
+            overflow-y: auto;
+            margin-top: 8px;
+            padding: 6px 8px;
+            background: var(--bg-0);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px;
+            color: var(--text-dim);
+            display: none;
+        }
+        .account-log-feed.visible { display: block; }
+        .account-log-feed .log-line { padding: 1px 0; }
+        .account-log-feed .log-line.success { color: rgb(180, 240, 200); }
+        .account-log-feed .log-line.error { color: rgb(255, 180, 180); }
+        .account-log-feed .log-line.info { color: var(--text-dim); }
         .empty {
             color: var(--text-dim);
             font-size: 12px;
@@ -841,6 +951,30 @@
                 <div class="result" id="sb-result"></div>
             </div>
 
+            <div class="panel" data-form="storyboard-account-manager">
+                <h2>Grok accounts <span class="pill">auth:setupAccounts (programmatic)</span></h2>
+                <div class="desc">
+                    Email + password are stored in plaintext in <code>accounts.json</code> under
+                    Electron's <code>userData</code> directory (parity with autogrok-veo3, never
+                    committed). Use <b>Auto-login (programmatic)</b> to log every account in
+                    headfully via Puppeteer; browsers minimise after capture so the session stays
+                    fresh until cookies expire. <b>Open manual login</b> remains available as a
+                    fallback when automation fails (e.g. CAPTCHA / 2FA).
+                </div>
+                <div class="account-manager">
+                    <h3>Configured accounts <span class="pill" id="sba-count">0</span></h3>
+                    <div id="sba-rows" class="account-manager-rows"></div>
+                    <div class="actions" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                        <button class="secondary" data-run="storyboard-account-add">+ Add row</button>
+                        <button class="secondary" data-run="storyboard-account-save">Save accounts.json</button>
+                        <button class="primary" data-run="storyboard-account-auto-login">Auto-login (programmatic)</button>
+                        <button class="secondary" data-run="storyboard-batch-login">Open manual login</button>
+                        <span id="sba-status" class="empty"></span>
+                    </div>
+                    <div id="sba-log-feed" class="account-log-feed" aria-live="polite"></div>
+                </div>
+            </div>
+
             <div class="panel" data-form="storyboard-batch">
                 <h2>Batch Image + Video <span class="pill">image:generate · i2v:generate · video:generate</span></h2>
                 <div class="desc">
@@ -941,6 +1075,7 @@
     <script src="storyboard_compose_table_helpers.js"></script>
     <script src="storyboard_batch_helpers.js"></script>
     <script src="storyboard_login_banner_helpers.js"></script>
+    <script src="storyboard_account_manager_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>
