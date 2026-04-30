@@ -846,8 +846,9 @@
         }
 
         // ── Phase 1: image:generate ────────────────────────────────────
-        showLoading('swc-result', `Generating ${scenes.length} Grok image(s) — one per scene (this can take 30–120s, requires an active Grok session)...`);
-
+        // Plan first so the loading message reflects the actual number of
+        // prompts that will be sent (skipped scenes shouldn't inflate the
+        // count the user sees during the 30–120s wait).
         const { prompts, indexMap, skipped: planSkipped } = helpers.planPromptsFromScenes(scenes);
         if (!prompts.length) {
             const skipDetail = planSkipped
@@ -859,6 +860,11 @@
             });
             return;
         }
+
+        const skipNote = planSkipped.length
+            ? ` (${planSkipped.length} scene${planSkipped.length === 1 ? '' : 's'} skipped — missing image_prompt or duration_s)`
+            : '';
+        showLoading('swc-result', `Generating ${prompts.length} Grok image(s) — one per usable scene${skipNote} (this can take 30–120s, requires an active Grok session)...`);
 
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty($('swc-aspect').value);
