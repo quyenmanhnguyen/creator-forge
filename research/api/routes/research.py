@@ -182,7 +182,7 @@ def _llm_verdict(seed: str, region: str, language: str, payload: dict, warnings:
     )
     try:
         raw = llm.chat_json(json.dumps(payload, default=str), system=system)
-        data = json.loads(raw)
+        data = llm.parse_llm_json(raw)
     except RuntimeError as exc:
         # Specific case: missing DeepSeek key → friendly warning, no traceback noise.
         if llm.ERR_NO_DEEPSEEK_KEY in str(exc):

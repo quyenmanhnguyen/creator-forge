@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from openai import OpenAI
 
@@ -48,6 +49,79 @@ def chat_json(prompt: str, system: str | None = None, model: str | None = None) 
     return resp.choices[0].message.content or "{}"
 
 
+# Match a trailing comma immediately before a closing brace or bracket,
+# optionally with whitespace in between. DeepSeek and most LLMs sometimes
+# emit these in long JSON responses despite ``response_format=json_object``.
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def parse_llm_json(raw: str) -> dict:
+    """Parse a JSON object from an LLM response — tolerant of common drift.
+
+    DeepSeek / GPT / Claude with ``response_format=json_object`` *usually*
+    emit clean JSON, but on long outputs (e.g. the 8-part outline at
+    ~900 chars) they occasionally drift: a ``,`` is dropped between two
+    keys, a stray ``\\n`` lands inside a string, or the model wraps the
+    object in ```` ```json ... ``` ```` fences. Without this helper a
+    single missing comma surfaces as
+    ``JSONDecodeError: Expecting ',' delimiter: line 14 column 11 (char 853)``
+    and the entire Studio outline step fails — which is exactly the
+    bug screenshot reported.
+
+    Strategy:
+      1. Strip ``json`` markdown fences if present.
+      2. Try ``json.loads`` directly.
+      3. Clip to the first ``{`` and last ``}`` (drops chatter).
+      4. Strip trailing commas before ``}`` / ``]``.
+      5. Retry; on final failure re-raise the *original* ``JSONDecodeError``
+         so callers can include the LLM's char-offset in their warning.
+
+    Always returns a ``dict``; if the parsed top-level isn't a dict we
+    wrap it under ``{"value": ...}`` so callers can ``.get(...)`` safely.
+    """
+    if not raw:
+        return {}
+    text = raw.strip()
+    if not text:
+        return {}
+    # Strip ```json ... ``` or ``` ... ``` fences
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, count=1)
+        text = re.sub(r"\s*```\s*$", "", text, count=1)
+        text = text.strip()
+    first_err: json.JSONDecodeError | None = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        first_err = exc
+        parsed = None
+    if parsed is None:
+        # Clip to the outermost balanced-looking object.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            clipped = text[start : end + 1]
+            try:
+                parsed = json.loads(clipped)
+            except json.JSONDecodeError:
+                # Strip trailing commas and retry once.
+                repaired = _TRAILING_COMMA_RE.sub(r"\1", clipped)
+                try:
+                    parsed = json.loads(repaired)
+                except json.JSONDecodeError:
+                    parsed = None
+    if parsed is None:
+        # Re-raise the *original* error so the caller's warning carries
+        # the most informative offset (the user-visible message in the
+        # Studio screenshot pointed at "line 14 column 11 (char 853)").
+        if first_err is not None:
+            raise first_err
+        raise json.JSONDecodeError("could not extract JSON object", text, 0)
+    if not isinstance(parsed, dict):
+        return {"value": parsed}
+    return parsed
+
+
 # ─── Studio pipeline helpers ─────────────────────────────────────────────────
 # Each helper produces structured output in the user's chosen language so
 # pages can render results without per-step prompt boilerplate. The prompts
@@ -73,7 +147,7 @@ def topic_ideas(seed: str, *, language: str, n: int = 20) -> dict:
         f"Write topic, emotion and hook in {language}."
     )
     raw = chat_json(f"Seed niche/keyword: {seed}", system=sys)
-    return json.loads(raw)
+    return parse_llm_json(raw)
 
 
 def titles_with_ctr(topic: str, *, language: str, n: int = 10, must_keywords: str = "") -> dict:
@@ -94,7 +168,7 @@ def titles_with_ctr(topic: str, *, language: str, n: int = 10, must_keywords: st
     )
     user = f"Topic: {topic}\nMust-include keywords (optional): {must_keywords or '(none)'}"
     raw = chat_json(user, system=sys)
-    return json.loads(raw)
+    return parse_llm_json(raw)
 
 
 def outline_8part(title: str, *, language: str) -> dict:
@@ -122,7 +196,7 @@ def outline_8part(title: str, *, language: str) -> dict:
         f"Write role, emotion and expansion in {language}."
     )
     raw = chat_json(f"Title: {title}", system=sys)
-    return json.loads(raw)
+    return parse_llm_json(raw)
 
 
 def long_script_chunked(

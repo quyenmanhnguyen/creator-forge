@@ -87,6 +87,8 @@ jobs:
           node --check desktop/dist/storyboard_video_compose_helpers.js
           node --check desktop/dist/storyboard_compose_table_helpers.js
           node --check desktop/dist/storyboard_batch_helpers.js
+          # PR-21: always-on 3-state login banner state mapper.
+          node --check desktop/dist/storyboard_login_banner_helpers.js
           # PR-20E: ffprobe-backed validation helper (Node-only — uses
           # child_process; main-process/service-side module, not loaded
           # via <script> into the renderer).
@@ -106,6 +108,7 @@ jobs:
           node desktop/tests/test_fetch_python_runtime.js
           node desktop/tests/test_video_validation_helpers.js
           node desktop/tests/test_auth_session_status.js
+          node desktop/tests/test_storyboard_login_banner_helpers.js
 
       - name: Syntax check standalone E2E scripts
         run: |
