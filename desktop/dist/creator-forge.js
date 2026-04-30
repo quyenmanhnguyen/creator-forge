@@ -1038,6 +1038,18 @@
             try {
                 const res = await api.auth.getSessionStatus();
                 const state = helpers.deriveBannerState(res);
+                // PR-22: if accounts.json has at least one entry but the
+                // session isn't ready, prefer the programmatic auto-login
+                // CTA over "Open manual login" — keeps the user one
+                // click away from headful Puppeteer.
+                const amh = window.StoryboardAccountManagerHelpers;
+                if (amh && state.status !== 'ready') {
+                    const cta = amh.deriveBannerCta(res);
+                    if (cta && cta.action) {
+                        state.buttonAction = cta.action;
+                        state.buttonText = cta.label;
+                    }
+                }
                 sbbRenderBanner(state);
                 sbbState.sessionKnown = state.status === 'ready';
                 return;
@@ -1101,6 +1113,248 @@
         } catch (e) {
             console.error('openManualLogin failed', e);
         }
+    }
+
+    // ─── PR-22: Account Manager (programmatic auto-login) ─────────────────
+    // The Storyboard tab now has a small Account Manager panel that
+    // renders one row per entry in `accounts.json`, lets the user
+    // add/remove rows, save back to disk, and trigger
+    // `auth:setupAccounts` (autogrok-veo3 parity). Live progress
+    // surfaces via the existing `electronAPI.onLog` channel.
+    const sbaState = {
+        rows: [],          // [{email, password, password_dirty}]
+        sessionStatus: null, // last auth:getSessionStatus payload
+        autoLoginInFlight: false,
+    };
+
+    function sbaPushLog(level, line) {
+        const helpers = window.StoryboardAccountManagerHelpers;
+        const feed = $('sba-log-feed');
+        if (!feed) return;
+        const safe = helpers
+            ? helpers.sanitizeProgressLog(String(line || ''), sbaState.rows)
+            : String(line || '');
+        const div = document.createElement('div');
+        div.className = 'log-line ' + (level === 'error' ? 'error'
+            : level === 'success' ? 'success' : 'info');
+        div.textContent = safe;
+        feed.appendChild(div);
+        feed.classList.add('visible');
+        feed.scrollTop = feed.scrollHeight;
+    }
+
+    function sbaSetStatus(text, level) {
+        const el = $('sba-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.className = level === 'error' ? 'error'
+            : level === 'success' ? 'success' : 'empty';
+    }
+
+    function sbaRender() {
+        const helpers = window.StoryboardAccountManagerHelpers;
+        const container = $('sba-rows');
+        const counter = $('sba-count');
+        if (!container) return;
+        const displayRows = helpers
+            ? helpers.mergeWithSessionStatus(sbaState.rows, sbaState.sessionStatus)
+            : sbaState.rows.map((r) => ({ email: r.email || '', state_label: '—', state_class: 'no-accounts', age_label: '—' }));
+        if (counter) counter.textContent = String(sbaState.rows.length);
+        if (sbaState.rows.length === 0) {
+            container.innerHTML = '<div class="empty">No Grok accounts configured. Click <b>+ Add row</b> to enter one.</div>';
+            return;
+        }
+        container.innerHTML = '';
+        sbaState.rows.forEach((row, idx) => {
+            const display = displayRows[idx] || {};
+            const div = document.createElement('div');
+            div.className = 'account-row';
+            const emailInput = document.createElement('input');
+            emailInput.type = 'email';
+            emailInput.placeholder = 'email@example.com';
+            emailInput.value = row.email || '';
+            emailInput.setAttribute('data-sba-idx', String(idx));
+            emailInput.setAttribute('data-sba-field', 'email');
+            const passwordInput = document.createElement('input');
+            passwordInput.type = 'password';
+            passwordInput.placeholder = row.password ? '●●●●●● (saved)' : 'password';
+            // Never echo the saved password into the DOM. The user
+            // re-types only when changing it.
+            passwordInput.value = row.password_dirty ? (row.password || '') : '';
+            passwordInput.setAttribute('data-sba-idx', String(idx));
+            passwordInput.setAttribute('data-sba-field', 'password');
+            const state = document.createElement('span');
+            state.className = 'state ' + (display.state_class || 'no-accounts');
+            state.textContent = (display.state_label || '—') + (display.age_label && display.age_label !== '—' ? ' · ' + display.age_label : '');
+            const remove = document.createElement('button');
+            remove.className = 'row-remove';
+            remove.type = 'button';
+            remove.title = 'Remove this account';
+            remove.textContent = '×';
+            remove.setAttribute('data-sba-idx', String(idx));
+            remove.setAttribute('data-sba-action', 'remove');
+            div.appendChild(emailInput);
+            div.appendChild(passwordInput);
+            div.appendChild(state);
+            div.appendChild(remove);
+            container.appendChild(div);
+        });
+    }
+
+    async function sbaLoad() {
+        if (!api || !api.auth || typeof api.auth.getAccounts !== 'function') {
+            sbaState.rows = [];
+            sbaRender();
+            return;
+        }
+        try {
+            const data = await api.auth.getAccounts();
+            const list = Array.isArray(data) ? data
+                : (data && Array.isArray(data.accounts) ? data.accounts : []);
+            sbaState.rows = list.map((acc) => ({
+                email: typeof acc.email === 'string' ? acc.email : '',
+                password: typeof acc.password === 'string' ? acc.password : '',
+                password_dirty: false,
+            }));
+        } catch (e) {
+            console.error('auth.getAccounts failed', e);
+            sbaState.rows = [];
+        }
+        // Pull in session status too so the row badges are accurate.
+        if (typeof api.auth.getSessionStatus === 'function') {
+            try {
+                sbaState.sessionStatus = await api.auth.getSessionStatus();
+            } catch (_) { /* fall back to no badges */ }
+        }
+        sbaRender();
+    }
+
+    function sbaAddRow() {
+        sbaState.rows.push({ email: '', password: '', password_dirty: true });
+        sbaRender();
+    }
+
+    function sbaRemoveRow(idx) {
+        const i = parseInt(idx, 10);
+        if (!Number.isFinite(i) || i < 0 || i >= sbaState.rows.length) return;
+        sbaState.rows.splice(i, 1);
+        sbaRender();
+    }
+
+    function sbaSyncFromInputs() {
+        // Read current input values back into state before saving /
+        // auto-login. We don't repaint here so the user keeps focus.
+        const inputs = document.querySelectorAll('#sba-rows input[data-sba-idx]');
+        inputs.forEach((el) => {
+            const idx = parseInt(el.getAttribute('data-sba-idx'), 10);
+            const field = el.getAttribute('data-sba-field');
+            if (!Number.isFinite(idx) || !sbaState.rows[idx]) return;
+            if (field === 'email') {
+                sbaState.rows[idx].email = String(el.value || '').trim();
+            } else if (field === 'password') {
+                const v = String(el.value || '');
+                if (v) {
+                    sbaState.rows[idx].password = v;
+                    sbaState.rows[idx].password_dirty = true;
+                }
+                // Empty input means "keep existing saved password".
+            }
+        });
+    }
+
+    async function sbaSave() {
+        const helpers = window.StoryboardAccountManagerHelpers;
+        if (!api || !api.auth || typeof api.auth.saveAccounts !== 'function') {
+            sbaSetStatus('auth.saveAccounts IPC unavailable — rebuild Electron.', 'error');
+            return;
+        }
+        sbaSyncFromInputs();
+        const payload = sbaState.rows.map((r) => ({ email: r.email, password: r.password }));
+        if (helpers) {
+            const v = helpers.validateAccountList(payload);
+            if (!v.valid) {
+                const msg = v.errors.map((e) => `row ${e.idx + 1}: ${e.error}`).join('; ');
+                sbaSetStatus('Cannot save — ' + msg, 'error');
+                return;
+            }
+        }
+        try {
+            await api.auth.saveAccounts(payload);
+            sbaState.rows.forEach((r) => { r.password_dirty = false; });
+            sbaSetStatus(`Saved ${payload.length} account${payload.length === 1 ? '' : 's'} to accounts.json.`, 'success');
+            // Re-poll banner so it picks up the new configured count.
+            sbbCheckSession().catch(() => {});
+            sbaLoad().catch(() => {});
+        } catch (e) {
+            sbaSetStatus('Save failed: ' + (e && e.message ? e.message : String(e)), 'error');
+        }
+    }
+
+    async function sbaAutoLogin() {
+        const helpers = window.StoryboardAccountManagerHelpers;
+        if (sbaState.autoLoginInFlight) {
+            sbaSetStatus('Auto-login already in progress…', 'info');
+            return;
+        }
+        if (!api || !api.auth || typeof api.auth.setupAccounts !== 'function') {
+            sbaSetStatus('auth.setupAccounts IPC unavailable — rebuild Electron.', 'error');
+            return;
+        }
+        sbaSyncFromInputs();
+        const payload = sbaState.rows
+            .map((r) => ({ email: r.email, password: r.password }))
+            .filter((a) => a.email && a.password);
+        if (!payload.length) {
+            sbaSetStatus('Add at least one email + password row first.', 'error');
+            return;
+        }
+        if (helpers) {
+            const v = helpers.validateAccountList(payload);
+            if (!v.valid) {
+                const msg = v.errors.map((e) => `row ${e.idx + 1}: ${e.error}`).join('; ');
+                sbaSetStatus('Cannot auto-login — ' + msg, 'error');
+                return;
+            }
+        }
+        sbaState.autoLoginInFlight = true;
+        sbaSetStatus(`Auto-login: launching headful Puppeteer for ${payload.length} account${payload.length === 1 ? '' : 's'}…`, 'info');
+        sbaPushLog('info', `→ auth:setupAccounts (${payload.length} row${payload.length === 1 ? '' : 's'})`);
+        try {
+            const result = await api.auth.setupAccounts(payload);
+            const ok = !!(result && result.success);
+            const sessions = (result && Number.isFinite(result.sessions)) ? result.sessions : 0;
+            const msg = ok
+                ? `Auto-login OK — ${sessions}/${payload.length} session${sessions === 1 ? '' : 's'} captured. Browsers minimised.`
+                : `Auto-login finished with errors${result && result.error ? ': ' + result.error : '.'}`;
+            sbaSetStatus(msg, ok ? 'success' : 'error');
+            sbaPushLog(ok ? 'success' : 'error', msg);
+        } catch (e) {
+            const msg = 'Auto-login threw: ' + (e && e.message ? e.message : String(e));
+            sbaSetStatus(msg, 'error');
+            sbaPushLog('error', msg);
+        } finally {
+            sbaState.autoLoginInFlight = false;
+            // Refresh banner + row state badges.
+            sbbCheckSession().catch(() => {});
+            sbaLoad().catch(() => {});
+        }
+    }
+
+    function sbaWireDelegatedHandlers() {
+        const rows = $('sba-rows');
+        if (!rows) return;
+        rows.addEventListener('click', (e) => {
+            const t = e.target;
+            if (!t || !t.matches) return;
+            if (t.matches('button[data-sba-action="remove"]')) {
+                sbaRemoveRow(t.getAttribute('data-sba-idx'));
+            }
+        });
+        // Sync input values into state on every change so the next
+        // Save / Auto-login picks them up even if the user didn't blur.
+        rows.addEventListener('input', () => {
+            sbaSyncFromInputs();
+        });
     }
 
     async function sbbGenerateImages() {
@@ -1297,6 +1551,10 @@
         // when the session is `ready`. The handler is intentionally a
         // re-poll, not a re-login.
         'storyboard-batch-refresh-session': async () => sbbCheckSession(),
+        // PR-22: Account Manager (programmatic auto-login).
+        'storyboard-account-add': async () => sbaAddRow(),
+        'storyboard-account-save': sbaSave,
+        'storyboard-account-auto-login': sbaAutoLogin,
     };
 
     function setupRunButtons() {
@@ -1340,6 +1598,19 @@
         sbbRepaintAll();
         sbbCheckSession().catch(() => {});
         setInterval(() => sbbCheckSession().catch(() => {}), 30_000);
+        // PR-22: Account Manager — load saved accounts, wire delegated
+        // handlers for in-row inputs/buttons, and stream main-process
+        // setupAccounts logs into the panel's log feed.
+        sbaLoad().catch(() => {});
+        sbaWireDelegatedHandlers();
+        if (api && typeof api.onLog === 'function') {
+            api.onLog((data) => {
+                if (!sbaState.autoLoginInFlight) return;
+                if (!data || typeof data !== 'object') return;
+                const level = data.level === 'error' || data.level === 'success' ? data.level : 'info';
+                sbaPushLog(level, String(data.message || data.msg || ''));
+            });
+        }
         const voicePollHandle = setInterval(() => {
             const ps = $('ps-voice');
             if (!ps || ps.options.length > 1) { clearInterval(voicePollHandle); return; }
