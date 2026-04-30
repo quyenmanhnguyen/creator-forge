@@ -387,6 +387,34 @@
             font-size: 10px;
             margin-top: 2px;
         }
+        /* PR-24 — bridge chip on settled image rows links into the
+           video panel via JS. Keep it visually distinct so users
+           notice the new affordance without learning a new icon. */
+        .swc-table .actions a.bridge-chip {
+            color: var(--accent);
+            font-weight: 600;
+            border: 1px solid var(--accent);
+            border-radius: 3px;
+            padding: 1px 6px;
+            margin-left: 4px;
+        }
+        .swc-table .actions a.bridge-chip:hover {
+            background: rgba(124, 154, 255, 0.15);
+            text-decoration: none;
+        }
+        /* PR-24 — Browse… button next to the output-dir input. */
+        .dir-picker-row {
+            display: flex;
+            gap: 6px;
+            align-items: stretch;
+        }
+        .dir-picker-row input[type="text"] {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+        .dir-picker-row button {
+            flex: 0 0 auto;
+        }
         /* PR-20D — "Batch Image + Video" panel. Reuses .swc-table styles
            for the per-scene tables; adds a section header / login
            banner / button row that can sit between sections. */
@@ -1005,7 +1033,10 @@
                         </select>
                     </label>
                     <label title="Where to save mp4 / png assets. Leave blank to auto-create ~/.creator-forge/output/batch-<timestamp>/ on your machine.">Output folder (optional)
-                        <input id="sbb-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/batch-<timestamp>/" />
+                        <span class="dir-picker-row">
+                            <input id="sbb-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/batch-<timestamp>/" />
+                            <button type="button" class="secondary" data-run="storyboard-batch-pick-output">Browse…</button>
+                        </span>
                     </label>
                     <label>Video mode
                         <select id="sbb-video-mode">
@@ -1086,7 +1117,10 @@
                         </select>
                     </label>
                     <label title="Where to save voice.mp3 / captions.srt / short.mp4. Leave blank to auto-create ~/.creator-forge/output/short-<timestamp>/ on your machine.">Output folder (optional)
-                        <input id="ps-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/short-<timestamp>/" />
+                        <span class="dir-picker-row">
+                            <input id="ps-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/short-<timestamp>/" />
+                            <button type="button" class="secondary" data-run="producer-short-pick-output">Browse…</button>
+                        </span>
                     </label>
                     <label class="checkbox-row">
                         <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to mp4

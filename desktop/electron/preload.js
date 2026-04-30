@@ -71,6 +71,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
         generate: (params) => ipcRenderer.invoke('refimg:generate', params),
     },
 
+    // PR-24: native folder picker for output-dir inputs. Returns
+    // ``{ canceled, path }`` so the renderer can drop the path into
+    // an <input> without parsing dialog internals.
+    dialog: {
+        chooseOutputDir: (opts) => ipcRenderer.invoke('dialog:chooseOutputDir', opts),
+    },
+
     onProgress: (callback) => {
         ipcRenderer.on('job:progress', (_, data) => callback(data));
     },

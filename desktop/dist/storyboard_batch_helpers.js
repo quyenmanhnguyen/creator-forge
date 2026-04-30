@@ -475,6 +475,37 @@
         }
     }
 
+    /**
+     * PR-24 — count variants per scene_id so the renderer can render
+     * "scene N · variant K/M" labels. Returns a Map keyed by stringified
+     * scene_id (or "" when scene_id is missing) → total variant count.
+     * Pure, defensive against null rows.
+     */
+    function buildVariantTotals(rows) {
+        const map = new Map();
+        if (!Array.isArray(rows)) return map;
+        for (const r of rows) {
+            const k = (r && r.scene_id != null) ? String(r.scene_id) : "";
+            map.set(k, (map.get(k) || 0) + 1);
+        }
+        return map;
+    }
+
+    /**
+     * PR-24 — format the "scene N · variant K/M" label segment for a
+     * row. When the scene only has a single variant (legacy 1-row-per-
+     * scene tables) the variant tag is omitted so older tables keep
+     * their familiar layout.
+     */
+    function formatVariantLabel(row, variantTotals) {
+        const sceneId = row && row.scene_id != null ? row.scene_id : null;
+        const sceneLabel = `scene ${sceneId != null ? sceneId : "?"}`;
+        const total = (variantTotals && variantTotals.get && variantTotals.get(sceneId != null ? String(sceneId) : "")) || 1;
+        if (total <= 1) return sceneLabel;
+        const idx = (row && typeof row.variant_idx === "number") ? row.variant_idx : 0;
+        return `${sceneLabel} · variant ${idx + 1}/${total}`;
+    }
+
     const api = {
         initImageRowsFromScenes,
         initVideoRowsFromScenes,
@@ -489,6 +520,8 @@
         summarizeRows,
         statusLabel,
         statusClass,
+        buildVariantTotals,
+        formatVariantLabel,
     };
 
     if (typeof module === "object" && module.exports) module.exports = api;

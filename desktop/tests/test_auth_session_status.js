@@ -196,6 +196,31 @@ test("malformed accounts entries (no email) are skipped", () => {
     assert.strictEqual(res.accounts[0].email, "ok@example.com");
 });
 
+// ─── PR-24 ─────────────────────────────────────────────────────────
+// In dev mode (`npm start`) the IPC writer ``auth:saveAccounts``
+// targets ``app.getPath('userData')/accounts.json`` while the legacy
+// default loader resolves ``PATHS.ACCOUNTS_FILE`` to
+// ``desktop/accounts.json``. The two paths point at different files,
+// so without the IPC handler injecting an explicit ``accountsLoader``
+// the status would stay ``no_accounts`` even after a successful save
+// + auto-login. This test pins the contract that
+// ``getSessionStatus`` honours an explicit loader so the IPC handler
+// can wire the correct path.
+test("PR-24: explicit accountsLoader overrides the AccountService default (banner-sync fix)", () => {
+    resetSessions();
+    let calls = 0;
+    const customLoader = () => {
+        calls += 1;
+        return [{ email: "saved-via-userdata@example.com", password: "x" }];
+    };
+    const res = AuthService.getSessionStatus({ accountsLoader: customLoader });
+    assert.strictEqual(calls, 1, "explicit accountsLoader must be invoked exactly once");
+    assert.strictEqual(res.configured_count, 1);
+    // No active session yet → status == 'stale' (account exists but
+    // cookies haven't been captured), NOT 'no_accounts'.
+    assert.strictEqual(res.status, "stale");
+});
+
 let pass = 0;
 let fail = 0;
 for (const t of tests) {

@@ -416,6 +416,63 @@ test("PR-23: legacy initImageRowsFromScenes(scenes) (no opts) returns 1 row per 
     assert.ok(rows.every((r) => r.variant_idx === 0));
 });
 
+// ─── PR-24 ─────────────────────────────────────────────────────────
+test("PR-24: buildVariantTotals counts variants per scene_id", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES, { imagesPerScene: 4 });
+    const totals = helpers.buildVariantTotals(rows);
+    assert.strictEqual(totals.get("1"), 4);
+    assert.strictEqual(totals.get("2"), 4);
+    assert.strictEqual(totals.get("3"), 4);
+    assert.strictEqual(totals.get("4"), 4);
+});
+
+test("PR-24: buildVariantTotals returns 1 per scene for legacy single-row tables", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES);
+    const totals = helpers.buildVariantTotals(rows);
+    for (const id of ["1", "2", "3", "4"]) {
+        assert.strictEqual(totals.get(id), 1);
+    }
+});
+
+test("PR-24: buildVariantTotals tolerates null / missing scene_id rows", () => {
+    const totals = helpers.buildVariantTotals([
+        { scene_id: 7, variant_idx: 0 },
+        { scene_id: 7, variant_idx: 1 },
+        { scene_id: null, variant_idx: 0 },
+        null, // junk row — must not throw
+    ]);
+    assert.strictEqual(totals.get("7"), 2);
+    // scene_id=null still gets bucketed under "" so the renderer can
+    // still find a count for it.
+    assert.strictEqual(totals.get(""), 2); // null row + scene_id:null both
+});
+
+test("PR-24: formatVariantLabel emits 'scene N · variant K/M' for multi-variant scenes", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES, { imagesPerScene: 4 });
+    const totals = helpers.buildVariantTotals(rows);
+    assert.strictEqual(helpers.formatVariantLabel(rows[0], totals), "scene 1 · variant 1/4");
+    assert.strictEqual(helpers.formatVariantLabel(rows[1], totals), "scene 1 · variant 2/4");
+    assert.strictEqual(helpers.formatVariantLabel(rows[3], totals), "scene 1 · variant 4/4");
+    assert.strictEqual(helpers.formatVariantLabel(rows[4], totals), "scene 2 · variant 1/4");
+});
+
+test("PR-24: formatVariantLabel omits the variant tag for legacy 1-row-per-scene tables", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES);
+    const totals = helpers.buildVariantTotals(rows);
+    // total == 1 → no variant tag, label is plain "scene N".
+    for (const r of rows) {
+        const lbl = helpers.formatVariantLabel(r, totals);
+        assert.ok(!lbl.includes("variant"), `unexpected variant tag in legacy label: ${lbl}`);
+        assert.match(lbl, /^scene \d/);
+    }
+});
+
+test("PR-24: formatVariantLabel falls back to '?' when scene_id is missing entirely", () => {
+    const totals = new Map();
+    const lbl = helpers.formatVariantLabel({ variant_idx: 0 }, totals);
+    assert.strictEqual(lbl, "scene ?");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

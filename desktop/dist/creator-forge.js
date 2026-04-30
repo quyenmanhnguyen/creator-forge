@@ -825,6 +825,11 @@
             e.preventDefault();
             const p = t.getAttribute('data-swc-show');
             if (api && typeof api.showItemInFolder === 'function') api.showItemInFolder(p).catch(() => {});
+        } else if (t.matches('a[data-sbb-make-video]')) {
+            e.preventDefault();
+            const sid = t.getAttribute('data-sbb-make-video');
+            const rid = t.getAttribute('data-sbb-make-video-row') || '';
+            try { sbbBridgeImageToVideo(sid, rid); } catch (err) { console.warn('bridge image→video failed:', err); }
         }
     });
 
@@ -895,6 +900,13 @@
         html += `<table class="swc-table"><thead><tr>
             <th>#</th><th>Scene</th><th>Prompt</th><th>Status</th><th>Output</th><th>Actions</th>
         </tr></thead><tbody>`;
+        // PR-24: count variants per scene_id so we can render
+        // "scene N · variant K/M" labels — without this every variant
+        // row looks identical to the next one and the user can't tell
+        // a 60-row table apart from a duplicated 1-row scene.
+        const variantTotals = (typeof helpers.buildVariantTotals === 'function')
+            ? helpers.buildVariantTotals(rows)
+            : new Map();
         for (const r of rows) {
             const label = helpers.statusLabel(r.status);
             const cls = helpers.statusClass(r.status);
@@ -917,10 +929,21 @@
                 }
                 outCell += `<div class="reason"><code>${escapeHtml(outPath)}</code></div>`;
             }
-            const actions = outPath ? sbbRenderPathActions(outPath) : '<span class="muted">—</span>';
+            const sceneCellLabel = (typeof helpers.formatVariantLabel === 'function')
+                ? helpers.formatVariantLabel(r, variantTotals)
+                : `scene ${r.scene_id != null ? r.scene_id : '?'}`;
+            // Per-row "Make video" chip on settled image rows so the
+            // user can bridge an image → video without leaving the
+            // batch panel.
+            let bridgeChip = '';
+            if (kind === 'image' && r.status === 'generated' && outPath) {
+                bridgeChip = ` <a href="#" class="bridge-chip" data-sbb-make-video="${escapeHtml(r.scene_id != null ? r.scene_id : '')}" data-sbb-make-video-row="${escapeHtml(r.row_id || '')}">▶ Make video</a>`;
+            }
+            const baseActions = outPath ? sbbRenderPathActions(outPath) : '';
+            const actions = (baseActions || bridgeChip) ? `${baseActions}${bridgeChip}` : '<span class="muted">—</span>';
             html += `<tr>
                 <td class="scene-num">${escapeHtml(r.order)}</td>
-                <td><b>scene ${escapeHtml(r.scene_id != null ? r.scene_id : '?')}</b><div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
+                <td><b>${escapeHtml(sceneCellLabel)}</b><div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
                 <td class="prompt-cell">${escapeHtml(r.prompt || '')}</td>
                 <td>${statusCell}</td>
                 <td>${outCell}</td>
@@ -1118,6 +1141,69 @@
         sbbState.imageRows = [];
         sbbState.videoRows = [];
         sbbRepaintAll();
+    }
+
+    /**
+     * PR-24 — open the OS folder picker and stuff the chosen path into
+     * the input identified by ``inputId``. Cancel = no-op so the
+     * existing value is preserved. The IPC degrades gracefully when
+     * the dialog API isn't available (older preload, web preview).
+     */
+    async function sbbPickOutputDir(inputId) {
+        const input = $(inputId);
+        if (!input) return;
+        if (!api || !api.dialog || typeof api.dialog.chooseOutputDir !== 'function') {
+            // Renderer running outside Electron (or a stale preload) —
+            // fall back to a simple prompt so the picker is still
+            // usable rather than silently doing nothing.
+            const fallback = window.prompt('Output folder (absolute path):', input.value || '');
+            if (fallback) input.value = fallback;
+            return;
+        }
+        try {
+            const res = await api.dialog.chooseOutputDir({
+                title: 'Choose output folder',
+                defaultPath: input.value || undefined,
+            });
+            if (res && !res.canceled && res.path) {
+                input.value = res.path;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } catch (err) {
+            console.warn('chooseOutputDir failed:', err);
+        }
+    }
+
+    /**
+     * PR-24 — bridge a settled image row to the video flow. Re-pairs
+     * image_path into the matching video row, switches mode to I2V,
+     * scrolls the video panel into view, and surfaces a status hint
+     * so the user can click "Generate videos" themselves. We
+     * deliberately don't auto-dispatch the IPC: the user may want to
+     * pair more images first or flip to T2V.
+     */
+    function sbbBridgeImageToVideo(sceneId, _rowId) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        if (!sbbState.videoRows.length) {
+            // Re-init from current scenes if the user cleared the
+            // video table or never auto-filled.
+            sbbAutoFill();
+        }
+        sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
+        // Force I2V mode — bridging an image makes T2V nonsensical.
+        const modeEl = $('sbb-video-mode');
+        if (modeEl && modeEl.value !== 'i2v') modeEl.value = 'i2v';
+        sbbRepaintVideo();
+        const result = $('sbb-video-result');
+        if (result) {
+            const sceneLabel = sceneId != null && sceneId !== '' ? `scene ${sceneId}` : 'this scene';
+            result.innerHTML = `<div class="info">Image paired for ${escapeHtml(sceneLabel)}. Click <b>Generate videos</b> to start I2V (or pair more first).</div>`;
+        }
+        const target = $('sbb-video-rows') || $('sbb-video-result');
+        if (target && typeof target.scrollIntoView === 'function') {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
     }
 
     async function sbbOpenLogin() {
@@ -1592,6 +1678,10 @@
         'storyboard-batch-image': sbbGenerateImages,
         'storyboard-batch-video': sbbGenerateVideos,
         'storyboard-batch-login': sbbOpenLogin,
+        // PR-24: native folder pickers — drop the chosen path into the
+        // matching <input>. Cancel is a no-op (preserves current value).
+        'storyboard-batch-pick-output': async () => sbbPickOutputDir('sbb-output-dir'),
+        'producer-short-pick-output': async () => sbbPickOutputDir('ps-output-dir'),
         // PR-21: the always-on banner swaps its CTA to "Refresh status"
         // when the session is `ready`. The handler is intentionally a
         // re-poll, not a re-login.
