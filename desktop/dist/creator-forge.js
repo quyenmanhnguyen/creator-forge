@@ -882,6 +882,11 @@
             const rowId = t.getAttribute('data-sbb-row');
             if (action === 'edit') sbbBeginEdit(kind, rowId);
             else if (action === 'delete') sbbDeleteRow(kind, rowId);
+            else if (action === 'refs') sbbAddRowRefs(rowId).catch((err) => console.warn('add row refs failed:', err));
+            else if (action === 'clear-refs') sbbClearRowRefs(rowId);
+        } else if (t.matches('button[data-sbb-ref-remove]')) {
+            // PR-28 — ✕ button on a global-ref list entry.
+            sbbRemoveGlobalRef(t.getAttribute('data-sbb-ref-remove'));
         } else if (t.matches('button[data-sbb-edit-action]')) {
             // PR-27 — Save / Cancel buttons inside an inline-edit shell.
             const action = t.getAttribute('data-sbb-edit-action');
@@ -974,6 +979,18 @@
         // row mid-edit. Format: "image:1#0" / "video:2#1" / null.
         editingRowKey: null,
         editingDraft: '',
+        // PR-28 — reference image upload. ``globalRefs`` is the
+        // shared character / style anchor list applied to every row
+        // unless that row has its own override in ``rowRefMap``.
+        // ``rowRefMap`` is a plain object keyed by row_id whose value
+        // is a string[] of absolute file paths returned by
+        // ``electronAPI.selectFiles``. Empty arrays mean "user
+        // explicitly cleared the override" (still falls back to the
+        // global). Both kinds (image / video) share the same maps —
+        // video rows pick up refs implicitly via the image→video
+        // bridge and don't expose their own ref UI.
+        globalRefs: [],
+        rowRefMap: {},
     };
 
     /** Repaint both image and video tables. */
@@ -1090,6 +1107,7 @@
             const sceneCellLabel = (typeof helpers.formatVariantLabel === 'function')
                 ? helpers.formatVariantLabel(r, variantTotals)
                 : `scene ${r.scene_id != null ? r.scene_id : '?'}`;
+            const refBadge = kind === 'image' ? sbbRenderRefBadge(r) : '';
             // Per-row "Make video" chip on settled image rows so the
             // user can bridge an image → video without leaving the
             // batch panel.
@@ -1111,7 +1129,8 @@
             const delBtn = `<button class="sbb-icon-btn danger" data-sbb-row-action="delete"`
                 + ` data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(r.row_id || '')}"`
                 + ` title="Drop this row from the table"${deletable ? '' : ' disabled'}>Delete</button>`;
-            const rowActions = `<div class="sbb-row-actions">${editBtn}${delBtn}${baseActions}${bridgeChip}</div>`;
+            const refButtons = kind === 'image' ? sbbRenderRefRowButtons(r) : '';
+            const rowActions = `<div class="sbb-row-actions">${editBtn}${delBtn}${refButtons}${baseActions}${bridgeChip}</div>`;
             const rowKey = `${kind}:${r.row_id}`;
             const inEdit = editKey === rowKey;
             const promptCell = inEdit
@@ -1122,7 +1141,7 @@
             html += `<tr${trCls}>
                 <td class="sbb-select-cell"><input type="checkbox" data-sbb-row-select="${escapeHtml(r.row_id || '')}" data-sbb-kind="${escapeHtml(kind)}" ${isSelected ? 'checked' : ''} /></td>
                 <td class="scene-num">${escapeHtml(r.order)}</td>
-                <td><b>${escapeHtml(sceneCellLabel)}</b><div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
+                <td><b>${escapeHtml(sceneCellLabel)}</b>${refBadge}<div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
                 <td class="prompt-cell">${promptCell}</td>
                 <td>${statusCell}</td>
                 <td>${outCell}</td>
@@ -1185,6 +1204,135 @@
             return `<span class="actions"><a href="#" data-swc-open="${safe}">open</a> <a href="#" data-swc-show="${safe}">show in folder</a></span>`;
         }
         return '';
+    }
+
+    /**
+     * PR-28 — render the per-row ref-state badge next to the scene
+     * label so the user can see at a glance whether a row will go
+     * through ``image:generate`` (no badge) or ``refimg:generate``
+     * (badge with ref count + "global" / "override" qualifier).
+     * Always returns a string; never mutates anything.
+     */
+    function sbbRenderRefBadge(row) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers || typeof helpers.resolveRefsForRow !== 'function') return '';
+        const refs = helpers.resolveRefsForRow(row, sbbState.rowRefMap, sbbState.globalRefs);
+        if (!refs.length) return '';
+        const override = sbbState.rowRefMap[String(row.row_id)];
+        const hasOverride = Array.isArray(override) && override.length > 0;
+        const cls = hasOverride ? '' : ' is-global';
+        const label = hasOverride ? `📎 ${refs.length} override` : `📎 ${refs.length} global`;
+        const tipPaths = refs.map((p) => sbbBasename(p)).join('\n');
+        const title = (hasOverride ? 'Per-row override:' : 'From global ref list:') + '\n' + tipPaths;
+        return `<span class="sbb-row-ref${cls}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
+    }
+
+    /** PR-28 — per-row ref buttons: Refs (open picker) + Clear-override (when present). */
+    function sbbRenderRefRowButtons(row) {
+        const rowId = row && row.row_id != null ? String(row.row_id) : '';
+        if (!rowId) return '';
+        const override = sbbState.rowRefMap[rowId];
+        const hasOverride = Array.isArray(override) && override.length > 0;
+        const refsBtn = `<button class="sbb-icon-btn" data-sbb-row-action="refs"`
+            + ` data-sbb-kind="image" data-sbb-row="${escapeHtml(rowId)}"`
+            + ` title="${escapeHtml(hasOverride ? 'Replace this row\'s reference images (currently: ' + override.length + ' file' + (override.length === 1 ? '' : 's') + ')' : 'Attach reference images for this row only — overrides the global list')}">Refs${hasOverride ? ` (${override.length})` : ''}</button>`;
+        let clearBtn = '';
+        if (hasOverride) {
+            clearBtn = `<button class="sbb-icon-btn" data-sbb-row-action="clear-refs"`
+                + ` data-sbb-kind="image" data-sbb-row="${escapeHtml(rowId)}"`
+                + ` title="Drop the per-row override — falls back to the global ref list">Clear refs</button>`;
+        }
+        return refsBtn + clearBtn;
+    }
+
+    /** Cross-platform basename (no Node ``path`` available in the renderer). */
+    function sbbBasename(p) {
+        const s = String(p || '');
+        const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+        return i >= 0 ? s.slice(i + 1) : s;
+    }
+
+    /** PR-28 — render the global ref list under the Storyboard panel. */
+    function sbbRenderGlobalRefs() {
+        const list = $('sb-ref-list');
+        const status = $('sb-ref-status');
+        if (!list) return;
+        const refs = sbbState.globalRefs || [];
+        if (status) {
+            status.textContent = refs.length
+                ? `${refs.length} ref image${refs.length === 1 ? '' : 's'} attached`
+                : 'no global refs attached';
+        }
+        if (!refs.length) {
+            list.innerHTML = '';
+            return;
+        }
+        list.innerHTML = refs.map((p, i) => `<li>
+            <span class="ref-path" title="${escapeHtml(p)}">${escapeHtml(sbbBasename(p))}</span>
+            <button class="ghost" data-sbb-ref-remove="${escapeHtml(String(i))}" title="Remove this ref from the global list">✕</button>
+        </li>`).join('');
+    }
+
+    /** PR-28 — file picker entry-point shared by global + per-row attach. */
+    async function sbbPickRefImageFiles() {
+        if (!api || typeof api.selectFiles !== 'function') return [];
+        try {
+            const paths = await api.selectFiles({
+                filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+            });
+            return Array.isArray(paths) ? paths : [];
+        } catch (err) {
+            console.warn('[sbb] selectFiles failed:', err && err.message);
+            return [];
+        }
+    }
+
+    async function sbbAddGlobalRefs() {
+        const picked = await sbbPickRefImageFiles();
+        if (!picked.length) return;
+        const merged = (sbbState.globalRefs || []).slice();
+        for (const p of picked) if (!merged.includes(p)) merged.push(p);
+        sbbState.globalRefs = merged;
+        sbbRenderGlobalRefs();
+        sbbRepaintImage();
+    }
+
+    function sbbRemoveGlobalRef(idx) {
+        const i = parseInt(idx, 10);
+        const refs = (sbbState.globalRefs || []).slice();
+        if (!Number.isFinite(i) || i < 0 || i >= refs.length) return;
+        refs.splice(i, 1);
+        sbbState.globalRefs = refs;
+        sbbRenderGlobalRefs();
+        sbbRepaintImage();
+    }
+
+    function sbbClearGlobalRefs() {
+        if (!sbbState.globalRefs.length) return;
+        sbbState.globalRefs = [];
+        sbbRenderGlobalRefs();
+        sbbRepaintImage();
+    }
+
+    async function sbbAddRowRefs(rowId) {
+        const key = String(rowId || '');
+        if (!key) return;
+        const picked = await sbbPickRefImageFiles();
+        if (!picked.length) return;
+        // Replace, not merge, so a re-pick is the user's clear way to
+        // override the previous list. (Use the ✕ button to drop a single ref.)
+        sbbState.rowRefMap = Object.assign({}, sbbState.rowRefMap, { [key]: picked.slice() });
+        sbbRepaintImage();
+    }
+
+    function sbbClearRowRefs(rowId) {
+        const key = String(rowId || '');
+        if (!key) return;
+        if (!sbbState.rowRefMap[key]) return;
+        const next = Object.assign({}, sbbState.rowRefMap);
+        delete next[key];
+        sbbState.rowRefMap = next;
+        sbbRepaintImage();
     }
 
     /**
@@ -1504,6 +1652,13 @@
             sbbState.editingRowKey = null;
             sbbState.editingDraft = '';
         }
+        // PR-28 — drop the per-row ref override so a recycled row_id
+        // (e.g. user re-runs scene_breakdown) doesn't inherit stale refs.
+        if (kind === 'image' && sbbState.rowRefMap[String(rowId)]) {
+            const next = Object.assign({}, sbbState.rowRefMap);
+            delete next[String(rowId)];
+            sbbState.rowRefMap = next;
+        }
         sbbRepaintKind(kind);
     }
 
@@ -1532,6 +1687,16 @@
                 sbbState.editingRowKey = null;
                 sbbState.editingDraft = '';
             }
+        }
+        // PR-28 — drop ref overrides for every deleted row so the map
+        // doesn't accumulate stale entries.
+        if (kind === 'image') {
+            const next = Object.assign({}, sbbState.rowRefMap);
+            let mutated = false;
+            for (const id of selected) {
+                if (next[String(id)]) { delete next[String(id)]; mutated = true; }
+            }
+            if (mutated) sbbState.rowRefMap = next;
         }
         // Suppress the unused-var warning from the linter — summary is
         // captured for future telemetry / status messaging.
@@ -2015,43 +2180,72 @@
             $('sbb-image-result').innerHTML = '<div class="error">electronAPI.image.generate unavailable.</div>';
             return;
         }
-        const plan = helpers.planImageGenerate(sbbState.imageRows);
-        if (!plan.prompts.length) {
+        // PR-28: when any row resolves to ≥1 ref image, we route those
+        // rows through `refimg:generate` (Grok's imagine-image-edit
+        // model) and the remainder through plain `image:generate`.
+        const refOpts = { rowRefMap: sbbState.rowRefMap, globalRefs: sbbState.globalRefs };
+        const split = helpers.partitionRowsByRefs(sbbState.imageRows, refOpts);
+        const plainPlan = helpers.planImageGenerate(split.withoutRefs);
+        const refPlan = helpers.planRefImageGenerate(split.withRefs, refOpts);
+        const eligibleCount = plainPlan.prompts.length + refPlan.items.length;
+        if (!eligibleCount) {
             $('sbb-image-result').innerHTML = '<div class="error">No eligible image prompts (every scene was skipped — check image_prompt).</div>';
+            return;
+        }
+        if (refPlan.items.length && (!api.refimg || typeof api.refimg.generate !== 'function')) {
+            $('sbb-image-result').innerHTML = '<div class="error">electronAPI.refimg.generate unavailable — drop the reference images or update the desktop shell.</div>';
             return;
         }
         sbbInstallListener();
         sbbState.imageRows = helpers.startBatchPhase(sbbState.imageRows);
-        sbbState.currentImageBatchSceneIds = plan.sceneIds.slice();
-        sbbState.currentImageBatchRowIds = (plan.rowIds || plan.sceneIds).slice();
+        // currentImageBatch* covers BOTH plans so progress events for
+        // either IPC channel route through the same row mapping.
+        sbbState.currentImageBatchSceneIds = [...plainPlan.sceneIds, ...refPlan.sceneIds];
+        sbbState.currentImageBatchRowIds = [
+            ...((plainPlan.rowIds || plainPlan.sceneIds).slice()),
+            ...refPlan.rowIds,
+        ];
         sbbRepaintImage();
 
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
         if (aspect) config.aspectRatio = aspect;
-        let resp;
-        try {
-            resp = await api.image.generate({ prompts: plan.prompts, config });
-        } catch (err) {
-            const banner = $('sbb-image-result');
-            if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">image:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
-            return;
+        const banner = $('sbb-image-result');
+
+        const tasks = [];
+        if (plainPlan.prompts.length) {
+            tasks.push(api.image.generate({ prompts: plainPlan.prompts, config })
+                .then((resp) => ({ kind: 'image', resp, plan: plainPlan }))
+                .catch((err) => ({ kind: 'image', err, plan: plainPlan })));
         }
-        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'image', plan.rowIds);
-        for (const r of settled) {
-            // PR-23: settle the variant row exactly (row_id) so siblings stay pending.
-            sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.row_id != null ? r.row_id : r.scene_id, r);
+        if (refPlan.items.length) {
+            tasks.push(api.refimg.generate({ items: refPlan.items, config })
+                .then((resp) => ({ kind: 'refimg', resp, plan: refPlan }))
+                .catch((err) => ({ kind: 'refimg', err, plan: refPlan })));
+        }
+        const outcomes = await Promise.all(tasks);
+
+        for (const o of outcomes) {
+            if (o.err) {
+                const channel = o.kind === 'refimg' ? 'refimg:generate' : 'image:generate';
+                if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">${channel} IPC threw: ${escapeHtml(o.err && o.err.message || String(o.err))}</div>`);
+                continue;
+            }
+            const settled = helpers.mapBatchResponse(o.resp, o.plan.sceneIds, 'image', o.plan.rowIds || o.plan.sceneIds);
+            for (const r of settled) {
+                sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.row_id != null ? r.row_id : r.scene_id, r);
+            }
+            if (o.resp && o.resp.success === false) {
+                const channel = o.kind === 'refimg' ? 'refimg:generate' : 'image:generate';
+                const why = o.resp.error || 'Unknown — check Login panel for an active Grok session.';
+                if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">${channel} failed: ${escapeHtml(why)}</div>`);
+            }
         }
         // Re-pair the video table now that some images settled —
         // I2V mode depends on having the latest image_path bindings.
         sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
         sbbRepaintAll();
         sbbResolveUrls(sbbState.imageRows, 'image').catch(() => {});
-
-        if (resp && resp.success === false) {
-            const why = resp.error || 'Unknown — check Login panel for an active Grok session.';
-            $('sbb-image-result').insertAdjacentHTML('afterbegin', `<div class="error">image:generate failed: ${escapeHtml(why)}</div>`);
-        }
     }
 
     async function sbbGenerateVideos() {
@@ -2207,6 +2401,10 @@
         // PR-27: re-roll all variants for every scene currently in
         // the image-batch table using the current Visual DNA.
         'storyboard-reroll-variants': sbbRerollAll,
+        // PR-28: global reference image attach / clear (shared with
+        // every variant unless the row has its own override).
+        'storyboard-ref-add': sbbAddGlobalRefs,
+        'storyboard-ref-clear': async () => sbbClearGlobalRefs(),
         // PR-24: native folder pickers — drop the chosen path into the
         // matching <input>. Cancel is a no-op (preserves current value).
         'storyboard-batch-pick-output': async () => sbbPickOutputDir('sbb-output-dir'),
@@ -2260,6 +2458,9 @@
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.
         sbbRepaintAll();
+        // PR-28 — paint the global ref list so the empty-state is
+        // visible from cold start.
+        sbbRenderGlobalRefs();
         sbbCheckSession().catch(() => {});
         setInterval(() => sbbCheckSession().catch(() => {}), 30_000);
         // PR-22: Account Manager — load saved accounts, wire delegated
