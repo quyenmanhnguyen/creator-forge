@@ -533,3 +533,106 @@ test('composeWithScenes: image:generate IPC throwing on first attempt is caught 
     assert.strictEqual(out.sceneAssets.length, 1);
 });
 
+
+
+// ─── PR-20A: animateScenes IPC contract fix ────────────────────────────────
+// Pre-PR-20A this method shipped { jobs, account } with image_path /
+// video_prompt field names — both silently dropped by main.js's
+// ipcMain.handle('i2v:generate', ...) which destructures
+// `{ items, config, startIdx }` and reads `item.imagePath`/`item.prompt`
+// inside `I2VService.generateOne`. The contract is now aligned.
+
+test('animateScenes: forwards { items, config, startIdx } with imagePath/prompt to i2v:generate', async () => {
+    const calls = { i2v: [] };
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => Promise.resolve({ success: true, results: [] }) },
+        producer: { composeShort: () => Promise.resolve({}) },
+        i2v: {
+            generate: (payload) => {
+                calls.i2v.push(payload);
+                return Promise.resolve({ success: true, results: [] });
+            },
+        },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+
+    const scenes = [
+        { scene_id: 1, hero_image_path: '/img/a.jpg', video_prompt: 'pan slowly', duration_s: 6 },
+        // Scene with only flow_video_prompt — bridge must accept it as a
+        // fallback so scene_breakdown output drops in directly.
+        { scene_id: 2, hero_image_path: '/img/b.jpg', flow_video_prompt: 'zoom in cinematic ', duration_s: 5 },
+    ];
+
+    const out = await bridge.animateScenes({ scenes, config: { batchSize: 2 }, startIdx: 4 });
+
+    assert.strictEqual(calls.i2v.length, 1);
+    const payload = calls.i2v[0];
+    // IPC channel expects `items`, never `jobs`.
+    assert.ok(Array.isArray(payload.items), 'payload.items must be an array');
+    assert.strictEqual(payload.items.length, 2);
+    // Field names match `I2VService.generateOne`'s destructure.
+    assert.deepStrictEqual(payload.items[0], { imagePath: '/img/a.jpg', prompt: 'pan slowly' });
+    assert.deepStrictEqual(payload.items[1], { imagePath: '/img/b.jpg', prompt: 'zoom in cinematic' });
+    // Pass-through fields land at the correct keys.
+    assert.deepStrictEqual(payload.config, { batchSize: 2 });
+    assert.strictEqual(payload.startIdx, 4);
+    // Legacy fields must NOT leak through (they were silently dropped
+    // pre-fix and would cause confusion if a future consumer added them).
+    assert.strictEqual(payload.jobs, undefined);
+    assert.strictEqual(payload.account, undefined);
+    // Return value passes through untouched (still useful for callers).
+    assert.deepStrictEqual(out, { success: true, results: [] });
+});
+
+test('animateScenes: drops scenes missing hero_image_path or video prompt without throwing', async () => {
+    const calls = { i2v: [] };
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => Promise.resolve({ success: true, results: [] }) },
+        producer: { composeShort: () => Promise.resolve({}) },
+        i2v: {
+            generate: (payload) => {
+                calls.i2v.push(payload);
+                return Promise.resolve({ success: true, results: [] });
+            },
+        },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+
+    const scenes = [
+        { scene_id: 1, hero_image_path: '/img/a.jpg', video_prompt: 'pan slowly', duration_s: 6 },
+        { scene_id: 2, hero_image_path: '', video_prompt: 'no image', duration_s: 4 },
+        { scene_id: 3, hero_image_path: '/img/c.jpg', video_prompt: '   ', flow_video_prompt: '', duration_s: 4 },
+        { scene_id: 4, hero_image_path: '   ', video_prompt: 'whitespace path', duration_s: 4 },
+        null,
+    ];
+
+    await bridge.animateScenes({ scenes });
+
+    assert.strictEqual(calls.i2v.length, 1);
+    const payload = calls.i2v[0];
+    // Only scene 1 survives the filter.
+    assert.strictEqual(payload.items.length, 1);
+    assert.deepStrictEqual(payload.items[0], { imagePath: '/img/a.jpg', prompt: 'pan slowly' });
+    // No optional fields when not provided.
+    assert.strictEqual('config' in payload, false);
+    assert.strictEqual('startIdx' in payload, false);
+});
+
+test('animateScenes: throws a helpful error if electronAPI.i2v.generate is missing', async () => {
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => Promise.resolve({}) },
+        producer: { composeShort: () => Promise.resolve({}) },
+        i2v: {},
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    await assert.rejects(
+        bridge.animateScenes({ scenes: [{ hero_image_path: '/x.jpg', video_prompt: 'y', duration_s: 1 }] }),
+        /electronAPI\.i2v\.generate is unavailable/,
+    );
+});
