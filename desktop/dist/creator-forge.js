@@ -763,6 +763,10 @@
         }
         const params = {
             script,
+            // PR-23: tts_provider lets the user pick Piper (offline) over
+            // edge-tts (online). The route falls back to edge-tts when the
+            // value is empty / unknown so a stale UI is never a 4xx.
+            tts_provider: ($('ps-tts-provider') && $('ps-tts-provider').value) || 'edge-tts',
             voice: $('ps-voice').value || 'en-US-AriaNeural',
             style: $('ps-style').value || 'violet-pink',
             write_srt: !!$('ps-write-srt').checked,
@@ -839,7 +843,9 @@
         imageRows: [],
         videoRows: [],
         currentImageBatchSceneIds: [],
+        currentImageBatchRowIds: [],
         currentVideoBatchSceneIds: [],
+        currentVideoBatchRowIds: [],
         listenerInstalled: false,
         sessionKnown: false,
     };
@@ -964,12 +970,16 @@
             const { jobId, progress } = data;
             const idx = (progress && typeof progress.globalIdx === 'number') ? progress.globalIdx : -1;
             if (jobId === 'image' && idx >= 0 && idx < sbbState.currentImageBatchSceneIds.length) {
-                const sid = sbbState.currentImageBatchSceneIds[idx];
-                sbbState.imageRows = helpers.applyBatchProgress(sbbState.imageRows, sid, progress);
+                // PR-23: prefer row_id (variant-precise) over scene_id so
+                // progress for variant N doesn't bleed into siblings.
+                const rid = (sbbState.currentImageBatchRowIds && sbbState.currentImageBatchRowIds[idx])
+                    || sbbState.currentImageBatchSceneIds[idx];
+                sbbState.imageRows = helpers.applyBatchProgress(sbbState.imageRows, rid, progress);
                 sbbRepaintImage();
             } else if ((jobId === 'i2v' || jobId === 'video') && idx >= 0 && idx < sbbState.currentVideoBatchSceneIds.length) {
-                const sid = sbbState.currentVideoBatchSceneIds[idx];
-                sbbState.videoRows = helpers.applyBatchProgress(sbbState.videoRows, sid, progress);
+                const rid = (sbbState.currentVideoBatchRowIds && sbbState.currentVideoBatchRowIds[idx])
+                    || sbbState.currentVideoBatchSceneIds[idx];
+                sbbState.videoRows = helpers.applyBatchProgress(sbbState.videoRows, rid, progress);
                 sbbRepaintVideo();
             }
         });
@@ -1089,9 +1099,19 @@
             $('sbb-video-result').innerHTML = '';
             return;
         }
-        sbbState.imageRows = helpers.initImageRowsFromScenes(scenes);
-        sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes);
+        const imagesPerScene = sbbReadVariantCount('sbb-images-per-scene', 4);
+        const videosPerScene = sbbReadVariantCount('sbb-videos-per-scene', 2);
+        sbbState.imageRows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene });
+        sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene });
         sbbRepaintAll();
+    }
+
+    function sbbReadVariantCount(elementId, fallback) {
+        const el = $(elementId);
+        const raw = el && el.value != null ? el.value : '';
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n > 0 && n <= 16) return n;
+        return fallback;
     }
 
     function sbbClear() {
@@ -1317,6 +1337,21 @@
             }
         }
         sbaState.autoLoginInFlight = true;
+        // PR-23: persist accounts.json BEFORE launching headful Puppeteer
+        // so auth:getSessionStatus reflects the configured count even if
+        // the user never clicked "Save accounts.json" first. Without this
+        // the session is captured in RAM but accounts.json stays empty,
+        // and the always-on banner / Account Manager state stay red.
+        try {
+            if (api.auth && typeof api.auth.saveAccounts === 'function') {
+                await api.auth.saveAccounts(payload);
+                sbaState.rows.forEach((r) => { r.password_dirty = false; });
+                sbaPushLog('info', `→ auth:saveAccounts persisted ${payload.length} row${payload.length === 1 ? '' : 's'} to accounts.json before login`);
+            }
+        } catch (e) {
+            sbaPushLog('error', 'auth:saveAccounts before auto-login failed: ' + (e && e.message ? e.message : String(e)));
+            // Continue anyway — setupAccounts can still succeed in RAM.
+        }
         sbaSetStatus(`Auto-login: launching headful Puppeteer for ${payload.length} account${payload.length === 1 ? '' : 's'}…`, 'info');
         sbaPushLog('info', `→ auth:setupAccounts (${payload.length} row${payload.length === 1 ? '' : 's'})`);
         try {
@@ -1376,6 +1411,7 @@
         sbbInstallListener();
         sbbState.imageRows = helpers.startBatchPhase(sbbState.imageRows);
         sbbState.currentImageBatchSceneIds = plan.sceneIds.slice();
+        sbbState.currentImageBatchRowIds = (plan.rowIds || plan.sceneIds).slice();
         sbbRepaintImage();
 
         const config = { imageGenerationCount: 1 };
@@ -1389,9 +1425,10 @@
             if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">image:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
             return;
         }
-        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'image');
+        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'image', plan.rowIds);
         for (const r of settled) {
-            sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.scene_id, r);
+            // PR-23: settle the variant row exactly (row_id) so siblings stay pending.
+            sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.row_id != null ? r.row_id : r.scene_id, r);
         }
         // Re-pair the video table now that some images settled —
         // I2V mode depends on having the latest image_path bindings.
@@ -1439,19 +1476,27 @@
         sbbInstallListener();
         // Mark eligible rows as generating, but also reflect any
         // skipped rows from the plan (e.g. I2V rows missing an image).
-        const eligibleSet = new Set(plan.sceneIds.map(String));
-        const skippedMap = new Map((plan.skipped || []).map((s) => [String(s.scene_id), s.reason]));
+        // PR-23: gate by row_id when the plan supplies it so variant 0
+        // can flip to `generating` while siblings remain pending.
+        const eligibleRowIdSet = new Set((plan.rowIds || []).map(String));
+        const eligibleSceneSet = new Set(plan.sceneIds.map(String));
+        const skippedRowMap = new Map(
+            (plan.skipped || []).map((s) => [String(s.row_id != null ? s.row_id : s.scene_id), s.reason])
+        );
         sbbState.videoRows = sbbState.videoRows.map((row) => {
+            const rid = String(row.row_id != null ? row.row_id : row.scene_id);
             const sid = String(row.scene_id);
-            if (eligibleSet.has(sid)) {
+            const eligible = plan.rowIds ? eligibleRowIdSet.has(rid) : eligibleSceneSet.has(sid);
+            if (eligible) {
                 return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
             }
-            if (skippedMap.has(sid)) {
-                return Object.assign({}, row, { status: 'skipped', reason: skippedMap.get(sid) });
+            if (skippedRowMap.has(rid)) {
+                return Object.assign({}, row, { status: 'skipped', reason: skippedRowMap.get(rid) });
             }
             return row;
         });
         sbbState.currentVideoBatchSceneIds = plan.sceneIds.slice();
+        sbbState.currentVideoBatchRowIds = (plan.rowIds || plan.sceneIds).slice();
         sbbRepaintVideo();
 
         let resp;
@@ -1480,10 +1525,10 @@
             }
             : null;
         const settled = validateFn && typeof helpers.mapBatchResponseAsync === 'function'
-            ? await helpers.mapBatchResponseAsync(resp, plan.sceneIds, 'video', { validateFn })
-            : helpers.mapBatchResponse(resp, plan.sceneIds, 'video');
+            ? await helpers.mapBatchResponseAsync(resp, plan.sceneIds, 'video', { validateFn, rowIds: plan.rowIds })
+            : helpers.mapBatchResponse(resp, plan.sceneIds, 'video', plan.rowIds);
         for (const r of settled) {
-            sbbState.videoRows = helpers.applyBatchResult(sbbState.videoRows, r.scene_id, r);
+            sbbState.videoRows = helpers.applyBatchResult(sbbState.videoRows, r.row_id != null ? r.row_id : r.scene_id, r);
         }
         sbbRepaintVideo();
         sbbResolveUrls(sbbState.videoRows, 'video').catch(() => {});

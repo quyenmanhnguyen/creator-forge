@@ -38,7 +38,7 @@ jobs:
         run: python -m compileall -q research
 
       - name: Pytest — API tests (must pass)
-        run: pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py research/tests/test_video_probe.py -v --no-header
+        run: pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py research/tests/test_video_probe.py research/tests/test_pixelle_tts_providers.py -v --no-header
 
       - name: Pytest — legacy tube-atlas tests (best-effort)
         run: |

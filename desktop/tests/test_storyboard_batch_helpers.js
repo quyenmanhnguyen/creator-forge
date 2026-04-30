@@ -286,6 +286,136 @@ test("PR-20E: mapBatchResponseAsync(image) does NOT invoke video validator (imag
     assert.strictEqual(out[0].image_path, "/x.png");
 });
 
+// PR-23 — variant rows + row_id-keyed dispatch.
+
+test("PR-23: initImageRowsFromScenes(scenes, {imagesPerScene:4}) expands each scene into 4 variant rows with unique row_id", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES, { imagesPerScene: 4 });
+    // 4 scenes × 4 variants = 16 rows.
+    assert.strictEqual(rows.length, 16);
+    // Variants share scene_id but row_id is unique.
+    const sceneOne = rows.filter((r) => r.scene_id === 1);
+    assert.strictEqual(sceneOne.length, 4);
+    const ids = new Set(rows.map((r) => r.row_id));
+    assert.strictEqual(ids.size, 16, "row_id collisions");
+    // variant_idx runs 0..N-1 within each scene.
+    assert.deepStrictEqual(sceneOne.map((r) => r.variant_idx), [0, 1, 2, 3]);
+    // Skipped scenes (no image_prompt) still expand into N skipped rows.
+    const sceneThree = rows.filter((r) => r.scene_id === 3);
+    assert.strictEqual(sceneThree.length, 4);
+    assert.ok(sceneThree.every((r) => r.status === "skipped"));
+});
+
+test("PR-23: initVideoRowsFromScenes(scenes, {videosPerScene:2}) expands per scene", () => {
+    const rows = helpers.initVideoRowsFromScenes(SCENES, { videosPerScene: 2 });
+    // 4 scenes × 2 = 8 rows.
+    assert.strictEqual(rows.length, 8);
+    const sceneTwo = rows.filter((r) => r.scene_id === 2);
+    assert.strictEqual(sceneTwo.length, 2);
+    // video_prompt precedence preserved across variants.
+    assert.ok(sceneTwo.every((r) => r.prompt === "v2"));
+    const ids = new Set(rows.map((r) => r.row_id));
+    assert.strictEqual(ids.size, 8);
+});
+
+test("PR-23: applyBatchProgress matches by row_id (no bleed across variants)", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES.slice(0, 2), { imagesPerScene: 3 });
+    let next = helpers.startBatchPhase(rows);
+    next = helpers.applyBatchProgress(next, "1#1", { progress: 50 });
+    const sceneOneVariants = next.filter((r) => r.scene_id === 1);
+    // Only variant 1 advanced. Variants 0 and 2 stay at 0.
+    assert.strictEqual(sceneOneVariants[0].progress, 0);
+    assert.strictEqual(sceneOneVariants[1].progress, 50);
+    assert.strictEqual(sceneOneVariants[2].progress, 0);
+});
+
+test("PR-23: applyBatchResult settles only the targeted variant row", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 4 });
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, "1#2", { status: "generated", image_path: "/v2.png" });
+    assert.strictEqual(rows[0].status, "generating");
+    assert.strictEqual(rows[1].status, "generating");
+    assert.strictEqual(rows[2].status, "generated");
+    assert.strictEqual(rows[2].image_path, "/v2.png");
+    assert.strictEqual(rows[3].status, "generating");
+});
+
+test("PR-23: applyBatchProgress falls back to scene_id broadcast when no row_id matches", () => {
+    // Legacy table — rows have row_id but the caller passes scene_id only.
+    const rows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 3 });
+    const started = helpers.startBatchPhase(rows);
+    // Pass the scene_id (which doesn't match any row_id directly) → all
+    // 3 variants of scene 1 should get the progress event.
+    const next = helpers.applyBatchProgress(started, "1", { progress: 25 });
+    assert.deepStrictEqual(next.map((r) => r.progress), [25, 25, 25]);
+});
+
+test("PR-23: planImageGenerate emits row_ids in lock-step with prompts", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES.slice(0, 2), { imagesPerScene: 2 });
+    const plan = helpers.planImageGenerate(rows);
+    assert.strictEqual(plan.prompts.length, 4); // 2 scenes × 2 variants
+    assert.strictEqual(plan.rowIds.length, 4);
+    assert.strictEqual(plan.sceneIds.length, 4);
+    assert.deepStrictEqual(plan.rowIds, ["1#0", "1#1", "2#0", "2#1"]);
+});
+
+test("PR-23: planVideoGenerate t2v + i2v emit row_ids and skipped rows carry row_id", () => {
+    // T2V — every row with a prompt is eligible (variants share prompt).
+    let rows = helpers.initVideoRowsFromScenes(SCENES, { videosPerScene: 2 });
+    let plan = helpers.planVideoGenerate(rows, "t2v");
+    assert.strictEqual(plan.rowIds.length, plan.prompts.length);
+    assert.ok(plan.skipped.every((s) => s.row_id != null));
+    // I2V — without paired image_path every variant is skipped with row_id set.
+    rows = helpers.initVideoRowsFromScenes(SCENES, { videosPerScene: 2 });
+    plan = helpers.planVideoGenerate(rows, "i2v");
+    assert.strictEqual(plan.items, plan.items); // shape ok
+    assert.ok(plan.skipped.every((s) => s.row_id != null));
+});
+
+test("PR-23: mapBatchResponse forwards row_id when rowIds[] is supplied", () => {
+    const sceneIds = [1, 1, 2, 2];
+    const rowIds = ["1#0", "1#1", "2#0", "2#1"];
+    const resp = {
+        success: true,
+        results: [
+            { savedFiles: ["/a.png"] },
+            { savedFiles: ["/b.png"] },
+            { error: "rate limit" },
+            { savedFiles: ["/d.png"] },
+        ],
+    };
+    const out = helpers.mapBatchResponse(resp, sceneIds, "image", rowIds);
+    assert.strictEqual(out.length, 4);
+    assert.deepStrictEqual(out.map((r) => r.row_id), rowIds);
+    assert.strictEqual(out[0].status, "generated");
+    assert.strictEqual(out[2].status, "fallback");
+});
+
+test("PR-23: pairImagePathsForI2V picks lowest variant_idx that settled per scene", () => {
+    // 1 scene × 3 image variants; only variant 1 settled.
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 3 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", {
+        status: "generated", image_path: "/img-v1.png",
+    });
+    // Now also settle variant 0 — pair should switch to variant 0
+    // (lowest variant_idx wins).
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 2 });
+    let paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v1.png");
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", {
+        status: "generated", image_path: "/img-v0.png",
+    });
+    paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v0.png");
+});
+
+test("PR-23: legacy initImageRowsFromScenes(scenes) (no opts) returns 1 row per scene with row_id set", () => {
+    const rows = helpers.initImageRowsFromScenes(SCENES);
+    assert.strictEqual(rows.length, 4); // one per scene
+    assert.ok(rows.every((r) => r.row_id != null));
+    // variant_idx is 0 across the board.
+    assert.ok(rows.every((r) => r.variant_idx === 0));
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

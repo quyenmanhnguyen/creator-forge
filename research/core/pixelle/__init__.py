@@ -82,7 +82,17 @@ from core.pixelle.subtitles import (
     group_word_boundaries,
     split_by_sentences,
 )
-from core.pixelle.tts import EdgeTTSAdapter, TTSAdapter, TTSResult, synthesize
+from core.pixelle.tts import (
+    DEFAULT_TTS_PROVIDER,
+    KNOWN_TTS_PROVIDERS,
+    EdgeTTSAdapter,
+    PiperTTSAdapter,
+    TTSAdapter,
+    TTSResult,
+    make_tts_adapter,
+    resolve_piper_voice_path,
+    synthesize,
+)
 from core.pixelle.visual_providers import (
     DEFAULT_PROVIDER_NAME,
     PROVIDER_NAMES,
@@ -117,7 +127,12 @@ __all__ = [
     "ComfyUIConfig",
     "ComfyUIVisualProvider",
     "ComposerOptions",
+    "DEFAULT_TTS_PROVIDER",
+    "KNOWN_TTS_PROVIDERS",
     "EdgeTTSAdapter",
+    "PiperTTSAdapter",
+    "make_tts_adapter",
+    "resolve_piper_voice_path",
     "GeminiImageProvider",
     "GoogleWhiskProvider",
     "GrokConfig",

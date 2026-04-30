@@ -962,6 +962,10 @@
                     fallback when automation fails (e.g. CAPTCHA / 2FA).
                 </div>
                 <div class="account-manager">
+                    <div id="sbb-login-banner" class="banner unknown">
+                        <span>Checking Grok session…</span>
+                        <button class="secondary" data-run="storyboard-batch-login">Open manual login</button>
+                    </div>
                     <h3>Configured accounts <span class="pill" id="sba-count">0</span></h3>
                     <div id="sba-rows" class="account-manager-rows"></div>
                     <div class="actions" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
@@ -986,9 +990,10 @@
                     them downstream. Persistent Grok session is reused — log in once via the
                     manual-login flow and cookies stay valid across app restarts (PR-11/12/13).
                 </div>
-                <div id="sbb-login-banner" class="banner unknown">
-                    <span>Checking Grok session…</span>
-                    <button class="secondary" data-run="storyboard-batch-login">Open manual login</button>
+                <div class="desc" style="margin-bottom:8px;">
+                    Login state lives in the <b>Grok accounts</b> panel above — add an
+                    account there and click <b>Auto-login (programmatic)</b> before
+                    generating.
                 </div>
                 <div class="form-grid">
                     <label>Aspect ratio (Grok image)
@@ -999,13 +1004,31 @@
                             <option value="16:9">16:9</option>
                         </select>
                     </label>
-                    <label>Output dir (blank = ~/.creator-forge/output/batch-&lt;ts&gt;/)
-                        <input id="sbb-output-dir" type="text" placeholder="auto" />
+                    <label title="Where to save mp4 / png assets. Leave blank to auto-create ~/.creator-forge/output/batch-<timestamp>/ on your machine.">Output folder (optional)
+                        <input id="sbb-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/batch-<timestamp>/" />
                     </label>
                     <label>Video mode
                         <select id="sbb-video-mode">
                             <option value="i2v">I2V (image-to-video; needs hero image)</option>
                             <option value="t2v">T2V (text-to-video; prompt-only)</option>
+                        </select>
+                    </label>
+                    <label title="Number of image variants to generate per scene. Defaults to 4 — pick the best afterwards.">Images per scene
+                        <select id="sbb-images-per-scene">
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                            <option value="4" selected>4 (default)</option>
+                            <option value="6">6</option>
+                            <option value="8">8</option>
+                        </select>
+                    </label>
+                    <label title="Number of video variants to generate per scene. Defaults to 2.">Videos per scene
+                        <select id="sbb-videos-per-scene">
+                            <option value="1">1</option>
+                            <option value="2" selected>2 (default)</option>
+                            <option value="3">3</option>
+                            <option value="4">4</option>
                         </select>
                     </label>
                 </div>
@@ -1040,8 +1063,18 @@
                     Edge-TTS voice + placeholder gradient background; AI per-scene visuals land in PR-A3+.
                 </div>
                 <div class="form-grid">
-                    <label>Voice
-                        <select id="ps-voice"><option value="en-US-AriaNeural">en-US-AriaNeural · Aria · F</option></select>
+                    <label title="Edge-TTS = online (Microsoft, free, requires internet). Piper-TTS = local / offline (~25MB per voice; install `pip install piper-tts` and place a voice .onnx under ~/.creator-forge/piper-voices/).">TTS provider
+                        <select id="ps-tts-provider">
+                            <option value="edge-tts" selected>edge-tts (online · default)</option>
+                            <option value="piper-tts">piper-tts (offline · local)</option>
+                        </select>
+                    </label>
+                    <label title="Voice id. For edge-tts: short name like en-US-AriaNeural. For piper-tts: short name like vi_VN-vais1000-medium (resolves to ~/.creator-forge/piper-voices/&lt;name&gt;.onnx) or absolute path to an .onnx file.">Voice
+                        <select id="ps-voice">
+                            <option value="en-US-AriaNeural">en-US-AriaNeural · Aria · F (edge-tts)</option>
+                            <option value="vi-VN-HoaiMyNeural">vi-VN-HoaiMyNeural · Hoài My · F (edge-tts)</option>
+                            <option value="vi_VN-vais1000-medium">vi_VN-vais1000-medium (piper-tts)</option>
+                        </select>
                     </label>
                     <label>Style
                         <select id="ps-style">
@@ -1052,8 +1085,8 @@
                             <option value="matcha">matcha</option>
                         </select>
                     </label>
-                    <label>Output dir (blank = ~/.creator-forge/output/short-&lt;ts&gt;/)
-                        <input id="ps-output-dir" type="text" placeholder="auto" />
+                    <label title="Where to save voice.mp3 / captions.srt / short.mp4. Leave blank to auto-create ~/.creator-forge/output/short-<timestamp>/ on your machine.">Output folder (optional)
+                        <input id="ps-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/short-<timestamp>/" />
                     </label>
                     <label class="checkbox-row">
                         <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
