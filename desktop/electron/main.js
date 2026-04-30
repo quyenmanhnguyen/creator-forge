@@ -675,8 +675,12 @@ ipcMain.handle('auth:clearSessions', async () => {
 // GROK_PROFILE_DIR env override). Caller may pass `profileDir` to override.
 ipcMain.handle('auth:openManualLogin', async (_, payload = {}) => {
     try {
+        // GROK_SESSIONS_DIR already incorporates the GROK_PROFILE_DIR env
+        // override (see desktop/src/config.js), so a separate env fallback
+        // here would skip the `/manual` subdir and collide with the
+        // per-email profile directories that setupAccount writes under
+        // SESSIONS_DIR (e.g. saved_sessions.json + Default/).
         const profileDir = payload.profileDir
-            || process.env.GROK_PROFILE_DIR
             || path.join(GROK_SESSIONS_DIR, 'manual');
         sendLog('info', `Opening manual Grok login (profile: ${profileDir})...`);
         const result = await browserOpenManualLogin({
