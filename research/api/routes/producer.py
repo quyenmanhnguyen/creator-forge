@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, field_validator
 from research.core import llm
 from research.core.pixelle import (
     DEFAULT_PROVIDER_NAME,
+    MAX_VARIANTS_PER_SCENE,
     SCENE_TEMPLATES,
     STYLES,
     TEMPLATE_KEYS,
@@ -48,6 +49,8 @@ from research.core.pixelle import (
     count_words,
     estimate_scene_count,
     estimate_total_duration_s,
+    expand_image_variants,
+    extract_visual_dna,
     fallback_captions_from_text,
     generate_scene_breakdown,
     group_word_boundaries,
@@ -112,6 +115,26 @@ class SceneBreakdownRequest(BaseModel):
     )
     words_per_minute: int = Field(150, ge=90, le=200)
     language: Literal["en", "ko", "ja", "vi"] = "en"
+    images_per_scene: int = Field(
+        1,
+        ge=1,
+        le=MAX_VARIANTS_PER_SCENE,
+        description=(
+            "PR-26 — number of varied image prompts to expand per scene. "
+            "When > 1, each scene gets an ``image_prompts`` list whose entries "
+            "differ on ≥2 of (composition, lighting, camera angle, detail focus) "
+            "and share the auto-extracted (or user-overridden) Visual DNA."
+        ),
+    )
+    visual_dna_override: str | None = Field(
+        None,
+        description=(
+            "PR-26 — user-supplied style anchor. When non-empty, skips the "
+            "auto-extract LLM call and is appended to every variant prompt. "
+            "When empty/None, the route extracts the Visual DNA from the script "
+            "and echoes it in the response so the user can review/override."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_template = field_validator("template_key", mode="before")(classmethod(lambda cls, v: _strip(v)))
@@ -133,6 +156,15 @@ class SceneOut(BaseModel):
     image_prompt: str
     flow_video_prompt: str
     duration_s: float = 0.0
+    image_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PR-26 — paste-ready variant list when ``images_per_scene > 1``. "
+            "Empty when only one prompt was requested. The legacy singular "
+            "``image_prompt`` always carries the first variant so callers "
+            "that don't know about variants keep working."
+        ),
+    )
 
 
 class SceneBreakdownResponse(BaseModel):
@@ -146,6 +178,18 @@ class SceneBreakdownResponse(BaseModel):
     total_duration_s_estimate: float
     scenes: list[SceneOut] = []
     md: str = ""
+    visual_dna: str = Field(
+        "",
+        description=(
+            "PR-26 — the style anchor used to expand variants. Either echoes "
+            "the request's ``visual_dna_override`` (when present) or the "
+            "auto-extracted summary derived from the script. Empty string when "
+            "the override was empty AND the auto-extract LLM call failed."
+        ),
+    )
+    images_per_scene: int = Field(
+        1, description="PR-26 — echoes the request's ``images_per_scene``."
+    )
     warnings: list[str] = []
     notes: str = ""
 
@@ -171,14 +215,33 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
 
     scenes_out: list[SceneOut] = []
     md_blob = ""
+    # Echo the user's override (if any) up front so the field stays
+    # populated even when the LLM pipeline fails entirely.
+    visual_dna_used = (req.visual_dna_override or "").strip()
+    chat_fn = _make_chat_fn()
+
+    # PR-26 — auto-extract Visual DNA in a separate LLM call only when
+    # there's no override AND the caller actually wants variants. For
+    # the legacy (``images_per_scene == 1``) path we skip the extra
+    # call so token cost / latency stays exactly where it was.
+    if not visual_dna_used and req.images_per_scene > 1:
+        try:
+            visual_dna_used = extract_visual_dna(script, chat_fn=chat_fn)
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            msg = _llm_warning("Visual DNA extraction", exc)
+            logger.warning(msg)
+            warnings.append(msg)
 
     try:
         scenes_raw: list[LongFormScene] = generate_scene_breakdown(
             script,
             template=template,
             n_scenes=n_scenes,
-            chat_fn=_make_chat_fn(),
+            chat_fn=chat_fn,
             words_per_minute=req.words_per_minute,
+            images_per_scene=req.images_per_scene,
+            visual_dna_override=visual_dna_used,
+            extract_dna=False,  # already handled above
         )
     except Exception as exc:  # noqa: BLE001 — boundary catch.
         msg = _llm_warning("Scene breakdown", exc)
@@ -196,6 +259,7 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
                     image_prompt=str(s.image_prompt),
                     flow_video_prompt=str(s.flow_video_prompt),
                     duration_s=float(s.duration_s or 0.0),
+                    image_prompts=list(s.image_prompts or ()),
                 )
             )
         md_blob = serialize_breakdown_md(scenes_raw, template=template)
@@ -224,8 +288,122 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
         total_duration_s_estimate=round(total_duration_estimate, 2),
         scenes=scenes_out,
         md=md_blob,
+        visual_dna=visual_dna_used,
+        images_per_scene=req.images_per_scene,
         warnings=warnings,
     )
+
+
+# ─── PR-26: Visual DNA + variant prompt endpoints ───────────────────────────
+
+
+class VisualDnaRequest(BaseModel):
+    """POST body for ``/producer/visual_dna``."""
+
+    script: str = Field(..., min_length=1, description="Long-form script (markdown OK).")
+
+    _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+
+class VisualDnaResponse(BaseModel):
+    visual_dna: str = ""
+    warnings: list[str] = []
+
+
+@router.post("/visual_dna", response_model=VisualDnaResponse)
+def visual_dna(req: VisualDnaRequest) -> VisualDnaResponse:
+    """PR-26 — extract the script's Visual DNA in a single LLM call.
+
+    Same robust-failure contract as :func:`scene_breakdown`: missing
+    ``DEEPSEEK_API_KEY`` → 200 with empty ``visual_dna`` and a
+    friendly warning, never 500.
+    """
+    warnings: list[str] = []
+    try:
+        dna = extract_visual_dna(req.script.strip(), chat_fn=_make_chat_fn())
+    except Exception as exc:  # noqa: BLE001
+        msg = _llm_warning("Visual DNA", exc)
+        logger.warning(msg)
+        warnings.append(msg)
+        dna = ""
+    return VisualDnaResponse(visual_dna=dna, warnings=warnings)
+
+
+class VariantPromptsSceneIn(BaseModel):
+    """Trimmed-down :class:`LongFormScene` shape accepted by the
+    variant-prompts endpoint. Only the fields needed for variant
+    expansion are required — ``narration`` is optional but boosts
+    LLM context when supplied."""
+
+    scene_id: int = 0
+    title: str = ""
+    narration: str = ""
+    image_prompt: str = Field(..., min_length=1)
+    flow_video_prompt: str = ""
+
+    _strip_image_prompt = field_validator("image_prompt", mode="before")(
+        classmethod(lambda cls, v: _strip(v))
+    )
+
+
+class VariantPromptsRequest(BaseModel):
+    """POST body for ``/producer/variant_prompts``."""
+
+    scene: VariantPromptsSceneIn
+    count: int = Field(
+        4,
+        ge=1,
+        le=MAX_VARIANTS_PER_SCENE,
+        description="How many varied prompts to emit (capped at MAX_VARIANTS_PER_SCENE).",
+    )
+    visual_dna: str = Field(
+        "",
+        description=(
+            "Style anchor appended verbatim to every variant. Pass the "
+            "value the user is editing in the Visual DNA field; the "
+            "endpoint won't auto-extract one for you here."
+        ),
+    )
+
+
+class VariantPromptsResponse(BaseModel):
+    prompts: list[str] = []
+    warnings: list[str] = []
+
+
+@router.post("/variant_prompts", response_model=VariantPromptsResponse)
+def variant_prompts(req: VariantPromptsRequest) -> VariantPromptsResponse:
+    """PR-26 — expand a single base scene prompt into ``count`` varied
+    paste-ready prompts.
+
+    Used by the renderer when the user re-rolls variants without
+    re-running scene_breakdown (e.g. after editing the Visual DNA
+    override or bumping ``images_per_scene``).
+    """
+    warnings: list[str] = []
+    scene = LongFormScene(
+        scene_id=int(req.scene.scene_id or 0),
+        title=req.scene.title or "",
+        narration=req.scene.narration or "",
+        image_prompt=req.scene.image_prompt,
+        flow_video_prompt=req.scene.flow_video_prompt or "",
+    )
+    try:
+        prompts = expand_image_variants(
+            scene,
+            count=req.count,
+            visual_dna=req.visual_dna or "",
+            chat_fn=_make_chat_fn(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        msg = _llm_warning("Variant prompts", exc)
+        logger.warning(msg)
+        warnings.append(msg)
+        # Degrade to repeating the base prompt so the caller still gets
+        # exactly ``count`` entries (mirrors expand_image_variants's
+        # in-process fallback path).
+        prompts = [req.scene.image_prompt] * req.count
+    return VariantPromptsResponse(prompts=prompts, warnings=warnings)
 
 
 # ─── Remaining shells (wired in later PRs) ──────────────────────────────────

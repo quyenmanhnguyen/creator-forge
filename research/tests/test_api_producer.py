@@ -141,7 +141,7 @@ def test_producer_strips_script_before_use(monkeypatch):
     after stripping must still flow through the orchestrator."""
     captured: dict[str, Any] = {}
 
-    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150):
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
         captured["script"] = script
         captured["n_scenes"] = n_scenes
         return [_scene(i) for i in range(1, 4)]
@@ -163,7 +163,7 @@ def test_producer_happy_path(monkeypatch):
     captured: dict[str, Any] = {}
     scenes = [_scene(i, dur=8.0) for i in range(1, 9)]
 
-    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150):
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
         captured.update(
             {
                 "template_key": template.key,
@@ -217,7 +217,7 @@ def test_producer_auto_estimates_n_scenes(monkeypatch):
     response's ``n_scenes_estimated`` field)."""
     captured: dict[str, Any] = {}
 
-    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150):
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
         captured["n_scenes_passed"] = n_scenes
         return [_scene(i) for i in range(1, (n_scenes or 3) + 1)]
 
@@ -235,7 +235,7 @@ def test_producer_default_template(monkeypatch):
     """No template_key in request → defaults to ``cinematic``."""
     captured: dict[str, Any] = {}
 
-    def fake_gen(script: str, *, template: SceneTemplate, n_scenes=None, chat_fn=None, words_per_minute=150):
+    def fake_gen(script: str, *, template: SceneTemplate, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
         captured["template_key"] = template.key
         return [_scene(i) for i in range(1, 4)]
 

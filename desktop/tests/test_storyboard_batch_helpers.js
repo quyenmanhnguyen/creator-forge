@@ -473,6 +473,90 @@ test("PR-24: formatVariantLabel falls back to '?' when scene_id is missing entir
     assert.strictEqual(lbl, "scene ?");
 });
 
+// ─── PR-26: per-variant image_prompts[] from the LLM expander ──────────
+
+test("PR-26: initImageRowsFromScenes consumes image_prompts[] when present", () => {
+    // /producer/scene_breakdown with images_per_scene=3 returns scenes
+    // carrying an `image_prompts` tuple. Each row must pick its variant
+    // entry instead of repeating the singular `image_prompt`.
+    const scenes = [
+        {
+            scene_id: 1,
+            title: "factory",
+            image_prompt: "Wide factory floor at dawn. (legacy fallback)",
+            image_prompts: [
+                "Aerial wide of the factory at dawn, anamorphic lens.",
+                "Macro close-up on rivets along the conveyor belt.",
+                "Low-angle hero shot of the foreman, sun behind.",
+            ],
+            duration_s: 5,
+        },
+    ];
+    const rows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene: 3 });
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].prompt, "Aerial wide of the factory at dawn, anamorphic lens.");
+    assert.strictEqual(rows[1].prompt, "Macro close-up on rivets along the conveyor belt.");
+    assert.strictEqual(rows[2].prompt, "Low-angle hero shot of the foreman, sun behind.");
+    // Status must be `pending` for all 3 (none of the variants are blank).
+    rows.forEach((r) => assert.strictEqual(r.status, "pending"));
+});
+
+test("PR-26: initImageRowsFromScenes falls back to image_prompt when image_prompts is shorter than imagesPerScene", () => {
+    // Asking for 4 variants but the LLM only returned 2 — the legacy
+    // singular field must fill the remainder so we don't end up with
+    // phantom blank rows that get marked as skipped.
+    const scenes = [
+        {
+            scene_id: 7,
+            title: "underflow",
+            image_prompt: "Fallback prompt body.",
+            image_prompts: ["Variant A.", "Variant B."],
+        },
+    ];
+    const rows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene: 4 });
+    assert.strictEqual(rows.length, 4);
+    assert.strictEqual(rows[0].prompt, "Variant A.");
+    assert.strictEqual(rows[1].prompt, "Variant B.");
+    // Variants 2 & 3 fall back to the singular field rather than being
+    // marked skipped.
+    assert.strictEqual(rows[2].prompt, "Fallback prompt body.");
+    assert.strictEqual(rows[3].prompt, "Fallback prompt body.");
+    rows.forEach((r) => assert.strictEqual(r.status, "pending"));
+});
+
+test("PR-26: initImageRowsFromScenes ignores empty/whitespace entries in image_prompts", () => {
+    const scenes = [
+        {
+            scene_id: 9,
+            image_prompt: "Singular prompt.",
+            image_prompts: ["", "   ", "Real variant."],
+        },
+    ];
+    const rows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene: 3 });
+    // Empty/whitespace variant entries fall back to the singular
+    // prompt instead of producing skipped rows.
+    assert.strictEqual(rows[0].prompt, "Singular prompt.");
+    assert.strictEqual(rows[1].prompt, "Singular prompt.");
+    assert.strictEqual(rows[2].prompt, "Real variant.");
+    rows.forEach((r) => assert.strictEqual(r.status, "pending"));
+});
+
+test("PR-26: legacy scenes without image_prompts behave identically (no regression)", () => {
+    // Same inputs as the PR-23 expansion test but no image_prompts
+    // tuple — must produce the same rows.length (2 scenes × 2 variants
+    // = 4) and repeat the singular prompt across all variants.
+    const scenes = [
+        { scene_id: 1, image_prompt: "p1", duration_s: 1 },
+        { scene_id: 2, image_prompt: "p2", duration_s: 1 },
+    ];
+    const rows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene: 2 });
+    assert.strictEqual(rows.length, 4);
+    assert.strictEqual(rows[0].prompt, "p1");
+    assert.strictEqual(rows[1].prompt, "p1");
+    assert.strictEqual(rows[2].prompt, "p2");
+    assert.strictEqual(rows[3].prompt, "p2");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {
