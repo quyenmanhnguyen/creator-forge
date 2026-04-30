@@ -672,33 +672,20 @@ ipcMain.handle('auth:getSessionStatus', async (_, params) => {
         if (params && typeof params === 'object' && typeof params.maxAgeMs === 'number') {
             opts.maxAgeMs = params.maxAgeMs;
         }
-        // PR-24: unify the accounts.json source-of-truth with
-        // ``auth:saveAccounts`` / ``auth:getAccounts`` (both rooted at
-        // ``app.getPath('userData')/accounts.json``). The legacy default
-        // path resolved through ``app.config.PATHS.ACCOUNTS_FILE``
-        // pointed at ``desktop/accounts.json`` in dev mode (``npm
-        // start``) which is NOT where the IPC writer lands, so
-        // ``getSessionStatus`` would keep returning ``no_accounts`` even
-        // right after a successful save+auto-login. We pass an explicit
-        // ``accountsLoader`` that reads the same file the writer wrote.
+        // PR-24/PR-25: unify the accounts.json source-of-truth with
+        // ``auth:saveAccounts`` / ``auth:getAccounts``. Path
+        // resolution now lives inside ``AccountService.loadAccounts``
+        // (which prefers ``app.getPath('userData')/accounts.json``
+        // when running inside Electron); we keep the explicit
+        // ``accountsLoader`` injection so a future refactor of
+        // AccountService can't silently regress the banner-sync fix
+        // again.
         opts.accountsLoader = () => {
-            const fs = require('fs');
-            const userDataPath = path.join(app.getPath('userData'), 'accounts.json');
             try {
-                if (fs.existsSync(userDataPath)) {
-                    const data = fs.readFileSync(userDataPath, 'utf8');
-                    const parsed = JSON.parse(data);
-                    return Array.isArray(parsed) ? parsed : [];
-                }
+                const accounts = AccountService.loadAccounts();
+                return Array.isArray(accounts) ? accounts : [];
             } catch (e) {
-                console.warn('[auth:getSessionStatus] userData accounts read failed:', e && e.message);
-            }
-            // Last-resort: fall back to the AccountService default so
-            // builds that DO ship accounts.json next to the binary keep
-            // working.
-            try {
-                return require('../src/services/AccountService').loadAccounts();
-            } catch {
+                console.warn('[auth:getSessionStatus] AccountService.loadAccounts failed:', e && e.message);
                 return [];
             }
         };
@@ -716,44 +703,29 @@ ipcMain.handle('auth:getSessionStatus', async (_, params) => {
     }
 });
 
+// PR-25: both IPC handlers delegate to AccountService so the path
+// resolution + bundled→userData migration stay in one place.
+// Previously this file inlined a near-duplicate copy that diverged
+// from AccountService (different indent, different fallback chain),
+// which is exactly how AuthService._doRelogin ended up reading from
+// ``desktop/accounts.json`` while the renderer wrote to
+// ``%APPDATA%/creator-forge/accounts.json``.
 ipcMain.handle('auth:getAccounts', async () => {
-    const fs = require('fs');
-
     try {
-        const userDataPath = path.join(app.getPath('userData'), 'accounts.json');
-
-        // If accounts.json exists in userData, use it
-        if (fs.existsSync(userDataPath)) {
-            const data = fs.readFileSync(userDataPath, 'utf8');
-            return JSON.parse(data);
-        }
-
-        // Migration: try to copy from bundled location (first run after update)
-        const bundledPath = path.join(__dirname, '..', 'accounts.json');
-        if (fs.existsSync(bundledPath)) {
-            const data = fs.readFileSync(bundledPath, 'utf8');
-            fs.writeFileSync(userDataPath, data, 'utf8');
-            console.log('[Auth] Migrated accounts.json to userData');
-            return JSON.parse(data);
-        }
-
-        return [];
+        const accounts = AccountService.loadAccounts();
+        return Array.isArray(accounts) ? accounts : [];
     } catch (error) {
-        console.error('Error loading accounts:', error);
+        console.error('[auth:getAccounts] load failed:', error);
         return [];
     }
 });
 
 ipcMain.handle('auth:saveAccounts', async (_, accounts) => {
-    const fs = require('fs');
-
     try {
-        const userDataPath = path.join(app.getPath('userData'), 'accounts.json');
-        fs.writeFileSync(userDataPath, JSON.stringify(accounts, null, 4), 'utf8');
-        console.log('[Auth] Saved accounts to:', userDataPath);
+        AccountService.saveAccounts(Array.isArray(accounts) ? accounts : []);
         return { success: true };
     } catch (error) {
-        console.error('Error saving accounts:', error);
+        console.error('[auth:saveAccounts] save failed:', error);
         throw error;
     }
 });

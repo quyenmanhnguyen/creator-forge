@@ -114,6 +114,10 @@ jobs:
           node desktop/tests/test_storyboard_login_banner_helpers.js
           node desktop/tests/test_storyboard_account_manager_helpers.js
           node desktop/tests/test_auth_service_keep_alive.js
+          # PR-25: AccountService userData path resolution + _doRelogin
+          # path-mismatch fix.
+          node desktop/tests/test_account_service_path.js
+          node desktop/tests/test_auth_service_relogin_path.js
 
       - name: Syntax check standalone E2E scripts
         run: |
