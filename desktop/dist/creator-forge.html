@@ -387,6 +387,46 @@
             font-size: 10px;
             margin-top: 2px;
         }
+        /* PR-20D — "Batch Image + Video" panel. Reuses .swc-table styles
+           for the per-scene tables; adds a section header / login
+           banner / button row that can sit between sections. */
+        .sbb-section {
+            margin-top: 12px;
+            padding-top: 8px;
+            border-top: 1px dashed var(--border);
+        }
+        .sbb-section-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 6px;
+        }
+        .sbb-section-head h3 {
+            margin: 0;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--accent2);
+        }
+        .sbb-section-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .banner {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 10px;
+            margin: 8px 0;
+            border-radius: 6px;
+            background: var(--bg-1);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            font-size: 12px;
+        }
+        .banner button {
+            margin-left: auto;
+        }
         .empty {
             color: var(--text-dim);
             font-size: 12px;
@@ -811,6 +851,65 @@
                 <div class="result" id="swc-result"></div>
             </div>
 
+            <div class="panel" data-form="storyboard-batch">
+                <h2>Batch Image + Video <span class="pill">image:generate · i2v:generate · video:generate</span></h2>
+                <div class="desc">
+                    KCRACKER-style two-table panel: auto-fills image_prompt + video_prompt from the
+                    scene_breakdown above, then lets you batch-generate Grok images and videos
+                    independently. Choose <b>I2V</b> (image-to-video, uses each scene's hero image) or
+                    <b>T2V</b> (text-to-video, prompt-only). Outputs go to the configured folder; this
+                    panel does <i>not</i> compose a 9:16 mp4 (use "Compose with AutoGrok" above for that).
+                    Persistent Grok session is reused — log in once via the manual-login flow and
+                    cookies stay valid across app restarts (PR-11/12/13).
+                </div>
+                <div id="sbb-login-banner" class="banner" hidden>
+                    <span>No active Grok session detected. Open the manual-login window to sign in;
+                    cookies will persist across app restarts.</span>
+                    <button class="secondary" data-run="storyboard-batch-login">Open manual login</button>
+                </div>
+                <div class="form-grid">
+                    <label>Aspect ratio (Grok image)
+                        <select id="sbb-aspect">
+                            <option value="">auto (1:1 default)</option>
+                            <option value="9:16">9:16</option>
+                            <option value="1:1">1:1</option>
+                            <option value="16:9">16:9</option>
+                        </select>
+                    </label>
+                    <label>Output dir (blank = ~/.creator-forge/output/batch-&lt;ts&gt;/)
+                        <input id="sbb-output-dir" type="text" placeholder="auto" />
+                    </label>
+                    <label>Video mode
+                        <select id="sbb-video-mode">
+                            <option value="i2v">I2V (image-to-video; needs hero image)</option>
+                            <option value="t2v">T2V (text-to-video; prompt-only)</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="storyboard-batch-fill">Auto-fill from scenes</button>
+                    <button class="secondary" data-run="storyboard-batch-clear">Clear</button>
+                </div>
+                <div class="sbb-section">
+                    <div class="sbb-section-head">
+                        <h3>Image batch</h3>
+                        <div class="sbb-section-actions">
+                            <button class="primary" data-run="storyboard-batch-image">Generate images</button>
+                        </div>
+                    </div>
+                    <div class="result" id="sbb-image-result"></div>
+                </div>
+                <div class="sbb-section">
+                    <div class="sbb-section-head">
+                        <h3>Video batch</h3>
+                        <div class="sbb-section-actions">
+                            <button class="primary" data-run="storyboard-batch-video">Generate videos</button>
+                        </div>
+                    </div>
+                    <div class="result" id="sbb-video-result"></div>
+                </div>
+            </div>
+
             <div class="panel" data-form="compose-short">
                 <h2>Compose short <span class="pill">/producer/short</span></h2>
                 <div class="desc">
@@ -851,6 +950,7 @@
     <script src="storyboard_compose_helpers.js"></script>
     <script src="storyboard_video_compose_helpers.js"></script>
     <script src="storyboard_compose_table_helpers.js"></script>
+    <script src="storyboard_batch_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>
