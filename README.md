@@ -440,6 +440,24 @@ The profile directory contains live cookies — **never commit it** and never
 paste cookie blobs into chat. `.gitignore` already covers `sessions/`,
 `grok-profile/`, and `desktop/{sessions,grok-profile}/`.
 
+#### Verifying the full AutoGrok image flow end-to-end
+A standalone Node harness (`scripts/e2e_autogrok_image.js`) drives a real
+Grok Imagine WebSocket call from your local machine — useful for
+verifying the PR-9 fixes (4-image batch + no blur) and PR-11 persistence
+without the full Electron app. See
+[docs/e2e-autogrok-image.md](docs/e2e-autogrok-image.md) for the
+walkthrough; tl;dr:
+
+```bash
+cd desktop && npm install && cd ..
+export GROK_PROFILE_DIR="$HOME/.creator-forge/grok-profile"
+GROK_EMAIL="you@example.com" node scripts/e2e_autogrok_image.js
+```
+
+The harness pops up a Chrome window for manual login on first run, then
+reuses the persisted cookies on every subsequent run. Output images go
+to `e2e-output/<timestamp>/` (gitignored).
+
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
 `{ prompts: object[], count, account }`, but the IPC handler

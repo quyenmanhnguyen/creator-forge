@@ -68,6 +68,8 @@ desktop/videos/
 desktop/i2v-videos/
 desktop/i2v-input/
 desktop/logs/
+# E2E AutoGrok image-generate harness output (scripts/e2e_autogrok_image.js).
+e2e-output/
 
 # --- IDE / OS ---
 .vscode/
