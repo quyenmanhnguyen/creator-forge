@@ -52,6 +52,11 @@ from research.core.pixelle import (
     make_short,
     serialize_breakdown_md,
 )
+from research.core.pixelle.video_probe import (
+    MIN_FINAL_MP4_BYTES,
+    MIN_USABLE_VIDEO_BYTES,
+    validate_video_output,
+)
 from research.core.pixelle.voices import VOICES, voice_short_names
 
 logger = logging.getLogger(__name__)
@@ -350,6 +355,7 @@ class ShortResponse(BaseModel):
 # fakes without touching ``research.core.pixelle``.
 _tts_adapter_factory = EdgeTTSAdapter
 _make_short = make_short
+_validate_video_output = validate_video_output
 
 
 @router.post("/short", response_model=ShortResponse)
@@ -451,6 +457,7 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     # :func:`research.core.pixelle.composer.make_short`.
     resolved_video_scene_assets: list[VideoSceneAsset] = []
     videos_missing = 0
+    ffprobe_fallback_warned = False
     for spec in req.video_scene_assets or []:
         p = Path(spec.video_path).expanduser()
         if not p.exists():
@@ -466,6 +473,27 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 f"Video scene asset skipped (not a regular file): {spec.video_path}"
             )
             continue
+        # Probe the asset before handing it to make_short — a tiny /
+        # truncated mp4 (the I2V download layer's 1KB floor lets these
+        # through) would either render as a black hole inside the final
+        # short or crash moviepy mid-compose. We drop the asset, count
+        # it as missing, and surface the reason so the renderer can
+        # show why the scene fell back to its image clip.
+        check = _validate_video_output(p, min_bytes=MIN_USABLE_VIDEO_BYTES)
+        if not check.ok:
+            videos_missing += 1
+            warnings.append(
+                f"Video scene asset skipped (validation failed): {spec.video_path} "
+                f"— {check.reason or 'unknown'}"
+            )
+            continue
+        if not check.ffprobe_available and not ffprobe_fallback_warned:
+            ffprobe_fallback_warned = True
+            warnings.append(
+                "ffprobe is not on PATH — video scene assets validated by "
+                "size only. Install ffprobe (or set FFPROBE_PATH) to enable "
+                "duration/stream checks."
+            )
         resolved_video_scene_assets.append(
             VideoSceneAsset(
                 video_path=p,
@@ -542,7 +570,27 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 scene_assets=resolved_scene_assets or None,
                 video_scene_assets=resolved_video_scene_assets or None,
             )
-            composed_ok = mp4_path.exists()
+            # Previously: ``composed_ok = mp4_path.exists()`` — that
+            # accepts a 0-byte stub if moviepy crashed mid-write. Run the
+            # same probe we use on inputs so a tiny / corrupt /
+            # zero-stream final mp4 surfaces as a warning + an empty
+            # ``mp4_path`` instead of being reported as a successful
+            # render.
+            final_check = _validate_video_output(
+                mp4_path, min_bytes=MIN_FINAL_MP4_BYTES
+            )
+            composed_ok = bool(final_check.ok)
+            if not composed_ok and mp4_path.exists():
+                warnings.append(
+                    f"Composed mp4 failed validation: {final_check.reason or 'unknown'}"
+                )
+            elif composed_ok and not final_check.ffprobe_available and not ffprobe_fallback_warned:
+                ffprobe_fallback_warned = True
+                warnings.append(
+                    "ffprobe is not on PATH — composed mp4 validated by size "
+                    "only. Install ffprobe (or set FFPROBE_PATH) to enable "
+                    "duration/stream checks."
+                )
         except Exception as exc:  # noqa: BLE001
             msg = f"Compose failed: {type(exc).__name__}: {exc}"
             logger.warning(msg)

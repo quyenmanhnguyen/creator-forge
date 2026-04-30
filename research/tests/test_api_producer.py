@@ -20,9 +20,44 @@ from research.core import llm
 from research.core.pixelle.scene_breakdown import LongFormScene, SceneTemplate
 from research.core.pixelle.subtitles import WordBoundary
 from research.core.pixelle.tts import TTSResult
+from research.core.pixelle.video_probe import VideoValidateResult
 
 app = create_app()
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _bypass_video_validation(monkeypatch):
+    """Default all /producer/short tests to "validation passes".
+
+    PR-20E wires ``validate_video_output`` into both the
+    ``video_scene_assets[]`` input loop and the final ``short.mp4``
+    check. The fake ``_make_short`` used throughout this file writes
+    tiny stub mp4s that would otherwise fail the 10 KB byte floor (and
+    the ffprobe step, when ffprobe is installed on the runner). We
+    replace ``_validate_video_output`` with a no-op that always
+    returns an "ok" result so unrelated tests keep passing; the
+    dedicated PR-20E tests below opt out with their own monkeypatches.
+    """
+    def _always_ok(file_path, *, min_bytes=0, min_duration_sec=0.0):
+        size = 0
+        try:
+            size = Path(file_path).stat().st_size
+        except OSError:
+            pass
+        return VideoValidateResult(
+            ok=True,
+            exists=True,
+            size=size,
+            ffprobe_available=True,
+            duration_sec=3.0,
+            has_video_stream=True,
+            width=720,
+            height=1280,
+            codec="h264",
+            reason=None,
+        )
+    monkeypatch.setattr(producer_route, "_validate_video_output", _always_ok)
 
 
 SAMPLE_SCRIPT = (
@@ -1071,3 +1106,137 @@ def test_short_rejects_invalid_video_scene_asset_timings():
         },
     )
     assert r.status_code == 422, r.text
+
+
+# ─── PR-20E: ffprobe-backed video validation ───────────────────────────────
+
+def test_short_drops_video_scene_asset_when_validator_says_not_ok(monkeypatch, tmp_path):
+    """A video_scene_assets entry that exists on disk but fails
+    ``_validate_video_output`` (truncated mp4, no video stream, etc.)
+    must be dropped from the composer payload with a validation-failed
+    warning and counted in ``videos_missing`` — it must NOT silently
+    render as a corrupt segment inside the final short.
+    """
+    captured: dict[str, Any] = {}
+
+    v_bad = tmp_path / "bad.mp4"
+    v_good = tmp_path / "good.mp4"
+    v_bad.write_bytes(b"\x00" * 1024)
+    v_good.write_bytes(b"\x00" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    def selective_validator(file_path, *, min_bytes=0, min_duration_sec=0.0):
+        p = Path(file_path)
+        if p.name == "bad.mp4":
+            return VideoValidateResult(
+                ok=False, exists=True, size=1024, ffprobe_available=True,
+                has_video_stream=False, reason="no video stream",
+            )
+        return VideoValidateResult(
+            ok=True, exists=True, size=1024, ffprobe_available=True,
+            has_video_stream=True, duration_sec=2.0,
+        )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+    monkeypatch.setattr(producer_route, "_validate_video_output", selective_validator)
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(tmp_path / "out_pr20e_drop"),
+            "video_scene_assets": [
+                {"video_path": str(v_bad), "start_s": 0.0, "duration_s": 2.0},
+                {"video_path": str(v_good), "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["videos_used"] == 1
+    assert body["videos_missing"] == 1
+    assert any("validation failed" in w and "bad.mp4" in w for w in body["warnings"])
+    vassets = captured["video_scene_assets"]
+    assert vassets is not None and len(vassets) == 1
+    assert vassets[0].video_path == v_good
+
+
+def test_short_final_mp4_fails_validation_returns_empty_mp4_path(monkeypatch, tmp_path):
+    """If ``_make_short`` writes a file but it fails validation (e.g.
+    moviepy crashed mid-write leaving a 0-byte stub, or ffprobe says
+    no video stream), the response must drop ``mp4_path`` back to ``""``
+    so the renderer doesn't show a "generated" mp4 that won't play. A
+    warning surfaces the reason. Audio / captions survive — this is
+    the allow_partial contract from earlier PRs.
+    """
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        Path(output_path).write_bytes(b"")  # 0-byte stub
+        return Path(output_path)
+
+    def rejecting_validator(file_path, *, min_bytes=0, min_duration_sec=0.0):
+        return VideoValidateResult(
+            ok=False, exists=True, size=0, ffprobe_available=True,
+            has_video_stream=False, reason="composed mp4 is 0 bytes",
+        )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+    monkeypatch.setattr(producer_route, "_validate_video_output", rejecting_validator)
+
+    r = client.post(
+        "/producer/short",
+        json={"script": SHORT_SCRIPT, "output_dir": str(tmp_path / "out_pr20e_final")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mp4_path"] == ""
+    assert any("failed validation" in w for w in body["warnings"])
+    # Audio still present (allow_partial).
+    assert body["audio_path"].endswith("voice.mp3")
+
+
+def test_short_ffprobe_missing_surfaces_single_warning(monkeypatch, tmp_path):
+    """When ffprobe isn't installed, validation soft-passes with
+    ``ffprobe_available=False`` and the route surfaces a SINGLE
+    warning (not one per asset + one for output) so the UI doesn't
+    spam.
+    """
+    v = tmp_path / "v.mp4"
+    v.write_bytes(b"\x00" * 20_000)
+
+    def fake_compose(audio_path, output_path, **_kwargs):
+        Path(output_path).write_bytes(b"\x00" * 20_000)
+        return Path(output_path)
+
+    def size_only_validator(file_path, *, min_bytes=0, min_duration_sec=0.0):
+        return VideoValidateResult(
+            ok=True, exists=True, size=20_000, ffprobe_available=False,
+            reason="ffprobe unavailable on this machine — fell back to exists+size check",
+        )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+    monkeypatch.setattr(producer_route, "_validate_video_output", size_only_validator)
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(tmp_path / "out_pr20e_noffprobe"),
+            "video_scene_assets": [
+                {"video_path": str(v), "start_s": 0.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    ffprobe_warnings = [w for w in body["warnings"] if "ffprobe is not on PATH" in w]
+    assert len(ffprobe_warnings) == 1, f"expected one ffprobe-missing warning, got {ffprobe_warnings}"
+    assert body["videos_used"] == 1

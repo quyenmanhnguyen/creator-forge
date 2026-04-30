@@ -238,17 +238,67 @@ test("immutability: helpers never mutate input arrays/objects", () => {
     assert.strictEqual(JSON.stringify(rows), snap, "input rows must not be mutated");
 });
 
+// ── PR-20E: mapBatchResponseAsync with ffprobe-backed validator ──────
+test("PR-20E: mapBatchResponseAsync(video) with no validator falls back to sync mapping", async () => {
+    const resp = { success: true, results: [{ success: true, videoPath: "/a.mp4" }, { success: false, error: "nope" }] };
+    const out = await helpers.mapBatchResponseAsync(resp, ["s1", "s2"], "video", {});
+    assert.strictEqual(out[0].status, "generated");
+    assert.strictEqual(out[0].video_path, "/a.mp4");
+    assert.strictEqual(out[1].status, "fallback");
+});
+
+test("PR-20E: mapBatchResponseAsync(video) flips generated→fallback when validator says !ok", async () => {
+    const resp = { success: true, results: [{ success: true, videoPath: "/bad.mp4" }, { success: true, videoPath: "/good.mp4" }] };
+    const validateFn = async (fp) => fp === "/bad.mp4"
+        ? { ok: false, reason: "no video stream", ffprobeAvailable: true }
+        : { ok: true, size: 250_000, ffprobeAvailable: true };
+    const out = await helpers.mapBatchResponseAsync(resp, ["s1", "s2"], "video", { validateFn });
+    assert.strictEqual(out[0].status, "fallback");
+    assert.match(out[0].reason, /no video stream/);
+    assert.strictEqual(out[1].status, "generated");
+    assert.strictEqual(out[1].bytes, 250_000);
+    assert.notStrictEqual(out[1].size_only, true);
+});
+
+test("PR-20E: mapBatchResponseAsync(video) marks size_only when ffprobe unavailable but ok", async () => {
+    const resp = { success: true, results: [{ success: true, videoPath: "/x.mp4" }] };
+    const validateFn = async () => ({ ok: true, ffprobeAvailable: false, reason: "ffprobe unavailable" });
+    const out = await helpers.mapBatchResponseAsync(resp, ["s1"], "video", { validateFn });
+    assert.strictEqual(out[0].status, "generated");
+    assert.strictEqual(out[0].size_only, true);
+});
+
+test("PR-20E: mapBatchResponseAsync(video) validator throw → fallback with threw reason", async () => {
+    const resp = { success: true, results: [{ success: true, videoPath: "/a.mp4" }] };
+    const validateFn = async () => { throw new Error("boom"); };
+    const out = await helpers.mapBatchResponseAsync(resp, ["s1"], "video", { validateFn });
+    assert.strictEqual(out[0].status, "fallback");
+    assert.match(out[0].reason, /validator threw: boom/);
+});
+
+test("PR-20E: mapBatchResponseAsync(image) does NOT invoke video validator (images are not ffprobed)", async () => {
+    let called = 0;
+    const resp = { success: true, results: [{ savedFiles: ["/x.png"] }] };
+    const validateFn = async () => { called += 1; return { ok: true }; };
+    const out = await helpers.mapBatchResponseAsync(resp, ["s1"], "image", { validateFn });
+    assert.strictEqual(called, 0);
+    assert.strictEqual(out[0].status, "generated");
+    assert.strictEqual(out[0].image_path, "/x.png");
+});
+
 let pass = 0;
 let fail = 0;
-for (const t of tests) {
-    try {
-        t.fn();
-        console.log(`  ok  ${t.name}`);
-        pass++;
-    } catch (e) {
-        console.log(`  FAIL  ${t.name}\n    ${e && e.message}`);
-        fail++;
+(async () => {
+    for (const t of tests) {
+        try {
+            await t.fn();
+            console.log(`  ok  ${t.name}`);
+            pass++;
+        } catch (e) {
+            console.log(`  FAIL  ${t.name}\n    ${e && e.message}`);
+            fail++;
+        }
     }
-}
-console.log(`\n${fail === 0 ? "PASSED" : "FAILED"} ${pass} / ${pass + fail} test(s)`);
-process.exit(fail === 0 ? 0 : 1);
+    console.log(`\n${fail === 0 ? "PASSED" : "FAILED"} ${pass} / ${pass + fail} test(s)`);
+    process.exit(fail === 0 ? 0 : 1);
+})();

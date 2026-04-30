@@ -5,6 +5,7 @@ const { API_ENDPOINTS, MODEL_CONFIG, I2V_CONFIG, PROCESSING_CONFIG, PATHS } = re
 const FileService = require('./FileService');
 const AuthService = require('./AuthService');
 const path = require('path');
+const { validateVideoOutput, MIN_USABLE_VIDEO_BYTES } = require('../../dist/video_validation_helpers');
 
 class I2VService {
     constructor() {
@@ -407,10 +408,25 @@ class I2VService {
 
                     const size = fs.statSync(tmpPath).size;
                     if (size > 1000) {
+                        // Probe the temp file before promoting it to the final
+                        // path. ffprobe catches a chunked-truncated mp4 (one
+                        // where the moov atom never landed) that the byte
+                        // floor of 1KB would otherwise let through. When
+                        // ffprobe isn't installed the helper degrades to
+                        // exists+size and we keep the legacy contract.
+                        const check = await validateVideoOutput(tmpPath, { minBytes: MIN_USABLE_VIDEO_BYTES });
+                        if (!check.ok) {
+                            try { fs.unlinkSync(tmpPath); } catch (_) {}
+                            console.log(`[I2VService] Download rejected by validator: ${check.reason}`);
+                            return null;
+                        }
+                        if (!check.ffprobeAvailable) {
+                            console.log('[I2VService] ffprobe unavailable — accepted on size-only fallback.');
+                        }
                         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
                         fs.renameSync(tmpPath, filePath);
                         console.log(`[I2VService] Saved stream: ${filePath}`);
-                        return { path: filePath, size };
+                        return { path: filePath, size, validation: check };
                     }
                     fs.unlinkSync(tmpPath);
                 }

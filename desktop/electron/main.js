@@ -345,6 +345,7 @@ const VideoService = require('../src/services/VideoService');
 const I2VService = require('../src/services/I2VService');
 const RefImageService = require('../src/services/RefImageService');
 const LicenseService = require('../src/services/LicenseService');
+const VideoValidation = require('../dist/video_validation_helpers');
 const { openManualLogin: browserOpenManualLogin } = require('../src/browser');
 const { SESSIONS_DIR: GROK_SESSIONS_DIR } = require('../src/config');
 
@@ -528,6 +529,35 @@ ipcMain.handle('file:statBytes', async (_, filePath) => {
     }
 });
 
+// PR-20E: ffprobe-backed validation for I2V/T2V/composer mp4 outputs.
+// Renderer-side helpers (Compose with AutoGrok / Batch Image+Video)
+// hand the path here and trust `{ ok, reason, ... }` to decide whether
+// a row should be marked `generated` or `fallback`. Failure modes
+// (missing ffprobe, missing file, truncated mp4) come back as a clean
+// `{ ok: false }` — we never throw.
+ipcMain.handle('video:validateOutput', async (_, params) => {
+    try {
+        const filePath = (params && typeof params === 'object') ? params.filePath : params;
+        if (!filePath) {
+            return { ok: false, exists: false, size: 0, ffprobeAvailable: false, reason: 'empty filePath' };
+        }
+        const opts = {};
+        if (params && typeof params === 'object') {
+            if (typeof params.minBytes === 'number') opts.minBytes = params.minBytes;
+            if (typeof params.minDurationSec === 'number') opts.minDurationSec = params.minDurationSec;
+        }
+        return await VideoValidation.validateVideoOutput(filePath, opts);
+    } catch (error) {
+        return {
+            ok: false,
+            exists: false,
+            size: 0,
+            ffprobeAvailable: false,
+            reason: `validateVideoOutput threw: ${(error && error.message) || error}`,
+        };
+    }
+});
+
 ipcMain.handle('account:importTxt', async () => {
     try {
         const result = await dialog.showOpenDialog(mainWindow, {
@@ -605,6 +635,32 @@ ipcMain.handle('account:remove', async (_, email) => {
         return { success: true };
     } catch (error) {
         return { success: false, error: error.message };
+    }
+});
+
+// PR-20E: structured session-state snapshot. The legacy banner only
+// knew "accounts.json non-empty?" — this IPC also folds in the live
+// session map so the renderer can distinguish no_accounts / stale /
+// ready / unknown without leaking cookies or headers across the
+// boundary (see AuthService.getSessionStatus for the safe-shape
+// contract).
+ipcMain.handle('auth:getSessionStatus', async (_, params) => {
+    try {
+        const opts = (params && typeof params === 'object') ? {} : {};
+        if (params && typeof params === 'object' && typeof params.maxAgeMs === 'number') {
+            opts.maxAgeMs = params.maxAgeMs;
+        }
+        return AuthService.getSessionStatus(opts);
+    } catch (error) {
+        return {
+            status: 'unknown',
+            reason: `getSessionStatus threw: ${(error && error.message) || error}`,
+            accounts: [],
+            ready_count: 0,
+            stale_count: 0,
+            configured_count: 0,
+            max_age_ms: 60 * 60 * 1000,
+        };
     }
 });
 

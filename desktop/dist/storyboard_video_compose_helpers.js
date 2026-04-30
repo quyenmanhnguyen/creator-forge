@@ -150,19 +150,32 @@
      * disk. Returns ``{ chosen, reason }`` mirroring
      * :func:`pickFirstUsableSavedFile` from the image helpers.
      *
-     * Validation: ``result.savedFile`` must be a non-empty string AND
-     * ``statBytesFn(savedFile)`` must report ``size >= minBytes``.
-     * ``result.success === false`` short-circuits without a stat call
-     * (the IPC handler already knows the download / generation failed).
+     * Validation:
+     *   1. ``result.savedFile`` must be a non-empty string AND
+     *      ``statBytesFn(savedFile)`` must report ``size >= minBytes``
+     *      (legacy contract — kept for back-compat).
+     *   2. PR-20E: when an optional ``opts.validateFn(filePath, minBytes)``
+     *      is provided, the result is also passed through ffprobe-backed
+     *      validation; ``{ ok:false }`` from validateFn maps to
+     *      ``chosen:null`` with the validator's ``reason`` so a
+     *      truncated/invalid mp4 (size ≥ minBytes but no video stream)
+     *      doesn't slip into ``video_scene_assets[]``.
+     *
+     * ``result.success === false`` short-circuits without any I/O —
+     * the IPC handler already knows the download / generation failed.
      *
      * @param {object|null} result
      * @param {(path:string)=>Promise<{exists:boolean,size:number}|null>} statBytesFn
-     * @param {{ minBytes?:number }} [opts]
-     * @returns {Promise<{ chosen: { filePath:string, bytes:number }|null,
+     * @param {{
+     *   minBytes?:number,
+     *   validateFn?:(filePath:string, minBytes:number)=>Promise<{ok:boolean,reason?:string,ffprobeAvailable?:boolean}>,
+     * }} [opts]
+     * @returns {Promise<{ chosen: { filePath:string, bytes:number, validation?:object }|null,
      *                     reason: string|null }>}
      */
     async function pickI2VOutputFile(result, statBytesFn, opts = {}) {
         const minBytes = typeof opts.minBytes === 'number' ? opts.minBytes : MIN_USABLE_VIDEO_BYTES;
+        const validateFn = typeof opts.validateFn === 'function' ? opts.validateFn : null;
         if (!result) {
             return { chosen: null, reason: 'i2v:generate returned no result for this job' };
         }
@@ -188,6 +201,21 @@
         const bytes = typeof st.size === 'number' ? st.size : 0;
         if (bytes < minBytes) {
             return { chosen: null, reason: `savedFile is suspiciously small (${bytes} < ${minBytes} bytes — likely truncated download)` };
+        }
+        if (validateFn) {
+            let validation = null;
+            try {
+                validation = await validateFn(filePath, minBytes);
+            } catch (err) {
+                return { chosen: null, reason: `validateFn threw: ${(err && err.message) || err}` };
+            }
+            if (!validation || validation.ok !== true) {
+                const reason = (validation && typeof validation.reason === 'string' && validation.reason)
+                    ? validation.reason
+                    : 'video failed ffprobe validation';
+                return { chosen: null, reason };
+            }
+            return { chosen: { filePath, bytes, validation }, reason: null };
         }
         return { chosen: { filePath, bytes }, reason: null };
     }
@@ -229,6 +257,7 @@
         const list = Array.isArray(jobs) ? jobs : [];
         const maxAttempts = Math.max(1, Number(opts.maxAttempts) || 2);
         const minBytes = typeof opts.minBytes === 'number' ? opts.minBytes : MIN_USABLE_VIDEO_BYTES;
+        const validateFn = typeof opts.validateFn === 'function' ? opts.validateFn : null;
 
         // Per-job state tracker — lives across attempts so we don't
         // re-issue items for jobs that already produced a usable mp4.
@@ -274,7 +303,7 @@
             for (let k = 0; k < pending.length; k++) {
                 pending[k].st.attempts = attempt;
                 const result = grouped.get(k) || null;
-                const pick = await pickI2VOutputFile(result, statBytesFn, { minBytes });
+                const pick = await pickI2VOutputFile(result, statBytesFn, { minBytes, validateFn });
                 if (pick.chosen) {
                     pending[k].st.status = attempt === 1 ? 'generated' : 'retried';
                     pending[k].st.video_path = pick.chosen.filePath;

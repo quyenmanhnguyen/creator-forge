@@ -233,6 +233,12 @@
      * The shapes differ slightly so we accept either via a `kind`
      * argument and route accordingly.
      *
+     * **Synchronous** variant — kept for back-compat. The caller gets
+     * every `kind === "video"` row marked `generated` as long as the
+     * IPC said `success: true`, which is the looser behavior that
+     * pre-PR-20E let tiny/invalid mp4s through. For new code, prefer
+     * `mapBatchResponseAsync` with a validator.
+     *
      * @param {Object} resp - IPC response
      * @param {Array} sceneIds - scene_id ordering used in the request
      * @param {"image"|"video"} kind
@@ -291,6 +297,66 @@
     }
 
     /**
+     * PR-20E — async counterpart that runs every successful video row
+     * through an injected ffprobe-backed validator. Failure modes:
+     *
+     *   - missing file / truncated download / no video stream → `fallback`
+     *     with the validator's `reason` copied in.
+     *   - validator throws                                   → `fallback`
+     *     with `"validator threw: <msg>"`.
+     *   - validator returns `{ ok:true, ffprobeAvailable:false }` → row
+     *     is marked `generated` with a `size_only: true` hint (size
+     *     floor already passed at the service layer); renderer can show
+     *     a tooltip.
+     *
+     * Image rows are unchanged — we don't ffprobe images.
+     *
+     * @param {Object} resp
+     * @param {Array} sceneIds
+     * @param {"image"|"video"} kind
+     * @param {{
+     *   validateFn?: (filePath:string)=>Promise<{ok:boolean,reason?:string,size?:number,ffprobeAvailable?:boolean}>,
+     * }} [opts]
+     */
+    async function mapBatchResponseAsync(resp, sceneIds, kind, opts) {
+        const o = opts || {};
+        const validateFn = (kind === "video" && typeof o.validateFn === "function") ? o.validateFn : null;
+        // When no validator is supplied, behavior matches the sync
+        // variant — callers that don't care about ffprobe keep working.
+        if (!validateFn) return mapBatchResponse(resp, sceneIds, kind);
+        const base = mapBatchResponse(resp, sceneIds, kind);
+        const out = [];
+        for (const row of base) {
+            if (row.status !== "generated" || !row.video_path) {
+                out.push(row);
+                continue;
+            }
+            let check = null;
+            try {
+                check = await validateFn(row.video_path);
+            } catch (err) {
+                out.push(Object.assign({}, row, {
+                    status: "fallback",
+                    reason: `validator threw: ${(err && err.message) || err}`,
+                }));
+                continue;
+            }
+            if (!check || check.ok !== true) {
+                out.push(Object.assign({}, row, {
+                    status: "fallback",
+                    reason: (check && typeof check.reason === "string" && check.reason) || "video failed ffprobe validation",
+                }));
+                continue;
+            }
+            const next = Object.assign({}, row);
+            if (typeof check.size === "number" && check.size > 0) next.bytes = check.size;
+            if (check.ffprobeAvailable === false) next.size_only = true;
+            out.push(next);
+        }
+        return out;
+    }
+
+    /**
      * Aggregate counters for the panel header. Returns counts of each
      * status so the UI can show "5 generated, 1 fallback, 2 skipped"
      * style summaries without iterating the rows in the renderer.
@@ -339,6 +405,7 @@
         planImageGenerate,
         planVideoGenerate,
         mapBatchResponse,
+        mapBatchResponseAsync,
         summarizeRows,
         statusLabel,
         statusClass,

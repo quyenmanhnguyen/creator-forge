@@ -39,6 +39,11 @@ class StoryboardBridge {
         this.producer = electronAPI.producer;
         this.i2v = electronAPI.i2v;
         this.refimg = electronAPI.refimg;
+        // PR-20E: ffprobe-backed validator. ``electronAPI.video.validateOutput``
+        // is registered by preload.js; when it's not exposed (older
+        // preload, unit tests with a partial mock) we leave this null
+        // and pickI2VOutputFile falls back to size-only checks.
+        this.video = electronAPI.video || null;
     }
 
     /**
@@ -485,12 +490,30 @@ class StoryboardBridge {
         let i2vFirstResp = null;
         let videoMaxAttempts = Math.max(1, Number(max_attempts_i2v) || 2);
 
+        // PR-20E: hand the orchestrator an ffprobe-backed validator so
+        // downloads that passed the service's size floor but aren't
+        // actually playable mp4s (truncated moov, HTML error body with
+        // an mp4 extension, codec_type missing) get marked as fallback
+        // instead of going into video_scene_assets[]. When the
+        // electronAPI.video.validateOutput IPC isn't available
+        // (legacy preload or partial test mocks) the orchestrator falls
+        // back to size-only checks — behavior-preserving.
+        const validateFn = (this.video && typeof this.video.validateOutput === 'function')
+            ? async (filePath, minBytes) => {
+                try {
+                    return await this.video.validateOutput({ filePath, minBytes });
+                } catch (err) {
+                    return { ok: false, reason: `validateOutput IPC threw: ${(err && err.message) || err}` };
+                }
+            }
+            : null;
+
         if (jobs.length > 0) {
             const videoOrchestration = await videoComposeHelpers.orchestrateI2VWithRetries(
                 jobs,
                 i2vGenerateFn,
                 statBytesAsync,
-                { maxAttempts: max_attempts_i2v, minBytes: MIN_USABLE_VIDEO_BYTES },
+                { maxAttempts: max_attempts_i2v, minBytes: MIN_USABLE_VIDEO_BYTES, validateFn },
             );
             videoSceneAssets = videoOrchestration.videoSceneAssets;
             videoPerSceneStatus = videoOrchestration.perSceneStatus;

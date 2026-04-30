@@ -1497,18 +1497,62 @@
     }
 
     /**
-     * Best-effort check for "is there at least one Grok account
-     * configured?". `auth:getAccounts` reads `accounts.json` so a
-     * non-empty list means the user has set up accounts; it does
-     * NOT prove a live session, but `image:generate` /
-     * `i2v:generate` / `video:generate` will surface "no active
-     * sessions" inline if cookies expired. We use this banner to
-     * nudge users who haven't run manual-login at all yet.
+     * Structured session check for the login banner.
+     *
+     * PR-20E: prefers the richer `auth:getSessionStatus` IPC over the
+     * legacy `auth:getAccounts`. The status IPC returns
+     * `{ status: 'no_accounts' | 'stale' | 'ready' | 'unknown',
+     *    reason, accounts:[{email, has_session, age_ms, cookie_count, fresh}] }`
+     * — no cookies/tokens/headers crossing the boundary. We use it to
+     * distinguish three banner states:
+     *
+     *   - `no_accounts` → banner visible, "Open manual login" text.
+     *   - `stale`       → banner visible, "Session may be stale" text
+     *                     so the user knows re-login is needed even
+     *                     though accounts.json is populated.
+     *   - `ready` / `unknown` → banner hidden (unknown = IPC glitch,
+     *                     safer to let the user try rather than scare
+     *                     them with a false negative).
+     *
+     * The legacy `getAccounts` path stays as a fallback for older
+     * preloads that don't expose `getSessionStatus` yet.
      */
     async function sbbCheckSession() {
         const banner = $('sbb-login-banner');
         if (!banner) return;
-        if (!api || !api.auth || typeof api.auth.getAccounts !== 'function') {
+        const msgEl = banner.querySelector('span');
+        if (!api || !api.auth) {
+            banner.hidden = true;
+            return;
+        }
+        if (typeof api.auth.getSessionStatus === 'function') {
+            try {
+                const res = await api.auth.getSessionStatus();
+                const status = (res && typeof res.status === 'string') ? res.status : 'unknown';
+                if (status === 'no_accounts') {
+                    banner.hidden = false;
+                    if (msgEl) {
+                        msgEl.textContent = 'No Grok account configured. Open the manual-login window to sign in; '
+                            + 'cookies will persist across app restarts.';
+                    }
+                } else if (status === 'stale') {
+                    banner.hidden = false;
+                    if (msgEl) {
+                        const reason = (res && typeof res.reason === 'string' && res.reason)
+                            ? res.reason
+                            : 'Session may be stale — open manual login to refresh cookies.';
+                        msgEl.textContent = reason;
+                    }
+                } else {
+                    banner.hidden = true;
+                }
+                sbbState.sessionKnown = status === 'ready';
+                return;
+            } catch (_) {
+                // fall through to the legacy check.
+            }
+        }
+        if (typeof api.auth.getAccounts !== 'function') {
             banner.hidden = true;
             return;
         }
@@ -1669,7 +1713,23 @@
             $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(mode)}:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
             return;
         }
-        const settled = helpers.mapBatchResponse(resp, plan.sceneIds, 'video');
+        // PR-20E: hand a validator into the async mapper so tiny/
+        // invalid mp4s (which the service's 1KB floor would otherwise
+        // accept) get flipped from `generated` → `fallback` with the
+        // ffprobe reason attached. When the IPC isn't available we
+        // fall back to the sync mapper — behavior-preserving.
+        const validateFn = (api.video && typeof api.video.validateOutput === 'function')
+            ? async (filePath) => {
+                try {
+                    return await api.video.validateOutput({ filePath });
+                } catch (err) {
+                    return { ok: false, reason: `validateOutput IPC threw: ${(err && err.message) || err}` };
+                }
+            }
+            : null;
+        const settled = validateFn && typeof helpers.mapBatchResponseAsync === 'function'
+            ? await helpers.mapBatchResponseAsync(resp, plan.sceneIds, 'video', { validateFn })
+            : helpers.mapBatchResponse(resp, plan.sceneIds, 'video');
         for (const r of settled) {
             sbbState.videoRows = helpers.applyBatchResult(sbbState.videoRows, r.scene_id, r);
         }
