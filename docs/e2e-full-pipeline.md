@@ -224,9 +224,44 @@ Electron window instead.
 
 ## Verifying with a single-shot script (CI / non-interactive)
 
-If you'd like to drive this from a Node script outside Electron,
-`scripts/e2e_autogrok_image.js` already proves the AutoGrok side. The
-compose side is a single HTTP POST against the sidecar:
+If you'd like to drive the compose half from a Node script outside Electron —
+e.g. right after `scripts/e2e_autogrok_image.js` succeeds — use the bundled
+helper:
+
+```bash
+node scripts/e2e_compose_with_scene_assets.js \
+  --input-dir e2e-output/<timestamp>
+```
+
+The helper:
+
+1. Picks every `*.jpg` / `*.jpeg` / `*.png` / `*.webp` from `--input-dir`
+   that's ≥ 50 KB (PR-9 blur threshold), sorted by basename.
+2. Probes `http://127.0.0.1:5050/healthz`. If a creator-forge sidecar is
+   already running it reuses it; otherwise it spawns one via
+   `desktop/electron/researchSidecar.js` and tears it down on exit.
+3. Builds `scene_assets[]` with cumulative `start_s` from a uniform
+   per-scene duration (`--duration`, default 4 seconds).
+4. POSTs `/producer/short` with the resolved `scene_assets[]`.
+5. Asserts `mp4_path` non-empty, `scenes_used == len(scene_assets)`,
+   `scenes_missing == 0`, `warnings == []`. Exit codes (`0` ok, `2` no
+   usable images, `3` sidecar unhealthy, `4` mp4 not produced, `5`
+   missing/warnings, `6` count mismatch) make it scriptable as a CI gate.
+
+Common overrides:
+
+| Flag | Purpose | Default |
+| --- | --- | --- |
+| `--script <text>` / `--script-file <path>` | Replace the built-in 5-sentence smoke script. | A fixed 5-sentence intro |
+| `--voice <name>` | Edge-TTS voice short name. | `en-US-AriaNeural` |
+| `--style <name>` | Gradient style fallback (only used if compose falls back). | `violet-pink` |
+| `--duration <seconds>` | Per-scene `duration_s`. | `4` |
+| `--limit <n>` | Use only the first N images (e.g. for a 2-image smoke test from a 4-image AutoGrok output). | unlimited |
+| `--port <n>` | Sidecar port. | `$CREATOR_FORGE_RESEARCH_PORT` or `5050` |
+| `--keep-sidecar` | Don't tear down the sidecar on exit. | tears down |
+
+If you'd rather drive `/producer/short` by hand, the equivalent curl looks
+like this — useful when iterating on the request shape:
 
 ```bash
 # 1. Start the sidecar (in a separate terminal)
@@ -234,7 +269,7 @@ compose side is a single HTTP POST against the sidecar:
 DEEPSEEK_API_KEY=... uvicorn research.api.main:create_app --factory --reload
 
 # 2. POST a request directly
-curl -X POST http://127.0.0.1:8000/producer/short \
+curl -X POST http://127.0.0.1:5050/producer/short \
   -H 'Content-Type: application/json' \
   -d '{
     "script": "Welcome to creator-forge. This is scene one. And this is scene two.",
