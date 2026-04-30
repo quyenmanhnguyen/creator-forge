@@ -53,6 +53,7 @@ jobs:
             --ignore=research/tests/test_api_studio.py \
             --ignore=research/tests/test_api_producer.py \
             --ignore=research/tests/test_video_probe.py \
+            --ignore=research/tests/test_pixelle_tts_providers.py \
             --ignore=research/tests/test_pixelle_comfyui_image.py \
             --ignore=research/tests/test_pixelle_subtitles.py \
             --ignore=research/tests/test_pixelle_composer.py \

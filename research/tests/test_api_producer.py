@@ -1402,3 +1402,49 @@ def test_short_keeps_explicit_factory_monkeypatch_for_back_compat(
     body = r.json()
     assert captured["called"] is True
     assert body["engine"] == "fake-back-compat"
+
+
+def test_short_zero_duration_warning_is_format_aware_for_wav(monkeypatch, tmp_path):
+    """PR-23 — when Piper produces a WAV and the duration probe returns
+    0, the warning must NOT mention `mutagen` (which is the MP3 probe
+    library; WAV is probed via stdlib `wave`).
+    """
+
+    class FakeWavAdapter:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            wav = Path(output_path).with_suffix(".wav")
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            wav.write_bytes(b"")  # truncated → wave probe returns 0
+            return TTSResult(
+                audio_path=wav,
+                duration_seconds=0.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeWavAdapter)
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **kw: pytest.fail("_make_short must not run when duration is 0"),
+    )
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "output_dir": str(tmp_path / "out_wav_warn"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_path"].endswith(".wav")
+    duration_warnings = [w for w in body["warnings"] if "duration probe returned 0" in w]
+    assert len(duration_warnings) == 1
+    # The misleading mutagen suggestion must NOT appear for WAV output.
+    assert "mutagen" not in duration_warnings[0]
+    assert "WAV" in duration_warnings[0] or "truncated" in duration_warnings[0]

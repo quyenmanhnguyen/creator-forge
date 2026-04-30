@@ -646,10 +646,22 @@ def compose_short(req: ShortRequest) -> ShortResponse:
             logger.warning(msg)
             warnings.append(msg)
     elif audio_ok and duration_s <= 0:
-        warnings.append(
-            "Audio rendered but duration probe returned 0 — install 'mutagen' for "
-            "MP3 duration probing or pass a non-zero duration upstream."
-        )
+        # PR-23: format-aware troubleshooting hint. Piper writes WAV
+        # (probed via stdlib `wave`, no extra dep) so suggesting
+        # `mutagen` would be misleading.
+        suffix = audio_path.suffix.lower()
+        if suffix == ".wav":
+            warnings.append(
+                "Audio rendered but duration probe returned 0 — the WAV file "
+                "may be truncated or corrupt; check the TTS log and confirm "
+                "the writer flushed the file."
+            )
+        else:
+            warnings.append(
+                "Audio rendered but duration probe returned 0 — install "
+                "'mutagen' for MP3 duration probing or pass a non-zero "
+                "duration upstream."
+            )
 
     return ShortResponse(
         mp4_path=str(mp4_path) if composed_ok else "",
