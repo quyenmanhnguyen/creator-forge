@@ -11,9 +11,16 @@ const helpers = require("../dist/storyboard_batch_helpers.js");
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+// scene 1 carries ONLY flow_video_prompt (the long-form scene_breakdown
+// shape from /producer/scene_breakdown). scene 2 carries BOTH
+// flow_video_prompt and video_prompt — `video_prompt` must win to match
+// the precedence used by StoryboardBridge.animateScenes,
+// storyboard_compose_table_helpers, and
+// storyboard_video_compose_helpers. scene 3 has no image_prompt
+// (skip). scene 4 has no video prompt of any kind (skip).
 const SCENES = [
     { scene_id: 1, title: "intro", image_prompt: "p1", flow_video_prompt: "vf1", duration_s: 3 },
-    { scene_id: 2, title: "middle", image_prompt: "p2", video_prompt: "v2", duration_s: 4 },
+    { scene_id: 2, title: "middle", image_prompt: "p2", video_prompt: "v2", flow_video_prompt: "vf2-IGNORED", duration_s: 4 },
     { scene_id: 3, title: "no-img", image_prompt: "", flow_video_prompt: "vf3", duration_s: 2 },
     { scene_id: 4, title: "no-vid", image_prompt: "p4", duration_s: 2 },
 ];
@@ -28,10 +35,16 @@ test("initImageRowsFromScenes: copies prompt, defaults to pending; empty prompt 
     assert.match(rows[2].reason, /image_prompt/);
 });
 
-test("initVideoRowsFromScenes: prefers flow_video_prompt, falls back to video_prompt", () => {
+test("initVideoRowsFromScenes: prefers video_prompt, falls back to flow_video_prompt (matches the rest of the codebase)", () => {
     const rows = helpers.initVideoRowsFromScenes(SCENES);
-    assert.strictEqual(rows[0].prompt, "vf1", "long-form flow_video_prompt wins");
-    assert.strictEqual(rows[1].prompt, "v2", "fallback to short-form video_prompt");
+    // scene 1 has only flow_video_prompt → use it.
+    assert.strictEqual(rows[0].prompt, "vf1");
+    // scene 2 has BOTH; video_prompt must win — same precedence as
+    // StoryboardBridge.animateScenes / storyboard_compose_table_helpers
+    // / storyboard_video_compose_helpers.
+    assert.strictEqual(rows[1].prompt, "v2", "video_prompt must take precedence over flow_video_prompt");
+    assert.notStrictEqual(rows[1].prompt, "vf2-IGNORED");
+    // scene 4 has neither.
     assert.strictEqual(rows[3].status, "skipped", "scene without any video prompt is skipped");
 });
 

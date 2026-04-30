@@ -51,10 +51,15 @@
 
     /**
      * Build initial video-batch row state. The video prompt comes
-     * from `flow_video_prompt` (long-form scene_breakdown) or
-     * `video_prompt` (short-form), whichever is present. For T2V mode
-     * the prompt is enough; for I2V mode the row will need an image
-     * path supplied later.
+     * from `video_prompt` (preferred — the i2v alias used everywhere
+     * else in the codebase) or `flow_video_prompt` (long-form
+     * scene_breakdown alternative), whichever is present. The
+     * precedence matches `StoryboardBridge.animateScenes`,
+     * `storyboard_compose_table_helpers.initRowsFromScenes`, and
+     * `storyboard_video_compose_helpers.planI2VJobsFromScenesAndImages`
+     * so a scene that carries both fields lands the same prompt in
+     * every panel. For T2V mode the prompt is enough; for I2V mode
+     * the row will need an image path supplied later.
      *
      * @param {Array<Object>} scenes
      * @returns {Array<Object>} video-batch rows.
@@ -62,9 +67,9 @@
     function initVideoRowsFromScenes(scenes) {
         if (!Array.isArray(scenes)) return [];
         return scenes.map((s, i) => {
-            const fvp = (s && typeof s.flow_video_prompt === "string") ? s.flow_video_prompt.trim() : "";
             const vp = (s && typeof s.video_prompt === "string") ? s.video_prompt.trim() : "";
-            const prompt = fvp || vp;
+            const fvp = (s && typeof s.flow_video_prompt === "string") ? s.flow_video_prompt.trim() : "";
+            const prompt = vp || fvp;
             const skipped = !prompt;
             return {
                 order: i + 1,
