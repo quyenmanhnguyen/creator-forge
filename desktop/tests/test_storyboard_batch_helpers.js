@@ -739,6 +739,154 @@ test("PR-27: summarizeSelection ignores stale row_ids no longer in the table", (
     assert.strictEqual(s.deletable, 1);
 });
 
+// =====================================================================
+// PR-28 — reference image resolver / partition / refimg:generate plan
+// =====================================================================
+
+function pr28Rows() {
+    // 2 scenes × 2 variants = 4 rows. row_id encoding: "<scene>#<variant>".
+    return helpers.initImageRowsFromScenes([
+        { scene_id: 1, image_prompt: "hero cafe", duration_s: 2 },
+        { scene_id: 2, image_prompt: "night skyline", duration_s: 2 },
+    ], { imagesPerScene: 2 });
+}
+
+test("PR-28: resolveRefsForRow — per-row override beats global defaults", () => {
+    const row = { row_id: "1#0", scene_id: 1 };
+    const global = ["/refs/global-char.png"];
+    const rowMap = { "1#0": ["/refs/scene1-char.png"] };
+    const resolved = helpers.resolveRefsForRow(row, rowMap, global);
+    assert.deepStrictEqual(resolved, ["/refs/scene1-char.png"]);
+});
+
+test("PR-28: resolveRefsForRow — falls back to global when row has no override", () => {
+    const row = { row_id: "2#1", scene_id: 2 };
+    const resolved = helpers.resolveRefsForRow(row, {}, ["/refs/g1.png", "/refs/g2.png"]);
+    assert.deepStrictEqual(resolved, ["/refs/g1.png", "/refs/g2.png"]);
+});
+
+test("PR-28: resolveRefsForRow — empty override array still hands through to global", () => {
+    // An empty override should NOT shadow the global — the user probably cleared the override.
+    const row = { row_id: "1#0", scene_id: 1 };
+    const resolved = helpers.resolveRefsForRow(row, { "1#0": [] }, ["/refs/global.png"]);
+    assert.deepStrictEqual(resolved, ["/refs/global.png"]);
+});
+
+test("PR-28: resolveRefsForRow — de-dupes and trims whitespace from the chosen list", () => {
+    const row = { row_id: "1#0", scene_id: 1 };
+    const resolved = helpers.resolveRefsForRow(row, null, ["/refs/a.png", "  /refs/a.png  ", "/refs/b.png", ""]);
+    assert.deepStrictEqual(resolved, ["/refs/a.png", "/refs/b.png"]);
+});
+
+test("PR-28: resolveRefsForRow — accepts Map as rowRefMap (not just plain object)", () => {
+    const row = { row_id: "1#0", scene_id: 1 };
+    const map = new Map([["1#0", ["/refs/from-map.png"]]]);
+    const resolved = helpers.resolveRefsForRow(row, map, ["/refs/global.png"]);
+    assert.deepStrictEqual(resolved, ["/refs/from-map.png"]);
+});
+
+test("PR-28: resolveRefsForRow — defends against missing row / null inputs", () => {
+    assert.deepStrictEqual(helpers.resolveRefsForRow(null, null, null), []);
+    assert.deepStrictEqual(helpers.resolveRefsForRow({}, null, null), []);
+    assert.deepStrictEqual(helpers.resolveRefsForRow({ row_id: "1#0" }, null, null), []);
+});
+
+test("PR-28: partitionRowsByRefs — splits rows cleanly into withRefs / withoutRefs", () => {
+    const rows = pr28Rows();
+    const rowMap = { "1#0": ["/refs/scene1.png"] };
+    const globalRefs = [];
+    const out = helpers.partitionRowsByRefs(rows, { rowRefMap: rowMap, globalRefs });
+    assert.strictEqual(out.withRefs.length, 1, "only row 1#0 has an override → one row in withRefs");
+    assert.strictEqual(out.withRefs[0].row_id, "1#0");
+    assert.strictEqual(out.withoutRefs.length, 3, "rest go into the plain image:generate bucket");
+});
+
+test("PR-28: partitionRowsByRefs — global refs put every row into withRefs", () => {
+    const rows = pr28Rows();
+    const out = helpers.partitionRowsByRefs(rows, {
+        rowRefMap: null,
+        globalRefs: ["/refs/char.png"],
+    });
+    assert.strictEqual(out.withRefs.length, rows.length, "a global ref routes every row through refimg:generate");
+    assert.strictEqual(out.withoutRefs.length, 0);
+});
+
+test("PR-28: planRefImageGenerate — emits RefImageService.generateBatch items shape", () => {
+    const rows = pr28Rows();
+    const plan = helpers.planRefImageGenerate(rows, {
+        rowRefMap: { "2#1": ["/refs/scene2-alt.png"] },
+        globalRefs: ["/refs/char.png"],
+    });
+    // All 4 rows have prompts + refs → 4 items.
+    assert.strictEqual(plan.items.length, 4);
+    // Row 2#1 uses its override; the other rows use the global.
+    const forScene2Var1 = plan.items[plan.rowIds.indexOf("2#1")];
+    assert.deepStrictEqual(forScene2Var1.refImagePaths, ["/refs/scene2-alt.png"]);
+    const forScene1Var0 = plan.items[plan.rowIds.indexOf("1#0")];
+    assert.deepStrictEqual(forScene1Var0.refImagePaths, ["/refs/char.png"]);
+    // Prompt + row_id + scene_id arrays run in lock-step.
+    assert.strictEqual(plan.sceneIds.length, plan.items.length);
+    assert.strictEqual(plan.rowIds.length, plan.items.length);
+    // prompt text comes through unchanged.
+    for (const item of plan.items) {
+        assert.ok(typeof item.prompt === "string" && item.prompt.length > 0);
+    }
+});
+
+test("PR-28: planRefImageGenerate — skips rows with status=skipped or empty prompt", () => {
+    const rows = pr28Rows();
+    rows[0].status = "skipped";
+    rows[0].prompt = "";
+    rows[0].reason = "missing image_prompt";
+    const plan = helpers.planRefImageGenerate(rows, {
+        rowRefMap: null,
+        globalRefs: ["/refs/char.png"],
+    });
+    assert.strictEqual(plan.items.length, 3, "skipped row excluded — only 3 eligible items remain");
+    assert.ok(!plan.rowIds.includes("1#0"), "row_id of the skipped row must not appear in plan.rowIds");
+});
+
+test("PR-28: planRefImageGenerate — excludes rows with no resolved refs (they take image:generate path)", () => {
+    const rows = pr28Rows();
+    const plan = helpers.planRefImageGenerate(rows, {
+        rowRefMap: { "1#0": ["/refs/only-this.png"] },
+        globalRefs: [],
+    });
+    // Only 1#0 has refs → only 1 item.
+    assert.strictEqual(plan.items.length, 1);
+    assert.strictEqual(plan.rowIds[0], "1#0");
+    assert.deepStrictEqual(plan.items[0].refImagePaths, ["/refs/only-this.png"]);
+});
+
+test("PR-28: planRefImageGenerate — no refs anywhere returns an empty plan", () => {
+    const rows = pr28Rows();
+    const plan = helpers.planRefImageGenerate(rows, { rowRefMap: null, globalRefs: null });
+    assert.strictEqual(plan.items.length, 0);
+    assert.strictEqual(plan.rowIds.length, 0);
+    assert.strictEqual(plan.sceneIds.length, 0);
+});
+
+test("PR-28: planRefImageGenerate + planImageGenerate are complementary — no overlap, no loss", () => {
+    // The renderer's contract: partition the rows by refs, then feed
+    // planRefImageGenerate to withRefs and planImageGenerate to
+    // withoutRefs. Every eligible row appears exactly once across the
+    // two plans.
+    const rows = pr28Rows();
+    const opts = {
+        rowRefMap: { "1#0": ["/refs/a.png"], "2#0": ["/refs/b.png"] },
+        globalRefs: [],
+    };
+    const split = helpers.partitionRowsByRefs(rows, opts);
+    const refPlan = helpers.planRefImageGenerate(split.withRefs, opts);
+    const plainPlan = helpers.planImageGenerate(split.withoutRefs);
+    const allRowIds = [...refPlan.rowIds, ...plainPlan.rowIds].sort();
+    const expected = rows
+        .filter((r) => r.status !== "skipped" && r.prompt)
+        .map((r) => r.row_id)
+        .sort();
+    assert.deepStrictEqual(allRowIds, expected, "every eligible row must appear in exactly one of the two plans");
+});
+
 test("PR-27: applyBatchProgress / applyBatchResult silently no-op for deleted rows", () => {
     let rows = pr27Rows();
     rows = helpers.removeRows(rows, ["1#1"]);

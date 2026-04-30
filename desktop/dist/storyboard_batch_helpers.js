@@ -249,6 +249,101 @@
     }
 
     /**
+     * PR-28 — resolve the list of reference image paths to use for a
+     * row. Per-row overrides trump the global list. Returns a new
+     * de-duplicated string[] (may be empty). Never mutates its
+     * inputs; safe to call on every render.
+     *
+     * @param {Object}                       row           batch row (must have ``row_id``)
+     * @param {Map<string,string[]>|Object}  rowRefMap     per-row overrides keyed by row_id
+     * @param {string[]}                    globalRefs    global default list (applies when no override)
+     */
+    function resolveRefsForRow(row, rowRefMap, globalRefs) {
+        if (!row || row.row_id == null) return [];
+        const key = String(row.row_id);
+        const override = _lookupRefs(rowRefMap, key);
+        const chosen = (override && override.length) ? override : (Array.isArray(globalRefs) ? globalRefs : []);
+        return _dedupeRefs(chosen);
+    }
+
+    function _lookupRefs(refMap, key) {
+        if (!refMap) return null;
+        if (typeof refMap.get === "function") {
+            const v = refMap.get(key);
+            return Array.isArray(v) ? v : null;
+        }
+        if (typeof refMap === "object") {
+            const v = refMap[key];
+            return Array.isArray(v) ? v : null;
+        }
+        return null;
+    }
+
+    function _dedupeRefs(list) {
+        const out = [];
+        const seen = new Set();
+        for (const p of (list || [])) {
+            if (typeof p !== "string") continue;
+            const trimmed = p.trim();
+            if (!trimmed || seen.has(trimmed)) continue;
+            seen.add(trimmed);
+            out.push(trimmed);
+        }
+        return out;
+    }
+
+    /**
+     * PR-28 — split rows into two disjoint buckets by whether they
+     * resolve to ≥1 reference image. Rows with no refs take the
+     * legacy `image:generate` path; rows with refs take the
+     * `refimg:generate` path. Skipped / empty-prompt rows stay in
+     * their existing bucket so the renderer can still mark them as
+     * skipped without hitting the IPC.
+     *
+     * @param {Array<Object>}                 rows
+     * @param {Object}                        opts
+     * @param {Map<string,string[]>|Object}   opts.rowRefMap
+     * @param {string[]}                      opts.globalRefs
+     */
+    function partitionRowsByRefs(rows, opts) {
+        const o = opts || {};
+        const withRefs = [];
+        const withoutRefs = [];
+        for (const r of (Array.isArray(rows) ? rows : [])) {
+            const resolved = resolveRefsForRow(r, o.rowRefMap, o.globalRefs);
+            if (resolved.length > 0) withRefs.push(r); else withoutRefs.push(r);
+        }
+        return { withRefs, withoutRefs };
+    }
+
+    /**
+     * PR-28 — build the IPC payload for ``refimg:generate``. Runs in
+     * lock-step with ``planImageGenerate``: returns ``items`` (shape
+     * matching ``RefImageService.generateBatch``: ``{ prompt,
+     * refImagePaths }``), ``sceneIds``, ``rowIds`` so
+     * ``mapBatchResponse`` can map ``globalIdx`` back to the exact
+     * variant row. Rows without a prompt or marked skipped are
+     * excluded; rows without any resolved refs are excluded too (the
+     * caller is expected to call ``planImageGenerate`` for those
+     * separately).
+     */
+    function planRefImageGenerate(rows, opts) {
+        const o = opts || {};
+        const items = [];
+        const sceneIds = [];
+        const rowIds = [];
+        for (const r of (Array.isArray(rows) ? rows : [])) {
+            if (!r || r.status === "skipped" || !r.prompt) continue;
+            const refs = resolveRefsForRow(r, o.rowRefMap, o.globalRefs);
+            if (!refs.length) continue;
+            items.push({ prompt: r.prompt, refImagePaths: refs });
+            sceneIds.push(r.scene_id);
+            rowIds.push(r.row_id != null ? r.row_id : r.scene_id);
+        }
+        return { items, sceneIds, rowIds };
+    }
+
+    /**
      * Build the IPC payload for I2V or T2V. In I2V mode, only rows
      * whose `image_path` is populated (paired by
      * `pairImagePathsForI2V`) are eligible — the rest are returned in
@@ -730,6 +825,10 @@
         updatePromptForRow,
         applyVariantPrompts,
         summarizeSelection,
+        // PR-28 — reference image upload (global + per-row override).
+        resolveRefsForRow,
+        partitionRowsByRefs,
+        planRefImageGenerate,
     };
 
     if (typeof module === "object" && module.exports) module.exports = api;
