@@ -325,6 +325,87 @@ async function run() {
         assert.strictEqual(helpers.countFallbackI2VScenes(null), 0);
     });
 
+    // ── PR-20E: validateFn integration ────────────────────────────────
+    test("PR-20E: pickI2VOutputFile passes ffprobe validator → chosen kept", async () => {
+        const result = { savedFile: "/tmp/ok.mp4", success: true };
+        const stat = fakeStat({ "/tmp/ok.mp4": 200_000 });
+        const validateFn = async (fp, minBytes) => {
+            assert.strictEqual(fp, "/tmp/ok.mp4");
+            assert.strictEqual(minBytes, 10000);
+            return { ok: true, size: 200_000, ffprobeAvailable: true };
+        };
+        const pick = await helpers.pickI2VOutputFile(result, stat, { validateFn });
+        assert.strictEqual(pick.reason, null);
+        assert.strictEqual(pick.chosen.filePath, "/tmp/ok.mp4");
+        assert.strictEqual(pick.chosen.bytes, 200_000);
+        assert.strictEqual(pick.chosen.validation.ok, true);
+    });
+
+    test("PR-20E: pickI2VOutputFile fails validator → chosen:null + reason propagated", async () => {
+        const result = { savedFile: "/tmp/html.mp4", success: true };
+        const stat = fakeStat({ "/tmp/html.mp4": 50_000 });
+        const validateFn = async () => ({
+            ok: false,
+            reason: "no video stream detected by ffprobe",
+            ffprobeAvailable: true,
+        });
+        const pick = await helpers.pickI2VOutputFile(result, stat, { validateFn });
+        assert.strictEqual(pick.chosen, null);
+        assert.match(pick.reason, /no video stream/);
+    });
+
+    test("PR-20E: pickI2VOutputFile validateFn throws → chosen:null + reason captures throw", async () => {
+        const result = { savedFile: "/tmp/x.mp4", success: true };
+        const stat = fakeStat({ "/tmp/x.mp4": 20_000 });
+        const validateFn = async () => { throw new Error("IPC exploded"); };
+        const pick = await helpers.pickI2VOutputFile(result, stat, { validateFn });
+        assert.strictEqual(pick.chosen, null);
+        assert.match(pick.reason, /validateFn threw: IPC exploded/);
+    });
+
+    test("PR-20E: pickI2VOutputFile size floor short-circuits before validateFn runs", async () => {
+        let called = 0;
+        const result = { savedFile: "/tmp/tiny.mp4", success: true };
+        const stat = fakeStat({ "/tmp/tiny.mp4": 500 }); // below 10KB minBytes
+        const validateFn = async () => { called += 1; return { ok: true }; };
+        const pick = await helpers.pickI2VOutputFile(result, stat, { validateFn });
+        assert.strictEqual(pick.chosen, null);
+        assert.match(pick.reason, /suspiciously small/);
+        assert.strictEqual(called, 0);
+    });
+
+    test("PR-20E: orchestrateI2VWithRetries forwards validateFn; invalid mp4 on attempt 1 → retry wins", async () => {
+        const jobs = [{ globalIdx: 0, scene_id: "A", prompt: "p", imagePath: "/img.jpg", start_s: 0, duration_s: 3 }];
+        const firstSaved = "/tmp/attempt1.mp4";
+        const secondSaved = "/tmp/attempt2.mp4";
+        const stat = fakeStat({ [firstSaved]: 20_000, [secondSaved]: 20_000 });
+        let attempts = 0;
+        const i2vGenerateFn = async (items) => {
+            attempts += 1;
+            return {
+                success: true,
+                results: items.map((_, localIdx) => ({
+                    success: true,
+                    savedFile: attempts === 1 ? firstSaved : secondSaved,
+                    globalIdx: jobs[0].globalIdx,
+                    localIdx,
+                })),
+            };
+        };
+        // validator rejects attempt1 (no moov), accepts attempt2.
+        const validateFn = async (fp) => fp === firstSaved
+            ? { ok: false, reason: "no video stream", ffprobeAvailable: true }
+            : { ok: true, ffprobeAvailable: true };
+        const res = await helpers.orchestrateI2VWithRetries(
+            jobs, i2vGenerateFn, stat,
+            { maxAttempts: 2, minBytes: 10000, validateFn },
+        );
+        assert.strictEqual(attempts, 2);
+        assert.strictEqual(res.perSceneStatus[0].status, "retried");
+        assert.strictEqual(res.perSceneStatus[0].video_path, secondSaved);
+        assert.strictEqual(res.videoSceneAssets.length, 1);
+    });
+
     test("stripVideoSceneAssetForComposer: drops scene_id, preserves only video_path/start_s/duration_s", () => {
         const stripped = helpers.stripVideoSceneAssetForComposer([
             { video_path: "/a.mp4", start_s: 0, duration_s: 3, scene_id: 1, extra: "ignored" },

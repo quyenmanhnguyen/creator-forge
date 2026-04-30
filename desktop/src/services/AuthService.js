@@ -211,6 +211,102 @@ class AuthService {
         return age < maxAge;
     }
 
+    /**
+     * Aggregate session-state snapshot for the renderer's login banner.
+     *
+     * PR-20E: ``auth:getAccounts`` only reads ``accounts.json`` so the
+     * old banner only knew "configured vs not". This method also
+     * inspects ``activeSessions`` so the UI can distinguish:
+     *
+     *   - ``no_accounts`` — accounts.json empty, user must run manual
+     *     login or Setup.
+     *   - ``stale``       — at least one account configured, but no
+     *     session in memory or every session past
+     *     ``maxAgeMs`` (default 1h).
+     *   - ``ready``       — at least one configured account has a
+     *     session newer than ``maxAgeMs``.
+     *   - ``unknown``     — accounts.json couldn't be read.
+     *
+     * IMPORTANT: the returned account entries deliberately omit
+     * ``cookies`` / ``capturedHeaders`` / ``statsigId`` — only counts
+     * + booleans + ages survive the IPC boundary so a leak via the
+     * banner UI is impossible. Tests assert this contract.
+     *
+     * @param {{ accountsLoader?: ()=>Array<{email:string}>, maxAgeMs?: number, now?: number }} [opts]
+     */
+    getSessionStatus(opts = {}) {
+        const maxAgeMs = typeof opts.maxAgeMs === 'number' ? opts.maxAgeMs : 60 * 60 * 1000;
+        const now = typeof opts.now === 'number' ? opts.now : Date.now();
+        let accounts;
+        try {
+            const loader = typeof opts.accountsLoader === 'function'
+                ? opts.accountsLoader
+                : () => AccountService.loadAccounts();
+            accounts = loader() || [];
+        } catch (err) {
+            return {
+                status: 'unknown',
+                reason: `accounts.json read failed: ${(err && err.message) || err}`,
+                accounts: [],
+                ready_count: 0,
+                stale_count: 0,
+                configured_count: 0,
+                max_age_ms: maxAgeMs,
+            };
+        }
+
+        const accountList = Array.isArray(accounts) ? accounts : [];
+        const summary = [];
+        let readyCount = 0;
+        let staleCount = 0;
+        for (const acc of accountList) {
+            if (!acc || typeof acc.email !== 'string') continue;
+            const session = this.activeSessions.get(acc.email) || null;
+            const ageMs = session && typeof session.timestamp === 'number'
+                ? Math.max(0, now - session.timestamp)
+                : null;
+            const cookieCount = session && Array.isArray(session.cookies)
+                ? session.cookies.length
+                : 0;
+            const hasSession = !!session;
+            const fresh = hasSession && ageMs !== null && ageMs < maxAgeMs && cookieCount > 0;
+            if (fresh) readyCount += 1;
+            else if (hasSession) staleCount += 1;
+            // Renderer-safe shape: NO cookies/headers/statsigId. Only
+            // booleans + counts + ages so the banner can't leak secrets.
+            summary.push({
+                email: acc.email,
+                has_session: hasSession,
+                age_ms: ageMs,
+                cookie_count: cookieCount,
+                fresh,
+            });
+        }
+
+        let status;
+        let reason = null;
+        if (accountList.length === 0) {
+            status = 'no_accounts';
+            reason = 'accounts.json is empty — open manual login to add one.';
+        } else if (readyCount > 0) {
+            status = 'ready';
+        } else {
+            status = 'stale';
+            reason = staleCount > 0
+                ? 'Configured account(s) have no fresh session — re-login or refresh cookies.'
+                : 'No active session in memory — sign in once with manual login.';
+        }
+        return {
+            status,
+            reason,
+            accounts: summary,
+            ready_count: readyCount,
+            stale_count: staleCount,
+            configured_count: accountList.length,
+            max_age_ms: maxAgeMs,
+        };
+    }
+
     async reloginAccount(email) {
         const count = this._reloginCounts.get(email) || 0;
         if (count >= MAX_RELOGIN_ATTEMPTS) {

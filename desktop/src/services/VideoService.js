@@ -5,6 +5,7 @@ const path = require('path');
 const { API_ENDPOINTS, MODEL_CONFIG, VIDEO_CONFIG, PROCESSING_CONFIG, PATHS } = require('../config/app.config');
 const FileService = require('./FileService');
 const AuthService = require('./AuthService');
+const { validateVideoOutput, MIN_USABLE_VIDEO_BYTES } = require('../../dist/video_validation_helpers');
 
 class VideoService {
   constructor() {
@@ -283,10 +284,23 @@ class VideoService {
           throw new Error(`Downloaded file too small (${size} bytes)`);
         }
 
+        // Probe the temp file before promoting it. ffprobe catches a
+        // chunked-truncated mp4 (no moov atom) that the legacy 1KB
+        // floor would otherwise wave through; when ffprobe is missing
+        // the helper falls back to exists+size and we keep behavior.
+        const check = await validateVideoOutput(tmpPath, { minBytes: MIN_USABLE_VIDEO_BYTES });
+        if (!check.ok) {
+          try { fs.unlinkSync(tmpPath); } catch (_) {}
+          throw new Error(`Downloaded file rejected by validator: ${check.reason}`);
+        }
+        if (!check.ffprobeAvailable) {
+          console.log('[VideoService] ffprobe unavailable — accepted on size-only fallback.');
+        }
+
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         fs.renameSync(tmpPath, filePath);
         console.log(`[VideoService] Saved stream: ${filePath}`);
-        return { path: filePath, size };
+        return { path: filePath, size, validation: check };
       } catch (error) {
         try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
         console.log(`[VideoService] Download error:`, error.message.substring(0, 80));

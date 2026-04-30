@@ -38,7 +38,7 @@ jobs:
         run: python -m compileall -q research
 
       - name: Pytest — API tests (must pass)
-        run: pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py -v --no-header
+        run: pytest research/tests/test_api_niche.py research/tests/test_api_keywords.py research/tests/test_api_outlier.py research/tests/test_api_cloner.py research/tests/test_api_studio.py research/tests/test_api_producer.py research/tests/test_video_probe.py -v --no-header
 
       - name: Pytest — legacy tube-atlas tests (best-effort)
         run: |
@@ -52,6 +52,7 @@ jobs:
             --ignore=research/tests/test_api_cloner.py \
             --ignore=research/tests/test_api_studio.py \
             --ignore=research/tests/test_api_producer.py \
+            --ignore=research/tests/test_video_probe.py \
             --ignore=research/tests/test_pixelle_comfyui_image.py \
             --ignore=research/tests/test_pixelle_subtitles.py \
             --ignore=research/tests/test_pixelle_composer.py \
@@ -86,6 +87,10 @@ jobs:
           node --check desktop/dist/storyboard_video_compose_helpers.js
           node --check desktop/dist/storyboard_compose_table_helpers.js
           node --check desktop/dist/storyboard_batch_helpers.js
+          # PR-20E: ffprobe-backed validation helper (Node-only — uses
+          # child_process; main-process/service-side module, not loaded
+          # via <script> into the renderer).
+          node --check desktop/dist/video_validation_helpers.js
 
       - name: Offline regression tests (no puppeteer install required)
         run: |
@@ -99,6 +104,8 @@ jobs:
           node desktop/tests/test_storyboard_batch_helpers.js
           node desktop/tests/test_research_sidecar_lookup.js
           node desktop/tests/test_fetch_python_runtime.js
+          node desktop/tests/test_video_validation_helpers.js
+          node desktop/tests/test_auth_session_status.js
 
       - name: Syntax check standalone E2E scripts
         run: |

@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     auth: {
         login: (credentials) => ipcRenderer.invoke('auth:login', credentials),
         getAccounts: () => ipcRenderer.invoke('auth:getAccounts'),
+        // PR-20E: structured session snapshot — accounts.json + live
+        // session map combined into { status, accounts, counts } with
+        // no cookies/headers/tokens crossing the boundary.
+        getSessionStatus: (params) => ipcRenderer.invoke('auth:getSessionStatus', params),
         saveAccounts: (accounts) => ipcRenderer.invoke('auth:saveAccounts', accounts),
         setupAccounts: (accounts) => ipcRenderer.invoke('auth:setupAccounts', accounts),
         importTxt: () => ipcRenderer.invoke('account:importTxt'),
@@ -53,6 +57,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     video: {
         generate: (params) => ipcRenderer.invoke('video:generate', params),
         merge: (params) => ipcRenderer.invoke('video:merge', params),
+        // PR-20E: ffprobe-backed validation. Pass a string path or
+        // { filePath, minBytes?, minDurationSec? }. Always resolves;
+        // failure modes come back as { ok: false, reason }.
+        validateOutput: (params) => ipcRenderer.invoke('video:validateOutput', params),
     },
 
     i2v: {
