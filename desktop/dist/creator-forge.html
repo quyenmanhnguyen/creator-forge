@@ -440,6 +440,92 @@
             display: flex;
             gap: 8px;
         }
+        /* PR-27 — bulk-action toolbar + checkbox column + inline-edit
+           textarea. The toolbar floats above each table; buttons share
+           the same .secondary look as the rest of the panel so the new
+           controls don't feel like a graft. */
+        .sbb-toolbar {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+            padding: 6px 8px;
+            margin-top: 6px;
+            margin-bottom: 4px;
+            background: var(--bg-1);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 12px;
+        }
+        .sbb-toolbar .sbb-toolbar-summary {
+            color: var(--text-dim);
+            margin-right: auto;
+        }
+        .sbb-toolbar button {
+            padding: 4px 10px;
+            font-size: 12px;
+        }
+        .sbb-toolbar button[disabled] {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .swc-table .sbb-select-cell {
+            width: 26px;
+            text-align: center;
+        }
+        .swc-table .sbb-select-cell input[type="checkbox"] {
+            margin: 0;
+        }
+        .swc-table tr.sbb-row-selected td {
+            background: rgba(124, 154, 255, 0.08);
+        }
+        .swc-table .sbb-row-actions {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .swc-table .sbb-icon-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .swc-table .sbb-icon-btn:hover {
+            color: var(--text);
+            border-color: var(--accent);
+        }
+        .swc-table .sbb-icon-btn[disabled] {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .swc-table .sbb-icon-btn.danger:hover {
+            color: rgb(255, 180, 180);
+            border-color: rgba(255, 84, 84, 0.6);
+        }
+        .swc-table .prompt-cell .sbb-edit-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .swc-table .prompt-cell textarea.sbb-edit-input {
+            width: 100%;
+            min-height: 80px;
+            background: var(--bg-2);
+            color: var(--text);
+            border: 1px solid var(--accent);
+            border-radius: 3px;
+            padding: 4px 6px;
+            font: inherit;
+            box-sizing: border-box;
+        }
+        .swc-table .sbb-edit-actions {
+            display: flex;
+            gap: 6px;
+        }
         .banner {
             display: flex;
             align-items: center;
@@ -972,9 +1058,13 @@
                     <label class="form-row-full">Script
                         <textarea id="sb-script" rows="10" placeholder="paste a long-form script (or click 'Send script → Storyboard' in Studio)"></textarea>
                     </label>
+                    <label class="form-row-full" title="Style anchor appended verbatim to every variant prompt — auto-filled from the script after Break into scenes runs (when images per scene > 1). Edit and click 'Re-roll variants' to refresh prompts without re-running scene_breakdown.">Visual DNA <span class="muted" style="font-weight:400;">(style anchor — era · palette · lighting · lens · mood)</span>
+                        <textarea id="sb-visual-dna" rows="3" placeholder="auto-filled by scene_breakdown when images per scene &gt; 1; edit to override and click 'Re-roll variants' to apply"></textarea>
+                    </label>
                 </div>
                 <div class="actions">
                     <button class="primary" data-run="scene-breakdown">Break into scenes</button>
+                    <button class="secondary" data-run="storyboard-reroll-variants" title="Re-expand image_prompts for every scene using the current Visual DNA. Settled / in-flight rows in the Batch panel are left alone; only pending / fallback / skipped rows are refreshed.">Re-roll variants</button>
                 </div>
                 <div class="result" id="sb-result"></div>
             </div>

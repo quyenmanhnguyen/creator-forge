@@ -34,6 +34,17 @@
         // (PR-16) can pick up scenes without re-running the LLM.
         lastScenes: [],
         lastSceneScript: '',
+        // PR-27 — Visual DNA style anchor most recently returned by
+        // /producer/scene_breakdown (or edited by the user). Re-roll
+        // and the next scene_breakdown call both read from here so a
+        // user override persists across runs without re-typing.
+        lastVisualDna: '',
+        // PR-27 — value of ``images_per_scene`` carried into the last
+        // scene_breakdown / variantPrompts call. Tracked separately
+        // from the DOM select so re-roll always agrees with the
+        // current Batch panel setting (which the user may bump
+        // mid-session).
+        lastImagesPerScene: 4,
     };
 
     // ─── Tabs ──────────────────────────────────────────────────────────────
@@ -672,12 +683,21 @@
             return;
         }
         const nField = $('sb-n-scenes').value;
+        // PR-27: pull the Batch panel's "Images per scene" select so
+        // the LLM expands variants up front (constraint F1) and the
+        // backend gets a chance to extract Visual DNA (F2). Falls
+        // back to the legacy 1-prompt path when the field is missing.
+        const imagesPerScene = sbbReadVariantCount('sbb-images-per-scene', 4);
+        state.lastImagesPerScene = imagesPerScene;
+        const dnaOverride = (($('sb-visual-dna') || {}).value || '').trim();
         const params = {
             script,
             template_key: $('sb-template').value || 'cinematic',
             words_per_minute: asInt($('sb-wpm').value, 150),
             language: $('sb-language').value || 'en',
+            images_per_scene: imagesPerScene,
         };
+        if (dnaOverride) params.visual_dna_override = dnaOverride;
         if (nField && nField.trim().length) {
             params.n_scenes = asInt(nField, 12);
         }
@@ -696,6 +716,31 @@
         // panel reuses the same script that was just broken into scenes.
         state.lastScenes = scenes.slice();
         state.lastSceneScript = asNonEmpty($('sb-script').value) || '';
+        // PR-27: capture the Visual DNA the backend used (either
+        // echoed from our override or auto-extracted from the script
+        // when ``images_per_scene > 1``). Re-roll reads from this
+        // exact value so the prompts the user sees in the Batch
+        // panel always match the field above.
+        const dna = data && typeof data.visual_dna === 'string' ? data.visual_dna : '';
+        const dnaField = $('sb-visual-dna');
+        if (dnaField) {
+            // Only auto-fill when (a) there's something to fill, and
+            // (b) the user hasn't already typed an override. The
+            // override path lives in lastVisualDna, so a non-empty
+            // user value is preserved verbatim.
+            const userTyped = (dnaField.value || '').trim();
+            if (dna && (!userTyped || userTyped === state.lastVisualDna)) {
+                dnaField.value = dna;
+            }
+        }
+        state.lastVisualDna = (dnaField && dnaField.value || dna || '').trim();
+        // PR-27: when scenes carry image_prompts[] (from the variant
+        // expansion above), refresh the Batch image rows in place so
+        // the user sees the variants right away — without forcing
+        // them to click "Auto-fill from scenes" first. Settled rows
+        // in flight are NOT clobbered (initImageRowsFromScenes only
+        // runs when the table is empty or the scene set changed).
+        sbbSyncFromScenes(scenes);
         let html = '';
         html += `<div class="stats-row">
             <span>Template<b>${escapeHtml(data.template_label || data.template_key || '')}</b></span>
@@ -830,7 +875,72 @@
             const sid = t.getAttribute('data-sbb-make-video');
             const rid = t.getAttribute('data-sbb-make-video-row') || '';
             try { sbbBridgeImageToVideo(sid, rid); } catch (err) { console.warn('bridge image→video failed:', err); }
+        } else if (t.matches('button[data-sbb-row-action]')) {
+            // PR-27 — per-row Edit / Delete buttons.
+            const action = t.getAttribute('data-sbb-row-action');
+            const kind = t.getAttribute('data-sbb-kind');
+            const rowId = t.getAttribute('data-sbb-row');
+            if (action === 'edit') sbbBeginEdit(kind, rowId);
+            else if (action === 'delete') sbbDeleteRow(kind, rowId);
+        } else if (t.matches('button[data-sbb-edit-action]')) {
+            // PR-27 — Save / Cancel buttons inside an inline-edit shell.
+            const action = t.getAttribute('data-sbb-edit-action');
+            const kind = t.getAttribute('data-sbb-kind');
+            const rowId = t.getAttribute('data-sbb-row');
+            if (action === 'save') sbbSaveEdit(kind, rowId);
+            else if (action === 'cancel') sbbCancelEdit(kind);
+        } else if (t.matches('button[data-sbb-bulk]')) {
+            // PR-27 — bulk-action toolbar buttons.
+            const action = t.getAttribute('data-sbb-bulk');
+            const kind = t.getAttribute('data-sbb-kind');
+            if (action === 'select-all') sbbToggleSelectAll(kind);
+            else if (action === 'reroll') sbbRerollSelected(kind).catch((err) => console.warn('reroll failed:', err));
+            else if (action === 'delete') sbbDeleteSelected(kind);
         }
+    });
+
+    // PR-27 — checkbox change events (header + per-row). Lives in a
+    // separate listener because ``click`` on a checkbox fires before
+    // ``checked`` flips, so we read the post-flip value from
+    // ``change``.
+    document.addEventListener('change', (e) => {
+        const t = e.target;
+        if (!t || !t.matches) return;
+        if (t.matches('input[type="checkbox"][data-sbb-row-select]')) {
+            const kind = t.getAttribute('data-sbb-kind');
+            const rowId = t.getAttribute('data-sbb-row-select');
+            sbbToggleRow(kind, rowId);
+        } else if (t.matches('input[type="checkbox"][data-sbb-bulk="header-select"]')) {
+            const kind = t.getAttribute('data-sbb-kind');
+            sbbToggleSelectAll(kind);
+        }
+    });
+
+    // PR-27 — keyboard shortcuts inside the inline-edit textarea:
+    // Enter = Save, Esc = Cancel. Shift+Enter still inserts a newline.
+    document.addEventListener('keydown', (e) => {
+        const t = e.target;
+        if (!t || !t.matches || !t.matches('textarea[data-sbb-edit-input]')) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            const kind = (t.getAttribute('data-sbb-edit-input') || '').split(':')[0] || 'image';
+            sbbCancelEdit(kind);
+        } else if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            const [kind, rowId] = (t.getAttribute('data-sbb-edit-input') || '').split(':');
+            // Capture the textarea's current value into the draft so
+            // sbbSaveEdit reads the latest text.
+            sbbState.editingDraft = t.value;
+            sbbSaveEdit(kind || 'image', rowId);
+        }
+    });
+
+    // PR-27 — keep the editing draft in sync as the user types so
+    // a re-render mid-edit doesn't lose their input.
+    document.addEventListener('input', (e) => {
+        const t = e.target;
+        if (!t || !t.matches || !t.matches('textarea[data-sbb-edit-input]')) return;
+        sbbState.editingDraft = t.value;
     });
 
     // ─── PR-20D — "Batch Image + Video" panel ────────────────────────
@@ -853,6 +963,17 @@
         currentVideoBatchRowIds: [],
         listenerInstalled: false,
         sessionKnown: false,
+        // PR-27 — bulk-select state per kind (Set<row_id> as string).
+        // Populated/mutated via toggleRowSelection / selectAllRowIds /
+        // reconcileSelection from storyboard_batch_helpers.js.
+        imageSelected: new Set(),
+        videoSelected: new Set(),
+        // PR-27 — which row is currently in inline-edit mode. Only one
+        // row per kind can be in edit mode at a time so the renderer
+        // doesn't fight itself when the user clicks Edit on a second
+        // row mid-edit. Format: "image:1#0" / "video:2#1" / null.
+        editingRowKey: null,
+        editingDraft: '',
     };
 
     /** Repaint both image and video tables. */
@@ -885,19 +1006,55 @@
 
     /**
      * Render a per-row table for either kind. Same column layout for
-     * both so the panels are visually consistent: # | scene | prompt |
-     * status (pill + progress bar + thumb when settled) | actions.
+     * both so the panels are visually consistent:
+     * select | # | scene | prompt | status | output | actions.
+     *
+     * PR-27: prepended checkbox column, prepended bulk-action toolbar,
+     * promoted Edit / Delete to per-row buttons, and added an
+     * inline-edit textarea state when the user clicks Edit. Settled
+     * rows can't be edited (file already on disk) but can still be
+     * deleted with a confirm prompt.
      */
     function sbbRenderTable(rows, kind) {
         const helpers = window.StoryboardBatchHelpers;
         const summary = helpers.summarizeRows(rows);
+        const selected = sbbGetSelected(kind);
+        const selSummary = (typeof helpers.summarizeSelection === 'function')
+            ? helpers.summarizeSelection(rows, selected)
+            : { total: 0, editable: 0, deletable: 0, inFlight: 0, scenes: new Set() };
         const summaryStr = `total ${summary.total}`
             + (summary.generated ? ` · ${summary.generated} done` : '')
             + (summary.generating ? ` · ${summary.generating} generating` : '')
             + (summary.fallback ? ` · ${summary.fallback} failed` : '')
             + (summary.skipped ? ` · ${summary.skipped} skipped` : '');
+        // PR-27 — bulk-action toolbar. The toolbar is always visible
+        // (even with 0 selected) so the affordance is discoverable
+        // before the user clicks any checkbox.
+        const allRowIds = (typeof helpers.selectAllRowIds === 'function')
+            ? helpers.selectAllRowIds(rows)
+            : new Set();
+        const allSelected = allRowIds.size > 0 && allRowIds.size === selected.size
+            && [...allRowIds].every((id) => selected.has(id));
+        const noneSelected = selected.size === 0;
+        const selStr = noneSelected ? 'no rows selected' : `${selSummary.total} selected`;
+        const rerollDisabled = noneSelected || selSummary.scenes.size === 0;
         let html = `<div class="stats-row"><span>${escapeHtml(summaryStr)}</span></div>`;
+        html += `<div class="sbb-toolbar" data-sbb-toolbar="${escapeHtml(kind)}">`
+            + `<span class="sbb-toolbar-summary">${escapeHtml(selStr)}</span>`
+            + `<button class="secondary" data-sbb-bulk="select-all" data-sbb-kind="${escapeHtml(kind)}"`
+            + `${rows.length === 0 ? ' disabled' : ''}>${allSelected ? 'Deselect all' : 'Select all'}</button>`
+            + `<button class="secondary" data-sbb-bulk="reroll" data-sbb-kind="${escapeHtml(kind)}"`
+            + ` title="Re-roll variant prompts for the selected scenes using the current Visual DNA. Settled / in-flight rows are left alone."`
+            + `${rerollDisabled || kind !== 'image' ? ' disabled' : ''}>Re-roll variants</button>`
+            + `<button class="secondary danger" data-sbb-bulk="delete" data-sbb-kind="${escapeHtml(kind)}"`
+            + ` title="Drop the selected rows from the table. Generated assets stay on disk."`
+            + `${noneSelected ? ' disabled' : ''}>Delete selected</button>`
+            + `</div>`;
         html += `<table class="swc-table"><thead><tr>
+            <th class="sbb-select-cell"><input type="checkbox" data-sbb-bulk="header-select"
+                data-sbb-kind="${escapeHtml(kind)}"
+                ${allSelected ? 'checked' : ''}
+                ${rows.length === 0 ? 'disabled' : ''} /></th>
             <th>#</th><th>Scene</th><th>Prompt</th><th>Status</th><th>Output</th><th>Actions</th>
         </tr></thead><tbody>`;
         // PR-24: count variants per scene_id so we can render
@@ -907,6 +1064,7 @@
         const variantTotals = (typeof helpers.buildVariantTotals === 'function')
             ? helpers.buildVariantTotals(rows)
             : new Map();
+        const editKey = sbbState.editingRowKey;
         for (const r of rows) {
             const label = helpers.statusLabel(r.status);
             const cls = helpers.statusClass(r.status);
@@ -940,18 +1098,84 @@
                 bridgeChip = ` <a href="#" class="bridge-chip" data-sbb-make-video="${escapeHtml(r.scene_id != null ? r.scene_id : '')}" data-sbb-make-video-row="${escapeHtml(r.row_id || '')}">▶ Make video</a>`;
             }
             const baseActions = outPath ? sbbRenderPathActions(outPath) : '';
-            const actions = (baseActions || bridgeChip) ? `${baseActions}${bridgeChip}` : '<span class="muted">—</span>';
-            html += `<tr>
+            const editable = (typeof helpers.canEditRow === 'function') ? helpers.canEditRow(r) : true;
+            const deletable = (typeof helpers.canDeleteRow === 'function') ? helpers.canDeleteRow(r) : true;
+            const editTitle = editable
+                ? 'Edit prompt before generating'
+                : (r.status === 'generating'
+                    ? 'Cannot edit — row is generating; cancel via Delete first'
+                    : 'Cannot edit a settled row — output is already on disk');
+            const editBtn = `<button class="sbb-icon-btn" data-sbb-row-action="edit"`
+                + ` data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(r.row_id || '')}"`
+                + ` title="${escapeHtml(editTitle)}"${editable ? '' : ' disabled'}>Edit</button>`;
+            const delBtn = `<button class="sbb-icon-btn danger" data-sbb-row-action="delete"`
+                + ` data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(r.row_id || '')}"`
+                + ` title="Drop this row from the table"${deletable ? '' : ' disabled'}>Delete</button>`;
+            const rowActions = `<div class="sbb-row-actions">${editBtn}${delBtn}${baseActions}${bridgeChip}</div>`;
+            const rowKey = `${kind}:${r.row_id}`;
+            const inEdit = editKey === rowKey;
+            const promptCell = inEdit
+                ? sbbRenderEditShell(kind, r)
+                : escapeHtml(r.prompt || '');
+            const isSelected = selected.has(String(r.row_id));
+            const trCls = isSelected ? ' class="sbb-row-selected"' : '';
+            html += `<tr${trCls}>
+                <td class="sbb-select-cell"><input type="checkbox" data-sbb-row-select="${escapeHtml(r.row_id || '')}" data-sbb-kind="${escapeHtml(kind)}" ${isSelected ? 'checked' : ''} /></td>
                 <td class="scene-num">${escapeHtml(r.order)}</td>
                 <td><b>${escapeHtml(sceneCellLabel)}</b><div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
-                <td class="prompt-cell">${escapeHtml(r.prompt || '')}</td>
+                <td class="prompt-cell">${promptCell}</td>
                 <td>${statusCell}</td>
                 <td>${outCell}</td>
-                <td class="actions">${actions}</td>
+                <td class="actions">${rowActions}</td>
             </tr>`;
         }
         html += '</tbody></table>';
         return html;
+    }
+
+    /**
+     * PR-27 — inline-edit shell for the prompt cell. A textarea
+     * pre-filled with the row's current prompt + Save / Cancel
+     * buttons. The textarea uses ``data-sbb-edit-input`` so the
+     * delegated change handler can read its value back without
+     * needing an id.
+     */
+    function sbbRenderEditShell(kind, row) {
+        const draft = sbbState.editingDraft != null ? sbbState.editingDraft : (row.prompt || '');
+        return `<div class="sbb-edit-shell" data-sbb-edit-shell="${escapeHtml(kind)}:${escapeHtml(row.row_id || '')}">`
+            + `<textarea class="sbb-edit-input" data-sbb-edit-input="${escapeHtml(kind)}:${escapeHtml(row.row_id || '')}" rows="3">${escapeHtml(draft)}</textarea>`
+            + `<div class="sbb-edit-actions">`
+            + `<button class="sbb-icon-btn" data-sbb-edit-action="save" data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(row.row_id || '')}" title="Save prompt edit (Enter)">Save</button>`
+            + `<button class="sbb-icon-btn" data-sbb-edit-action="cancel" data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(row.row_id || '')}" title="Cancel edit (Esc)">Cancel</button>`
+            + `</div>`
+            + `</div>`;
+    }
+
+    /** Per-kind selection accessor. */
+    function sbbGetSelected(kind) {
+        return kind === 'video' ? sbbState.videoSelected : sbbState.imageSelected;
+    }
+
+    /** Per-kind rows accessor. */
+    function sbbGetRows(kind) {
+        return kind === 'video' ? sbbState.videoRows : sbbState.imageRows;
+    }
+
+    /** Per-kind rows mutator. */
+    function sbbSetRows(kind, rows) {
+        if (kind === 'video') sbbState.videoRows = rows;
+        else sbbState.imageRows = rows;
+    }
+
+    /** Per-kind selection mutator. */
+    function sbbSetSelected(kind, selected) {
+        if (kind === 'video') sbbState.videoSelected = selected;
+        else sbbState.imageSelected = selected;
+    }
+
+    /** Repaint the right side of the panel after a kind-specific change. */
+    function sbbRepaintKind(kind) {
+        if (kind === 'video') sbbRepaintVideo(); else sbbRepaintImage();
     }
 
     function sbbRenderPathActions(path) {
@@ -1127,6 +1351,308 @@
         sbbState.imageRows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene });
         sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene });
         sbbRepaintAll();
+    }
+
+    /**
+     * PR-27 — keep the Batch image-rows table in sync with the latest
+     * scene_breakdown response. Called automatically from
+     * renderSceneBreakdown so the user sees image_prompts variants
+     * without clicking "Auto-fill from scenes" first. Settled / in-
+     * flight rows are NOT clobbered: when the existing rows already
+     * cover the same scene_id × variant_idx grid we leave the table
+     * alone so progress and outputs stay attached to their rows. Any
+     * other case (no rows yet, scene set changed, variant count
+     * changed) does a full refresh.
+     */
+    function sbbSyncFromScenes(scenes) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers || !Array.isArray(scenes)) return;
+        const imagesPerScene = state.lastImagesPerScene || sbbReadVariantCount('sbb-images-per-scene', 4);
+        const expectedRowIds = new Set();
+        for (const s of scenes) {
+            if (!s || s.scene_id == null) continue;
+            for (let v = 0; v < imagesPerScene; v += 1) {
+                expectedRowIds.add(`${s.scene_id}#${v}`);
+            }
+        }
+        const existing = new Set();
+        let hasInFlight = false;
+        for (const r of sbbState.imageRows) {
+            existing.add(String(r.row_id));
+            if (r.status === 'generating') hasInFlight = true;
+        }
+        // Same scene/variant grid + something is settled or generating
+        // → leave the table alone. Otherwise rebuild from scratch.
+        let sameGrid = expectedRowIds.size === existing.size;
+        if (sameGrid) {
+            for (const id of expectedRowIds) {
+                if (!existing.has(id)) { sameGrid = false; break; }
+            }
+        }
+        if (sameGrid && (hasInFlight || sbbState.imageRows.some((r) => r.status === 'generated' || r.status === 'retried'))) {
+            return;
+        }
+        sbbState.imageRows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene });
+        // Video rows refresh too — variants per scene comes from the
+        // separate video select.
+        const videosPerScene = sbbReadVariantCount('sbb-videos-per-scene', 2);
+        sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene });
+        // Drop any selection that no longer matches a row.
+        sbbState.imageSelected = helpers.reconcileSelection(sbbState.imageSelected, sbbState.imageRows);
+        sbbState.videoSelected = helpers.reconcileSelection(sbbState.videoSelected, sbbState.videoRows);
+        sbbRepaintAll();
+    }
+
+    /**
+     * PR-27 — flip a single row's selection state for the given kind
+     * and repaint just that table.
+     */
+    function sbbToggleRow(kind, rowId) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const next = helpers.toggleRowSelection(sbbGetSelected(kind), rowId);
+        sbbSetSelected(kind, next);
+        sbbRepaintKind(kind);
+    }
+
+    /**
+     * PR-27 — header checkbox / "Select all" button. When some rows
+     * are selected, clicking selects everything; when ALL rows are
+     * selected, clicking deselects everything. Mirrors the typical
+     * spreadsheet UX.
+     */
+    function sbbToggleSelectAll(kind) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const rows = sbbGetRows(kind);
+        const selected = sbbGetSelected(kind);
+        const allIds = helpers.selectAllRowIds(rows);
+        const isAll = allIds.size > 0 && selected.size === allIds.size
+            && [...allIds].every((id) => selected.has(id));
+        sbbSetSelected(kind, isAll ? new Set() : allIds);
+        sbbRepaintKind(kind);
+    }
+
+    /**
+     * PR-27 — enter inline-edit mode for a single row. Settled rows
+     * are guarded at the helper layer; the click handler also disables
+     * the button itself so this is mostly belt-and-braces.
+     */
+    function sbbBeginEdit(kind, rowId) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const rows = sbbGetRows(kind);
+        const row = rows.find((r) => String(r.row_id) === String(rowId));
+        if (!row || !helpers.canEditRow(row)) return;
+        sbbState.editingRowKey = `${kind}:${rowId}`;
+        sbbState.editingDraft = row.prompt || '';
+        sbbRepaintKind(kind);
+        // Focus the textarea after the repaint so the user can start
+        // typing immediately.
+        setTimeout(() => {
+            const ta = document.querySelector(`textarea[data-sbb-edit-input="${kind}:${rowId}"]`);
+            if (ta) {
+                ta.focus();
+                const len = ta.value.length;
+                try { ta.setSelectionRange(len, len); } catch (_) { /* IE polyfill not needed */ }
+            }
+        }, 0);
+    }
+
+    /** PR-27 — commit the in-progress edit back into the row. */
+    function sbbSaveEdit(kind, rowId) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        // Read the textarea's current value first — input handler keeps
+        // the draft in sync, but during a programmatic save we want to
+        // be defensive and re-read in case a frame was dropped.
+        const ta = document.querySelector(`textarea[data-sbb-edit-input="${kind}:${rowId}"]`);
+        const draft = ta ? ta.value : (sbbState.editingDraft || '');
+        sbbSetRows(kind, helpers.updatePromptForRow(sbbGetRows(kind), rowId, draft));
+        sbbState.editingRowKey = null;
+        sbbState.editingDraft = '';
+        sbbRepaintKind(kind);
+    }
+
+    /** PR-27 — abandon the in-progress edit; the row keeps its old prompt. */
+    function sbbCancelEdit(kind) {
+        sbbState.editingRowKey = null;
+        sbbState.editingDraft = '';
+        sbbRepaintKind(kind || 'image');
+    }
+
+    /** PR-27 — drop a single row from the table. */
+    function sbbDeleteRow(kind, rowId) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const rows = sbbGetRows(kind);
+        const row = rows.find((r) => String(r.row_id) === String(rowId));
+        if (!row) return;
+        // Confirm before nuking a settled / in-flight row so the user
+        // doesn't lose progress by accident. Pending / fallback /
+        // skipped rows delete silently — the asset cost was zero.
+        if (row.status === 'generating' || row.status === 'generated' || row.status === 'retried') {
+            const msg = row.status === 'generating'
+                ? `Cancel scene ${row.scene_id} variant ${(row.variant_idx || 0) + 1}? The Grok call will keep running but its result will be ignored.`
+                : `Drop scene ${row.scene_id} variant ${(row.variant_idx || 0) + 1}? The generated file stays on disk.`;
+            if (typeof window.confirm === 'function' && !window.confirm(msg)) return;
+        }
+        sbbSetRows(kind, helpers.removeRows(rows, [rowId]));
+        sbbSetSelected(kind, helpers.reconcileSelection(sbbGetSelected(kind), sbbGetRows(kind)));
+        // If we just deleted the row that was being edited, exit edit mode.
+        if (sbbState.editingRowKey === `${kind}:${rowId}`) {
+            sbbState.editingRowKey = null;
+            sbbState.editingDraft = '';
+        }
+        sbbRepaintKind(kind);
+    }
+
+    /** PR-27 — drop every selected row from the table (with confirm for batches >1). */
+    function sbbDeleteSelected(kind) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const selected = sbbGetSelected(kind);
+        if (!selected.size) return;
+        const rows = sbbGetRows(kind);
+        const summary = helpers.summarizeSelection(rows, selected);
+        const settledOrInFlight = rows.filter((r) => selected.has(String(r.row_id)) && (r.status === 'generating' || r.status === 'generated' || r.status === 'retried')).length;
+        let proceed = true;
+        if (settledOrInFlight > 0 && typeof window.confirm === 'function') {
+            const msg = `Drop ${selected.size} row${selected.size === 1 ? '' : 's'}? `
+                + `${settledOrInFlight} of them ${settledOrInFlight === 1 ? 'is' : 'are'} settled or generating — files on disk stay, but in-flight Grok calls will have their results ignored.`;
+            proceed = window.confirm(msg);
+        }
+        if (!proceed) return;
+        sbbSetRows(kind, helpers.removeRows(rows, selected));
+        sbbSetSelected(kind, new Set());
+        // Clear edit mode if the edited row was in the doomed set.
+        if (sbbState.editingRowKey && sbbState.editingRowKey.startsWith(`${kind}:`)) {
+            const editedRowId = sbbState.editingRowKey.slice(kind.length + 1);
+            if (selected.has(editedRowId)) {
+                sbbState.editingRowKey = null;
+                sbbState.editingDraft = '';
+            }
+        }
+        // Suppress the unused-var warning from the linter — summary is
+        // captured for future telemetry / status messaging.
+        void summary;
+        sbbRepaintKind(kind);
+    }
+
+    /**
+     * PR-27 — re-roll variant prompts for every selected scene using
+     * the current Visual DNA. Walks the unique scene_ids in the
+     * selection, calls /producer/variant_prompts for each, and merges
+     * results back via applyVariantPrompts. Settled / in-flight rows
+     * are protected at the helper layer.
+     *
+     * Only the image table supports re-roll today; the video
+     * table's prompts come from a different LLM path
+     * (flow_video_prompt) which PR-27 does not change.
+     */
+    async function sbbRerollSelected(kind) {
+        if (kind !== 'image') return; // toolbar disables it for video, but be defensive
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        if (!api || !api.storyboard || typeof api.storyboard.variantPrompts !== 'function') {
+            const target = $('sbb-image-result');
+            if (target) target.insertAdjacentHTML('afterbegin',
+                '<div class="error">storyboard.variantPrompts IPC unavailable — rebuild Electron.</div>');
+            return;
+        }
+        const selected = sbbGetSelected(kind);
+        if (!selected.size) return;
+        const rows = sbbGetRows(kind);
+        // Collect the scene_ids touched by the selection, deduped.
+        const sceneIds = new Set();
+        const sceneMeta = new Map(); // scene_id → representative row (for the LLM payload)
+        for (const r of rows) {
+            if (!selected.has(String(r.row_id))) continue;
+            if (r.scene_id == null) continue;
+            sceneIds.add(String(r.scene_id));
+            if (!sceneMeta.has(String(r.scene_id))) sceneMeta.set(String(r.scene_id), r);
+        }
+        if (!sceneIds.size) return;
+        const dna = (state.lastVisualDna || (($('sb-visual-dna') || {}).value || '')).trim();
+        const count = state.lastImagesPerScene || sbbReadVariantCount('sbb-images-per-scene', 4);
+        // Match the matching scene from the original scene_breakdown
+        // for richer context (title / narration / flow_video_prompt).
+        const scenesById = new Map();
+        for (const s of (state.lastScenes || [])) {
+            if (s && s.scene_id != null) scenesById.set(String(s.scene_id), s);
+        }
+        const target = $('sbb-image-result');
+        // Mark a transient hint so the user knows something's happening.
+        if (target) {
+            target.insertAdjacentHTML('afterbegin',
+                `<div class="info" data-sbb-reroll-banner>Re-rolling variants for ${sceneIds.size} scene${sceneIds.size === 1 ? '' : 's'}…</div>`);
+        }
+        const warnings = [];
+        for (const sid of sceneIds) {
+            const fallbackRow = sceneMeta.get(sid);
+            const sceneFromBreakdown = scenesById.get(sid);
+            const sceneIn = {
+                scene_id: Number(sid) || sid,
+                title: (sceneFromBreakdown && sceneFromBreakdown.title) || (fallbackRow && fallbackRow.title) || '',
+                narration: (sceneFromBreakdown && sceneFromBreakdown.narration) || '',
+                image_prompt: (sceneFromBreakdown && sceneFromBreakdown.image_prompt) || (fallbackRow && fallbackRow.prompt) || '',
+                flow_video_prompt: (sceneFromBreakdown && sceneFromBreakdown.flow_video_prompt) || '',
+            };
+            try {
+                const res = await api.storyboard.variantPrompts({
+                    scene: sceneIn,
+                    count,
+                    visual_dna: dna,
+                });
+                const prompts = res && Array.isArray(res.prompts) ? res.prompts : [];
+                if (Array.isArray(res && res.warnings)) warnings.push(...res.warnings);
+                sbbSetRows('image', helpers.applyVariantPrompts(sbbGetRows('image'), sid, prompts));
+            } catch (err) {
+                warnings.push(`scene ${sid}: ${(err && err.message) || err}`);
+            }
+        }
+        sbbRepaintImage();
+        // Drop the transient banner.
+        const banner = document.querySelector('[data-sbb-reroll-banner]');
+        if (banner && banner.parentNode) banner.parentNode.removeChild(banner);
+        if (warnings.length) {
+            const msg = `Re-roll completed with warnings: ${warnings.join(' · ')}`;
+            const hint = $('sbb-image-result');
+            if (hint) hint.insertAdjacentHTML('afterbegin', `<div class="info">${escapeHtml(msg)}</div>`);
+        }
+    }
+
+    /**
+     * PR-27 — "Re-roll variants" button next to "Break into scenes"
+     * (Storyboard panel). Re-rolls variants for every scene currently
+     * loaded in the image batch table. Convenient for "I just edited
+     * Visual DNA, refresh everything" without clicking through every
+     * row. Falls back to a no-op (with a friendly message) when there
+     * are no scenes loaded.
+     */
+    async function sbbRerollAll() {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const rows = sbbState.imageRows;
+        if (!rows.length) {
+            const target = $('sb-result');
+            if (target) {
+                target.insertAdjacentHTML('afterbegin',
+                    '<div class="error">No scenes loaded — click "Break into scenes" first, then re-roll.</div>');
+            }
+            return;
+        }
+        const allIds = helpers.selectAllRowIds(rows);
+        const prev = sbbState.imageSelected;
+        sbbState.imageSelected = allIds;
+        try {
+            await sbbRerollSelected('image');
+        } finally {
+            // Restore the user's prior selection — re-roll all is a
+            // one-shot action, not a selection change.
+            sbbState.imageSelected = helpers.reconcileSelection(prev, sbbState.imageRows);
+            sbbRepaintImage();
+        }
     }
 
     function sbbReadVariantCount(elementId, fallback) {
@@ -1678,6 +2204,9 @@
         'storyboard-batch-image': sbbGenerateImages,
         'storyboard-batch-video': sbbGenerateVideos,
         'storyboard-batch-login': sbbOpenLogin,
+        // PR-27: re-roll all variants for every scene currently in
+        // the image-batch table using the current Visual DNA.
+        'storyboard-reroll-variants': sbbRerollAll,
         // PR-24: native folder pickers — drop the chosen path into the
         // matching <input>. Cancel is a no-op (preserves current value).
         'storyboard-batch-pick-output': async () => sbbPickOutputDir('sbb-output-dir'),
