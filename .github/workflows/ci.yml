@@ -84,6 +84,7 @@ jobs:
           node --check desktop/dist/creator-forge.js
           node --check desktop/dist/storyboard_compose_helpers.js
           node --check desktop/dist/storyboard_video_compose_helpers.js
+          node --check desktop/dist/storyboard_compose_table_helpers.js
 
       - name: Offline regression tests (no puppeteer install required)
         run: |
@@ -93,6 +94,7 @@ jobs:
           node desktop/tests/test_e2e_compose_script.js
           node desktop/tests/test_storyboard_compose_helpers.js
           node desktop/tests/test_storyboard_video_compose_helpers.js
+          node desktop/tests/test_storyboard_compose_table_helpers.js
           node desktop/tests/test_research_sidecar_lookup.js
           node desktop/tests/test_fetch_python_runtime.js
 
