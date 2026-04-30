@@ -513,6 +513,21 @@ ipcMain.handle('file:deleteFile', async (_, filePath) => {
     }
 });
 
+// Lightweight size probe — used by renderer-side flows that only need to
+// know whether a file passes the ≥50KB blur-rejection threshold (PR-9). We
+// reply with `{ exists, size }` so a missing file is a soft signal rather
+// than an exception that has to be caught in the renderer.
+ipcMain.handle('file:statBytes', async (_, filePath) => {
+    try {
+        const fs = require('fs');
+        if (!filePath) return { exists: false, size: 0 };
+        const stats = fs.statSync(filePath);
+        return { exists: true, size: Number(stats.size) || 0 };
+    } catch (error) {
+        return { exists: false, size: 0 };
+    }
+});
+
 ipcMain.handle('account:importTxt', async () => {
     try {
         const result = await dialog.showOpenDialog(mainWindow, {

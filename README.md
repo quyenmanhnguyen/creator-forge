@@ -482,6 +482,20 @@ node scripts/e2e_compose_with_scene_assets.js \
 Pair it with `e2e_autogrok_image.js` to chain a full
 AutoGrok → compose smoke from a single shell.
 
+#### "Compose with AutoGrok" button (PR-16)
+The Storyboard tab also exposes the full pipeline as a single click. After
+running **Break into scenes**, scroll to the **Compose with AutoGrok**
+panel, pick a voice / gradient fallback / optional Grok aspect ratio,
+and click. The renderer drives `image:generate` (one image per scene),
+filters each scene's results to the first ≥ 50 KB savedFile (PR-9), and
+posts the resulting `scene_assets[]` into `/producer/short`. Loading
+state flips explicitly between *"Generating N Grok image(s)..."* and
+*"Composing 9:16 mp4..."* so you can tell which phase is slow. Result
+card shows `mp4_path`, `scenes_used`, `scenes_missing`, the resolved
+per-scene windows, and any skip reasons. See
+[docs/e2e-full-pipeline.md](docs/e2e-full-pipeline.md) for the full
+walkthrough.
+
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
 `{ prompts: object[], count, account }`, but the IPC handler

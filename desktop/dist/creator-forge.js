@@ -30,6 +30,10 @@
         lastTitle: '',
         lastOutlineParts: null,   // array of {part, role, emotion, expansion}
         lastScript: '',
+        // Latest scene_breakdown — captured so "Compose with AutoGrok"
+        // (PR-16) can pick up scenes without re-running the LLM.
+        lastScenes: [],
+        lastSceneScript: '',
     };
 
     // ─── Tabs ──────────────────────────────────────────────────────────────
@@ -688,6 +692,10 @@
 
     function renderSceneBreakdown(data) {
         const scenes = (data && data.scenes) || [];
+        // Capture for the "Compose with AutoGrok" handoff (PR-16). The
+        // panel reuses the same script that was just broken into scenes.
+        state.lastScenes = scenes.slice();
+        state.lastSceneScript = asNonEmpty($('sb-script').value) || '';
         let html = '';
         html += `<div class="stats-row">
             <span>Template<b>${escapeHtml(data.template_label || data.template_key || '')}</b></span>
@@ -774,7 +782,7 @@
         const d = data || {};
         let html = '';
         html += `<div class="stats-row">
-            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed ? d.duration_s.toFixed(2) : d.duration_s)}s</b></span>
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
             <span>Engine<b>${escapeHtml(d.engine || '')}</b></span>
             <span>Style<b>${escapeHtml(d.style || '')}</b></span>
@@ -798,6 +806,195 @@
         html += renderWarnings(d.warnings);
         html += renderRawJson(d);
         $('ps-result').innerHTML = html;
+    }
+
+    // ─── Storyboard: Compose with AutoGrok (PR-16) ─────────────────────────
+    // One-click drives the full pipeline:
+    //   image:generate (1 image per scene)
+    //   → pick first ≥50KB savedFile per scene (PR-9 blur threshold)
+    //   → producer:composeShort with scene_assets[]
+    // Loading state explicitly flips between the two phases so the user
+    // sees "generating images" → "composing MP4" rather than one opaque spinner.
+    async function runStoryboardCompose() {
+        const helpers = (typeof window !== 'undefined' && window.StoryboardComposeHelpers) || null;
+        if (!helpers) {
+            showError('swc-result', { message: 'storyboard_compose_helpers.js failed to load (check the renderer console).' });
+            return;
+        }
+        if (!api || !api.image || typeof api.image.generate !== 'function') {
+            showError('swc-result', { message: 'electronAPI.image.generate is unavailable — run via `npm run dev`.' });
+            return;
+        }
+        if (!api.producer || typeof api.producer.composeShort !== 'function') {
+            showError('swc-result', { message: 'electronAPI.producer.composeShort is unavailable — sidecar bridge missing.' });
+            return;
+        }
+        if (typeof api.statBytes !== 'function') {
+            showError('swc-result', { message: 'electronAPI.statBytes is unavailable — preload.js out of date (rebuild Electron).' });
+            return;
+        }
+
+        const scenes = (state.lastScenes || []).slice();
+        if (!scenes.length) {
+            showError('swc-result', { status: 422, message: 'Run "Break into scenes" first — no scene_breakdown captured yet.' });
+            return;
+        }
+        const script = state.lastSceneScript || asNonEmpty($('sb-script').value);
+        if (!script) {
+            showError('swc-result', { status: 422, message: 'Storyboard script is empty — paste one above first.' });
+            return;
+        }
+
+        // ── Phase 1: image:generate ────────────────────────────────────
+        // Plan first so the loading message reflects the actual number of
+        // prompts that will be sent (skipped scenes shouldn't inflate the
+        // count the user sees during the 30–120s wait).
+        const { prompts, indexMap, skipped: planSkipped } = helpers.planPromptsFromScenes(scenes);
+        if (!prompts.length) {
+            const skipDetail = planSkipped
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
+                .join('; ');
+            showError('swc-result', {
+                status: 422,
+                message: `No usable scenes — every scene is missing image_prompt or duration_s. ${skipDetail ? '(' + skipDetail + ')' : ''}`,
+            });
+            return;
+        }
+
+        const skipNote = planSkipped.length
+            ? ` (${planSkipped.length} scene${planSkipped.length === 1 ? '' : 's'} skipped — missing image_prompt or duration_s)`
+            : '';
+        showLoading('swc-result', `Generating ${prompts.length} Grok image(s) — one per usable scene${skipNote} (this can take 30–120s, requires an active Grok session)...`);
+
+        const config = { imageGenerationCount: 1 };
+        const aspect = asNonEmpty($('swc-aspect').value);
+        if (aspect) config.aspectRatio = aspect;
+
+        let imageGenerate;
+        try {
+            imageGenerate = await api.image.generate({ prompts, config });
+        } catch (err) {
+            showError('swc-result', { message: `image:generate IPC threw: ${err && err.message ? err.message : String(err)}` });
+            return;
+        }
+
+        if (!imageGenerate || imageGenerate.success === false) {
+            const why = (imageGenerate && imageGenerate.error)
+                ? imageGenerate.error
+                : 'Unknown — most common cause is no active Grok session. Open the Login panel, sign in, then retry.';
+            showError('swc-result', { message: `Grok image generation failed: ${why}` });
+            return;
+        }
+
+        // ── Phase 2: pick ≥50KB files + compose ────────────────────────
+        showLoading('swc-result', 'Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)...');
+
+        const statBytesAsync = (p) => api.statBytes(p);
+        const { sceneAssets, skipped: pickSkipped } = await helpers.buildSceneAssetsFromImageBatch(
+            scenes, imageGenerate, statBytesAsync,
+        );
+
+        if (!sceneAssets.length) {
+            // Inline the per-scene skip reasons so the user sees "all blur" /
+            // "no files" instead of the misleading generic "sidecar down"
+            // friendly message that showError() falls back to. Avoid stuffing
+            // the full imageGenerate response into err.body — it can be huge
+            // and showError stringifies it on top of the message.
+            const skipDetail = (pickSkipped || [])
+                .map((s) => `scene ${s.scene_id != null ? s.scene_id : '?'}: ${s.reason}`)
+                .join('; ');
+            showError('swc-result', {
+                message: `No scenes had a usable Grok image (every result < 50 KB or empty). Composer would just be gradient — aborting so you can retry image generation. ${skipDetail ? '(' + skipDetail + ')' : ''}`,
+            });
+            return;
+        }
+
+        const composePayload = {
+            script,
+            scene_assets: helpers.stripSceneAssetForComposer(sceneAssets),
+            voice: $('swc-voice').value || 'en-US-AriaNeural',
+            style: $('swc-style').value || 'violet-pink',
+            write_srt: !!$('swc-write-srt').checked,
+        };
+        const outDir = asNonEmpty($('swc-output-dir').value);
+        if (outDir) composePayload.output_dir = outDir;
+
+        let compose;
+        try {
+            compose = await api.producer.composeShort(composePayload);
+        } catch (err) {
+            showError('swc-result', { message: `producer:composeShort IPC threw: ${err && err.message ? err.message : String(err)}` });
+            return;
+        }
+
+        renderStoryboardCompose({
+            compose,
+            sceneAssets,
+            skipped: pickSkipped,
+            promptCount: prompts.length,
+            sceneCount: scenes.length,
+            indexMap,
+        });
+    }
+
+    function renderStoryboardCompose({ compose, sceneAssets, skipped, promptCount, sceneCount }) {
+        const d = compose || {};
+        let html = '';
+        html += `<div class="stats-row">
+            <span>Scenes total<b>${escapeHtml(sceneCount)}</b></span>
+            <span>Prompts sent<b>${escapeHtml(promptCount)}</b></span>
+            <span>scenes_used<b>${escapeHtml(d.scenes_used != null ? d.scenes_used : sceneAssets.length)}</b></span>
+            <span>scenes_missing<b>${escapeHtml(d.scenes_missing != null ? d.scenes_missing : 0)}</b></span>
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
+            <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
+        </div>`;
+
+        const paths = [
+            ['mp4', d.mp4_path],
+            ['voice.mp3', d.audio_path],
+            ['captions.srt', d.srt_path],
+        ].filter(([, p]) => !!p);
+        if (paths.length) {
+            html += `<div class="scene-card"><div class="scene-title">Output files</div>`;
+            paths.forEach(([label, p]) => {
+                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code></div>`;
+            });
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
+        } else {
+            html += renderEmpty('No mp4 produced. Check warnings — image generate may have all been < 50 KB.');
+        }
+
+        if (sceneAssets && sceneAssets.length) {
+            html += `<div class="scene-card"><div class="scene-title">Scene assets used (${sceneAssets.length})</div>`;
+            sceneAssets.forEach((sa) => {
+                html += `<div class="scene-block"><span class="scene-label">scene ${escapeHtml(sa.scene_id != null ? sa.scene_id : '?')}: ${escapeHtml(sa.start_s)}–${escapeHtml((sa.start_s + sa.duration_s).toFixed ? (sa.start_s + sa.duration_s).toFixed(3) : (sa.start_s + sa.duration_s))}s</span><code>${escapeHtml(sa.image_path)}</code></div>`;
+            });
+            html += `</div>`;
+        }
+        if (skipped && skipped.length) {
+            const items = skipped.map((s) => `<li>scene ${escapeHtml(s.scene_id != null ? s.scene_id : '?')}: ${escapeHtml(s.reason || '')}</li>`).join('');
+            html += `<div class="warning-list"><div class="warning-title">Scenes skipped (${skipped.length})</div><ul>${items}</ul></div>`;
+        }
+        html += renderWarnings(d.warnings);
+        html += renderRawJson(d);
+        $('swc-result').innerHTML = html;
+    }
+
+    async function populateStoryboardComposeVoicePicker() {
+        if (!api) return;
+        const sel = $('swc-voice');
+        if (!sel) return;
+        try {
+            const data = await api.producer.listVoices();
+            if (!data || !Array.isArray(data.voices) || !data.voices.length) return;
+            const current = sel.value;
+            sel.innerHTML = data.voices
+                .map((v) => `<option value="${escapeHtml(v.short_name)}">${escapeHtml(v.label || v.short_name)}</option>`)
+                .join('');
+            const desired = current || data.default || data.voices[0].short_name;
+            const found = Array.from(sel.options).find((o) => o.value === desired);
+            if (found) sel.value = desired;
+        } catch (_) { /* sidecar still booting — retry on the next poll */ }
     }
 
     function copyScriptFromStoryboard() {
@@ -848,6 +1045,7 @@
         humanize: runHumanize,
         'scene-breakdown': runSceneBreakdown,
         'compose-short': runComposeShort,
+        'storyboard-compose': runStoryboardCompose,
     };
 
     function setupRunButtons() {
@@ -880,10 +1078,15 @@
         // attempt may hit the soft sentinel; retry alongside the status poll
         // so the picker fills in shortly after cold start.
         populateVoicePicker();
+        populateStoryboardComposeVoicePicker();
         const voicePollHandle = setInterval(() => {
-            const sel = $('ps-voice');
-            if (sel && sel.options.length > 1) { clearInterval(voicePollHandle); return; }
-            populateVoicePicker();
+            const ps = $('ps-voice');
+            const swc = $('swc-voice');
+            const psReady = !ps || ps.options.length > 1;
+            const swcReady = !swc || swc.options.length > 1;
+            if (psReady && swcReady) { clearInterval(voicePollHandle); return; }
+            if (!psReady) populateVoicePicker();
+            if (!swcReady) populateStoryboardComposeVoicePicker();
         }, 5000);
         // Re-poll every 5s so the dot recovers when the sidecar comes online late.
         setInterval(refreshSidecarStatus, 5000);
