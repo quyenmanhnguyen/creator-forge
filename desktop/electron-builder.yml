@@ -94,7 +94,27 @@ win:
   # `npm run dist:win`. See scripts/python-runtime.config.json for
   # pinning. This path is platform-scoped on purpose: macOS and Linux
   # bundled runtimes are deliberately a follow-up PR.
+  #
+  # IMPORTANT: electron-builder REPLACES the top-level `extraResources`
+  # with this platform-specific one (no merge), so we must redeclare
+  # the research/ sidecar entry here too — otherwise the Windows
+  # installer would ship python.exe but no research/api/main.py and
+  # the sidecar would fail to start.
   extraResources:
+    - from: "../research"
+      to: "research"
+      filter:
+        - "**/*"
+        - "!__pycache__/**"
+        - "!**/__pycache__/**"
+        - "!*.pyc"
+        - "!**/*.pyc"
+        - "!.pytest_cache/**"
+        - "!.ruff_cache/**"
+        - "!.venv/**"
+        - "!venv/**"
+        - "!tests/**"
+        - "!**/*.egg-info/**"
     - from: "build/python-runtime/win32-x64/python"
       to: "python"
       filter:
