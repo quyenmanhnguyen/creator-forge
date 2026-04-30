@@ -458,6 +458,16 @@ The harness pops up a Chrome window for manual login on first run, then
 reuses the persisted cookies on every subsequent run. Output images go
 to `e2e-output/<timestamp>/` (gitignored).
 
+#### Verifying the full pipeline end-to-end (research → compose with real images)
+Once AutoGrok image generation is verified, the next step is composing
+a 9:16 mp4 with the **real Grok-generated images** instead of the
+gradient placeholder. PR-14 wired `scene_assets` through `/producer/short`
+and added `StoryboardBridge.composeWithScenes` to orchestrate the
+storyboard → AutoGrok → compose handoff. See
+[docs/e2e-full-pipeline.md](docs/e2e-full-pipeline.md) for the full
+walkthrough — including a curl-only path that drives `/producer/short`
+directly with images saved by the AutoGrok harness.
+
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
 `{ prompts: object[], count, account }`, but the IPC handler
