@@ -11,6 +11,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openPath: (filePath) => ipcRenderer.invoke('file:openPath', filePath),
     showItemInFolder: (filePath) => ipcRenderer.invoke('file:showItemInFolder', filePath),
     deleteFile: (filePath) => ipcRenderer.invoke('file:deleteFile', filePath),
+    // Size-only stat for use cases where readFile would be wasteful
+    // (e.g. PR-9 ≥50KB blur threshold filtering after image:generate).
+    statBytes: (filePath) => ipcRenderer.invoke('file:statBytes', filePath),
 
     auth: {
         login: (credentials) => ipcRenderer.invoke('auth:login', credentials),

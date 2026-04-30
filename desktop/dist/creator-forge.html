@@ -663,6 +663,49 @@
                 <div class="result" id="sb-result"></div>
             </div>
 
+            <div class="panel" data-form="storyboard-compose">
+                <h2>Compose with AutoGrok <span class="pill">image:generate → /producer/short</span></h2>
+                <div class="desc">
+                    One-click full pipeline: generate one Grok image per scene from the
+                    breakdown above, then compose a 9:16 mp4 with those images
+                    Ken-Burns'd over each scene's audio window. Falls back to gradient for
+                    scenes whose image is &lt; 50&nbsp;KB or fails moderation (PR-9 threshold).
+                    Requires a working Grok session — open the Login panel first if needed.
+                </div>
+                <div class="form-grid">
+                    <label>Voice
+                        <select id="swc-voice"><option value="en-US-AriaNeural">en-US-AriaNeural · Aria · F</option></select>
+                    </label>
+                    <label>Style (gradient fallback)
+                        <select id="swc-style">
+                            <option value="violet-pink">violet-pink</option>
+                            <option value="sunset">sunset</option>
+                            <option value="ocean">ocean</option>
+                            <option value="mono">mono</option>
+                            <option value="matcha">matcha</option>
+                        </select>
+                    </label>
+                    <label>Aspect ratio (Grok image)
+                        <select id="swc-aspect">
+                            <option value="">auto (1:1 default)</option>
+                            <option value="9:16">9:16</option>
+                            <option value="1:1">1:1</option>
+                            <option value="16:9">16:9</option>
+                        </select>
+                    </label>
+                    <label>Output dir (blank = ~/.creator-forge/output/short-&lt;ts&gt;/)
+                        <input id="swc-output-dir" type="text" placeholder="auto" />
+                    </label>
+                    <label class="checkbox-row">
+                        <input id="swc-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="primary" data-run="storyboard-compose">Compose with AutoGrok</button>
+                </div>
+                <div class="result" id="swc-result"></div>
+            </div>
+
             <div class="panel" data-form="compose-short">
                 <h2>Compose short <span class="pill">/producer/short</span></h2>
                 <div class="desc">
@@ -700,6 +743,7 @@
             </div>
         </section>
     </main>
+    <script src="storyboard_compose_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>

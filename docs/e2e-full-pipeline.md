@@ -105,8 +105,35 @@ The new piece in this pipeline is **`StoryboardBridge.composeWithScenes`**
    The sidecar's `/producer/short` route applies the existing TTS +
    captions pipeline and Ken-Burns'es each image instead of the gradient.
 
-The simplest way to drive the full pipeline today is from the desktop
-renderer console (Studio → Storyboard tab):
+### Driving the pipeline from the UI (PR-16)
+
+The Storyboard tab now exposes a **"Compose with AutoGrok"** panel that
+wraps the same orchestration as `StoryboardBridge.composeWithScenes`:
+
+1. Studio → write/humanize a script → click **Send script → Storyboard**.
+2. Storyboard tab → fill the form (template / language / scene count /
+   WPM) → click **Break into scenes**. The renderer captures the latest
+   `scenes[]` in memory.
+3. Scroll to **Compose with AutoGrok** → pick a voice / gradient style /
+   optional aspect ratio → click **Compose with AutoGrok**.
+4. The result card shows `scenes_used`, `scenes_missing`, the resolved
+   `scene_assets[]` (per-scene `image_path` + window), the output folder,
+   and any per-scene skip reasons.
+
+Loading state explicitly flips between two phases so you can tell whether
+the slow part is image generation or the ffmpeg compose:
+
+- *"Generating N Grok image(s) — one per scene (this can take 30–120s, requires an active Grok session)..."*
+- *"Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)..."*
+
+Friendly errors call out the most common pitfalls (no scenes captured,
+empty script, no Grok session, every image < 50 KB) instead of throwing
+into the renderer console.
+
+### Driving the pipeline from the renderer DevTools
+
+If you'd rather call the bridge yourself (e.g. when scripting the UI),
+the same orchestration is available:
 
 ```js
 // Run inside the Electron renderer DevTools (F12 from the app window):
