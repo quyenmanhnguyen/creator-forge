@@ -404,5 +404,8 @@ def test_long_form_scene_to_json_keys() -> None:
         "image_prompt",
         "flow_video_prompt",
         "duration_s",
+        # PR-26: paste-ready variant list (empty when only one prompt
+        # was requested; legacy ``image_prompt`` keeps the first variant).
+        "image_prompts",
         "extra",
     }

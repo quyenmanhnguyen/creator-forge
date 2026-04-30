@@ -61,6 +61,8 @@ class StoryboardBridge {
      *   n_scenes?: number,
      *   words_per_minute?: number,
      *   language?: 'en'|'ko'|'ja'|'vi',
+     *   images_per_scene?: number,
+     *   visual_dna_override?: string|null,
      * }} params
      * @returns {Promise<{
      *   template_key: string, template_label: string, language: string,
@@ -72,8 +74,11 @@ class StoryboardBridge {
      *   scenes: Array<{
      *     scene_id: number, title: string, narration: string,
      *     image_prompt: string, flow_video_prompt: string, duration_s: number,
+     *     image_prompts: string[],
      *   }>,
      *   md: string,
+     *   visual_dna: string,
+     *   images_per_scene: number,
      *   warnings: string[], notes: string,
      * }>}
      */
@@ -84,6 +89,49 @@ class StoryboardBridge {
     /** Build a single thumbnail prompt for the script/topic. */
     thumbnail(params) {
         return this.story.thumbnail(params);
+    }
+
+    /**
+     * PR-26 — Auto-extract the script's "Visual DNA" style anchor in a
+     * single LLM call. Used by the Storyboard panel to populate the
+     * Visual DNA override field before the user edits it.
+     *
+     * @param {{ script: string }} params
+     * @returns {Promise<{ visual_dna: string, warnings: string[] }>}
+     */
+    visualDna(params) {
+        if (!this.story || typeof this.story.visualDna !== 'function') {
+            // Older preload — return an empty DNA so the renderer can
+            // gracefully fall back to user-entered text without an
+            // unhandled rejection bubble.
+            return Promise.resolve({ visual_dna: '', warnings: ['storyboard:visualDna IPC unavailable'] });
+        }
+        return this.story.visualDna(params);
+    }
+
+    /**
+     * PR-26 — Re-roll a single scene's variant prompts without re-running
+     * the whole scene_breakdown. Used when the user edits the Visual DNA
+     * override or bumps images_per_scene mid-batch.
+     *
+     * @param {{
+     *   scene: { scene_id: number, title: string, narration: string,
+     *            image_prompt: string, flow_video_prompt?: string },
+     *   count: number,
+     *   visual_dna?: string,
+     * }} params
+     * @returns {Promise<{ prompts: string[], warnings: string[] }>}
+     */
+    variantPrompts(params) {
+        if (!this.story || typeof this.story.variantPrompts !== 'function') {
+            const base = (params && params.scene && params.scene.image_prompt) || '';
+            const count = Math.max(1, Number((params && params.count) || 1) | 0);
+            return Promise.resolve({
+                prompts: new Array(count).fill(base),
+                warnings: ['storyboard:variantPrompts IPC unavailable'],
+            });
+        }
+        return this.story.variantPrompts(params);
     }
 
     /**

@@ -114,6 +114,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     storyboard: {
         fromScript: (params) => ipcRenderer.invoke('storyboard:fromScript', params),
         thumbnail: (params) => ipcRenderer.invoke('storyboard:thumbnail', params),
+        // PR-26: Visual DNA auto-extract + variant prompt re-roll.
+        visualDna: (params) => ipcRenderer.invoke('storyboard:visualDna', params),
+        variantPrompts: (params) => ipcRenderer.invoke('storyboard:variantPrompts', params),
     },
 
     producer: {

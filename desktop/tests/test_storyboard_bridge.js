@@ -142,6 +142,112 @@ test('aspectRatio and enablePro pass through to config when provided', async () 
     assert.strictEqual(calls.image[0].config.enablePro, true);
 });
 
+// ─── PR-26: visualDna + variantPrompts bridge methods ─────────────────
+console.log('');
+console.log('# StoryboardBridge.visualDna / variantPrompts (PR-26)');
+
+test('visualDna forwards script payload to storyboard:visualDna IPC', async () => {
+    const calls = [];
+    const api = {
+        storyboard: {
+            fromScript: () => null,
+            thumbnail: () => null,
+            visualDna: (payload) => {
+                calls.push(payload);
+                return Promise.resolve({
+                    visual_dna: 'noir 1940s, deep shadows',
+                    warnings: [],
+                });
+            },
+            variantPrompts: () => null,
+        },
+        image: { generate: () => null },
+        producer: { composeShort: () => null },
+        i2v: { generate: () => null },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.visualDna({ script: 'A noir detective walks the rain-soaked streets.' });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].script, 'A noir detective walks the rain-soaked streets.');
+    assert.strictEqual(out.visual_dna, 'noir 1940s, deep shadows');
+});
+
+test('visualDna degrades gracefully when storyboard.visualDna is absent (older preload)', async () => {
+    const api = {
+        // Intentionally no visualDna method on the namespace.
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => null },
+        producer: { composeShort: () => null },
+        i2v: { generate: () => null },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.visualDna({ script: 'anything' });
+    // Older preload → empty DNA + a warning, NOT an unhandled rejection.
+    assert.strictEqual(out.visual_dna, '');
+    assert.ok(Array.isArray(out.warnings));
+    assert.ok(out.warnings.some((w) => /unavailable/i.test(w)));
+});
+
+test('variantPrompts forwards scene + count + visual_dna to storyboard:variantPrompts IPC', async () => {
+    const calls = [];
+    const api = {
+        storyboard: {
+            fromScript: () => null,
+            thumbnail: () => null,
+            visualDna: () => null,
+            variantPrompts: (payload) => {
+                calls.push(payload);
+                return Promise.resolve({
+                    prompts: ['p1', 'p2', 'p3'],
+                    warnings: [],
+                });
+            },
+        },
+        image: { generate: () => null },
+        producer: { composeShort: () => null },
+        i2v: { generate: () => null },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    const scene = {
+        scene_id: 1,
+        title: 'factory',
+        narration: 'The factory wakes at dawn.',
+        image_prompt: 'Wide factory floor at dawn.',
+        flow_video_prompt: 'Slow dolly in.',
+    };
+    const out = await bridge.variantPrompts({ scene, count: 3, visual_dna: 'cinematic 35mm' });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].count, 3);
+    assert.strictEqual(calls[0].visual_dna, 'cinematic 35mm');
+    assert.strictEqual(calls[0].scene.image_prompt, 'Wide factory floor at dawn.');
+    assert.deepStrictEqual(out.prompts, ['p1', 'p2', 'p3']);
+});
+
+test('variantPrompts degrades to "repeat base prompt N times" when IPC missing', async () => {
+    const api = {
+        storyboard: { fromScript: () => null, thumbnail: () => null },
+        image: { generate: () => null },
+        producer: { composeShort: () => null },
+        i2v: { generate: () => null },
+        refimg: { generate: () => null },
+    };
+    const bridge = new StoryboardBridge(api);
+    const out = await bridge.variantPrompts({
+        scene: { scene_id: 1, image_prompt: 'base prompt body' },
+        count: 4,
+    });
+    assert.deepStrictEqual(out.prompts, [
+        'base prompt body',
+        'base prompt body',
+        'base prompt body',
+        'base prompt body',
+    ]);
+    assert.ok(out.warnings.some((w) => /unavailable/i.test(w)));
+});
+
 // ─── composeWithScenes (PR-14) ─────────────────────────────────────────
 console.log('');
 console.log('# StoryboardBridge.composeWithScenes');

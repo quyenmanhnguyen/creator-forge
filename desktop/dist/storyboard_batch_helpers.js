@@ -34,14 +34,24 @@
         // (`scene_id#variant_idx`) so progress / result events can target
         // a single variant without bleeding across siblings; `scene_id`
         // is kept for I2V pairing. Default 1 = legacy behaviour.
+        //
+        // PR-26: when the scene carries an `image_prompts` array
+        // (LLM-expanded variants from /producer/scene_breakdown with
+        // images_per_scene > 1), prefer entry `v` over the singular
+        // `image_prompt`. The legacy field still wins when the array is
+        // shorter than the number of variants requested by the UI, so
+        // the fallback never produces a phantom empty prompt.
         const variants = Math.max(1, Math.floor(Number((opts && opts.imagesPerScene) || 1)) || 1);
         const out = [];
         let order = 1;
         scenes.forEach((s) => {
-            const prompt = (s && typeof s.image_prompt === "string") ? s.image_prompt.trim() : "";
-            const skipped = !prompt;
+            const fallbackPrompt = (s && typeof s.image_prompt === "string") ? s.image_prompt.trim() : "";
+            const variantList = Array.isArray(s && s.image_prompts) ? s.image_prompts : [];
             const sceneId = s ? s.scene_id : null;
             for (let v = 0; v < variants; v += 1) {
+                const variantPrompt = (typeof variantList[v] === "string") ? variantList[v].trim() : "";
+                const prompt = variantPrompt || fallbackPrompt;
+                const skipped = !prompt;
                 out.push({
                     order: order++,
                     scene_id: sceneId,

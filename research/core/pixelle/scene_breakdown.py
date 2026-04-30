@@ -199,6 +199,11 @@ class LongFormScene:
 
     Round-trips through :func:`serialize_breakdown_md` /
     :func:`parse_breakdown_response`.
+
+    PR-26 adds ``image_prompts`` — the paste-ready variant list when
+    the user requested ``images_per_scene > 1``. ``image_prompt`` (the
+    legacy singular field) always carries the canonical first prompt
+    so callers that don't know about variants keep working unchanged.
     """
 
     scene_id: int
@@ -207,9 +212,12 @@ class LongFormScene:
     image_prompt: str
     flow_video_prompt: str
     duration_s: float = 0.0
+    image_prompts: tuple[str, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict:
+        # ``asdict`` converts the tuple to a list, which is what the
+        # API/JSON layer needs anyway. No further normalisation needed.
         return asdict(self)
 
 
@@ -505,6 +513,230 @@ def serialize_breakdown_json(scenes: list[LongFormScene]) -> list[dict]:
     return [scene.to_json() for scene in scenes]
 
 
+# ─── Visual DNA extraction (PR-26) ───────────────────────────────────────────
+
+# Hard caps so a careless caller can't pay for infinite token usage.
+MAX_VARIANTS_PER_SCENE = 8
+VISUAL_DNA_MAX_CHARS = 1200
+
+
+def _default_chat_fn() -> Callable[[str, str], str]:
+    """Bind ``research.core.llm.chat`` as the default chat function.
+
+    The legacy default (``from core.llm import chat``) only resolves
+    inside the Streamlit cwd; the FastAPI sidecar runs from the repo
+    root where the package is reachable as ``research.core.*``. Routes
+    pass an explicit ``chat_fn`` to side-step this — helpers below
+    accept ``None`` and fall back here.
+    """
+    try:
+        from research.core.llm import chat as default_chat
+    except Exception:  # pragma: no cover — fallback for unusual cwds
+        from core.llm import chat as default_chat  # type: ignore[no-redef]
+
+    def chat_fn(user: str, system: str) -> str:
+        # Match the legacy ``generate_scene_breakdown`` default (0.6).
+        # Callers that want a different temperature (e.g. the DNA
+        # extractor wants something more deterministic) pass their own
+        # ``chat_fn``; the route layer already does this via
+        # ``producer._make_chat_fn``.
+        return default_chat(user, system=system, temperature=0.6)
+
+    return chat_fn
+
+
+def build_visual_dna_system_prompt() -> str:
+    """System prompt for the one-shot Visual DNA extractor.
+
+    The output is appended verbatim to every image prompt downstream,
+    so we constrain it to a single short paragraph (no headings, no
+    bullet points, no surrounding quotes) that names the era,
+    palette, lighting register, lens / film stock, and overall mood.
+    """
+    return (
+        "You are a visual director extracting the 'Visual DNA' of a "
+        "video script — the recurring style anchor that every shot "
+        "must share so they read as one coherent piece. Read the "
+        "script and reply with ONE short paragraph (1–3 sentences, "
+        "no headings, no bullet points, no surrounding quotes) that "
+        "names: era / setting register, colour palette, lighting "
+        "register, lens or film stock, and overall mood. Keep it "
+        "concrete and reusable — a downstream image generator will "
+        "literally append your reply to every scene prompt, so avoid "
+        "anything scene-specific. Plain text only."
+    )
+
+
+def extract_visual_dna(
+    script: str,
+    *,
+    chat_fn: Callable[[str, str], str] | None = None,
+) -> str:
+    """Ask the LLM for the Visual DNA of ``script``.
+
+    Returns an empty string when the script is empty or the LLM reply
+    is blank. Truncates to :data:`VISUAL_DNA_MAX_CHARS` so a chatty
+    model can't blow past the prompt budget when the result is
+    appended to every per-scene prompt.
+    """
+    body = (script or "").strip()
+    if not body:
+        return ""
+    if chat_fn is None:
+        chat_fn = _default_chat_fn()
+    raw = chat_fn(body, build_visual_dna_system_prompt())
+    cleaned = (raw or "").strip()
+    # Strip surrounding quotes that some models add despite the
+    # "no surrounding quotes" instruction.
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    if len(cleaned) > VISUAL_DNA_MAX_CHARS:
+        cleaned = cleaned[: VISUAL_DNA_MAX_CHARS].rstrip() + "…"
+    return cleaned
+
+
+# ─── Image variant expansion (PR-26) ─────────────────────────────────────────
+
+
+# Tag emitted by the variant LLM between independent prompts so we can
+# split the reply deterministically. Picked so it can't show up inside
+# a real prompt body.
+_VARIANT_DELIMITER = "<<<VARIANT>>>"
+
+
+def build_variant_system_prompt(*, count: int, visual_dna: str) -> str:
+    """System prompt for :func:`expand_image_variants`.
+
+    Encodes the F1 contract: ``count`` paste-ready prompts that each
+    differ on ≥2 of (composition, lighting, camera angle, detail
+    focus) AND share the appended ``visual_dna`` style anchor so the
+    set still reads as one coherent piece.
+    """
+    dna_block = (
+        f"VISUAL DNA (must end every prompt verbatim):\n{visual_dna.strip()}\n\n"
+        if visual_dna.strip()
+        else ""
+    )
+    return (
+        f"You expand a single base scene description into EXACTLY "
+        f"{count} paste-ready image prompts that capture the same "
+        "scene from different angles. Each prompt must be a single "
+        "ultra-detailed paragraph (no line breaks).\n\n"
+        f"{dna_block}"
+        "Diversity contract — every variant in this set must differ "
+        "from every other variant on AT LEAST TWO of these axes:\n"
+        "  • Composition (wide / medium / close-up / over-the-shoulder / top-down)\n"
+        "  • Lighting (key light direction, time of day, mood)\n"
+        "  • Camera angle (eye-level / low / high / dutch tilt / aerial)\n"
+        "  • Detail focus (hero subject vs context vs environment vs product macro)\n"
+        "No two prompts may share the same opening clause — vary the "
+        "opening so they don't all start with the same noun phrase.\n\n"
+        "Output format — emit each variant separated by a single "
+        f"line containing exactly ``{_VARIANT_DELIMITER}`` (and "
+        "nothing else). Do not number, label, or quote the variants. "
+        "No commentary before, between, or after."
+    )
+
+
+def build_variant_user_prompt(scene: LongFormScene) -> str:
+    """The ``user`` half of the variant call — the base scene context.
+
+    We pass the ``image_prompt`` as the seed plus the scene's
+    title/narration so the LLM has enough context to genuinely vary
+    the framing without inventing new subject matter.
+    """
+    return (
+        f"BASE SCENE TITLE: {scene.title}\n\n"
+        f"NARRATION (verbatim source paragraph):\n{scene.narration}\n\n"
+        f"BASE IMAGE PROMPT (seed — vary this, don't copy it):\n{scene.image_prompt}\n"
+    )
+
+
+def parse_variant_response(raw: str, *, count: int) -> list[str]:
+    """Split the LLM reply into ``count`` cleaned prompts.
+
+    Lenient on extra whitespace + accidental numbering ("1.", "1)",
+    "Variant 1:" etc.); rejects empty entries. If the LLM produced
+    fewer than ``count`` variants, pads with the last non-empty entry
+    so callers always get exactly ``count`` items (so the variant
+    table never has a phantom empty row).
+    """
+    if not raw or not raw.strip():
+        return []
+    parts = [p.strip() for p in raw.split(_VARIANT_DELIMITER)]
+    cleaned: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        # Strip common LLM-leading noise like "Variant 1:", "1.", "1)".
+        line0, _sep, rest = p.partition("\n")
+        prefix_re = re.match(
+            r"^\s*(?:variant\s*)?\d+\s*[:.\-)]\s*",
+            line0,
+            re.IGNORECASE,
+        )
+        if prefix_re:
+            line0 = line0[prefix_re.end():].strip()
+        body = (line0 + ("\n" + rest if rest else "")).strip()
+        # Collapse internal newlines so the result is a single
+        # paragraph, matching the legacy ``image_prompt`` shape.
+        body = " ".join(seg.strip() for seg in body.splitlines() if seg.strip())
+        if body:
+            cleaned.append(body)
+    if not cleaned:
+        return []
+    while len(cleaned) < count:
+        cleaned.append(cleaned[-1])
+    return cleaned[:count]
+
+
+def expand_image_variants(
+    scene: LongFormScene,
+    *,
+    count: int,
+    visual_dna: str = "",
+    chat_fn: Callable[[str, str], str] | None = None,
+) -> list[str]:
+    """Expand ``scene.image_prompt`` into ``count`` varied prompts.
+
+    Returns ``[scene.image_prompt]`` when ``count <= 1``. When the LLM
+    fails or returns nothing parseable, falls back to repeating the
+    base prompt so the caller still gets exactly ``count`` entries —
+    the renderer is responsible for surfacing a "variants not
+    diversified" warning if it cares.
+    """
+    n = max(1, min(MAX_VARIANTS_PER_SCENE, int(count)))
+    base = (scene.image_prompt or "").strip()
+    if n <= 1 or not base:
+        return [base] * (n if base else 0)
+
+    if chat_fn is None:
+        chat_fn = _default_chat_fn()
+    system = build_variant_system_prompt(count=n, visual_dna=visual_dna)
+    user = build_variant_user_prompt(scene)
+    try:
+        raw = chat_fn(user, system)
+    except Exception:  # pragma: no cover — handled by callers
+        raw = ""
+    parsed = parse_variant_response(raw, count=n)
+    if not parsed:
+        # Diversity unavailable — degrade to the legacy "repeat the
+        # base prompt" behaviour so the batch still produces N images.
+        return [base] * n
+    # Append the Visual DNA to each prompt iff the model didn't
+    # already include it (idempotent style anchor).
+    dna = (visual_dna or "").strip()
+    if dna:
+        out: list[str] = []
+        for p in parsed:
+            if dna in p:
+                out.append(p)
+            else:
+                out.append(f"{p} {dna}".strip())
+        return out
+    return parsed
+
+
 # ─── Orchestrator ────────────────────────────────────────────────────────────
 
 
@@ -515,6 +747,9 @@ def generate_scene_breakdown(
     n_scenes: int | None = None,
     chat_fn: Callable[[str, str], str] | None = None,
     words_per_minute: int = DEFAULT_WORDS_PER_MIN,
+    images_per_scene: int = 1,
+    visual_dna_override: str | None = None,
+    extract_dna: bool = False,
 ) -> list[LongFormScene]:
     """Expand ``script`` into a breakdown sheet using ``chat_fn``.
 
@@ -534,6 +769,24 @@ def generate_scene_breakdown(
     words_per_minute:
         WPM used to estimate per-scene duration from the narration
         slice the LLM emits.
+    images_per_scene:
+        PR-26 — when ``> 1``, expand each scene's ``image_prompt``
+        into N varied variants via :func:`expand_image_variants`. The
+        result is attached as ``LongFormScene.image_prompts``; the
+        legacy singular ``image_prompt`` always remains the first
+        variant so callers that don't know about variants keep
+        working unchanged.
+    visual_dna_override:
+        Optional user-provided style anchor. When present, it skips
+        the auto-extract LLM call and is appended to every variant.
+    extract_dna:
+        When ``True`` and ``visual_dna_override`` is empty, fire a
+        single LLM call (:func:`extract_visual_dna`) to derive the
+        anchor. The auto-extracted value is **not** stored on
+        ``LongFormScene`` itself — callers are expected to surface it
+        in the API response so the user can review/override it.
+        Returned as the second tuple element when callers opt into
+        :func:`generate_scene_breakdown_with_dna`.
     """
     body = (script or "").strip()
     if not body:
@@ -543,12 +796,85 @@ def generate_scene_breakdown(
     n_scenes = max(MIN_SCENE_COUNT, min(MAX_SCENE_COUNT, int(n_scenes)))
 
     if chat_fn is None:
-        from core.llm import chat as default_chat
-
-        def chat_fn(user: str, system: str) -> str:  # type: ignore[misc]
-            return default_chat(user, system=system, temperature=0.6)
+        chat_fn = _default_chat_fn()
 
     system = build_breakdown_system_prompt(template, n_scenes=n_scenes)
     user = build_breakdown_user_prompt(body)
     raw = chat_fn(user, system)
-    return parse_breakdown_response(raw, words_per_minute=words_per_minute)
+    scenes = parse_breakdown_response(raw, words_per_minute=words_per_minute)
+
+    n_variants = max(1, min(MAX_VARIANTS_PER_SCENE, int(images_per_scene or 1)))
+    if n_variants <= 1 or not scenes:
+        return scenes
+
+    dna = (visual_dna_override or "").strip()
+    if not dna and extract_dna:
+        try:
+            dna = extract_visual_dna(body, chat_fn=chat_fn)
+        except Exception:  # noqa: BLE001 — best-effort, the caller may not have a DEEPSEEK key
+            dna = ""
+
+    expanded: list[LongFormScene] = []
+    for s in scenes:
+        try:
+            prompts = expand_image_variants(
+                s, count=n_variants, visual_dna=dna, chat_fn=chat_fn
+            )
+        except Exception:  # noqa: BLE001
+            prompts = [s.image_prompt] * n_variants
+        # Re-emit the singular ``image_prompt`` as the first variant so
+        # downstream code that ignores ``image_prompts`` is unaffected.
+        head = prompts[0] if prompts else s.image_prompt
+        expanded.append(
+            LongFormScene(
+                scene_id=s.scene_id,
+                title=s.title,
+                narration=s.narration,
+                image_prompt=head,
+                flow_video_prompt=s.flow_video_prompt,
+                duration_s=s.duration_s,
+                image_prompts=tuple(prompts),
+                extra=s.extra,
+            )
+        )
+    return expanded
+
+
+def generate_scene_breakdown_with_dna(
+    script: str,
+    *,
+    template: SceneTemplate,
+    n_scenes: int | None = None,
+    chat_fn: Callable[[str, str], str] | None = None,
+    words_per_minute: int = DEFAULT_WORDS_PER_MIN,
+    images_per_scene: int = 1,
+    visual_dna_override: str | None = None,
+) -> tuple[list[LongFormScene], str]:
+    """Like :func:`generate_scene_breakdown` but also returns the
+    Visual DNA used (auto-extracted when no override).
+
+    Convenience wrapper for the FastAPI route, which needs both the
+    scenes and the DNA in the response payload.
+    """
+    body = (script or "").strip()
+    if not body:
+        return [], ""
+    if chat_fn is None:
+        chat_fn = _default_chat_fn()
+    dna = (visual_dna_override or "").strip()
+    if not dna:
+        try:
+            dna = extract_visual_dna(body, chat_fn=chat_fn)
+        except Exception:  # noqa: BLE001
+            dna = ""
+    scenes = generate_scene_breakdown(
+        body,
+        template=template,
+        n_scenes=n_scenes,
+        chat_fn=chat_fn,
+        words_per_minute=words_per_minute,
+        images_per_scene=images_per_scene,
+        visual_dna_override=dna,
+        extract_dna=False,  # already handled above
+    )
+    return scenes, dna

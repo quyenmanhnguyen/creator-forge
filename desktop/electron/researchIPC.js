@@ -64,6 +64,11 @@ const CHANNELS = {
 
     'storyboard:fromScript':      { method: 'POST', path: '/producer/scene_breakdown' },
     'storyboard:thumbnail':       { method: 'POST', path: '/producer/thumbnail_prompt' },
+    // PR-26: Visual DNA + variant re-roll (used by the Storyboard panel
+    // when the user edits the style anchor or bumps images_per_scene
+    // without re-running the whole scene_breakdown).
+    'storyboard:visualDna':       { method: 'POST', path: '/producer/visual_dna' },
+    'storyboard:variantPrompts':  { method: 'POST', path: '/producer/variant_prompts' },
 
     'producer:composeShort':      { method: 'POST', path: '/producer/short' },
     'producer:listVoices':        { method: 'GET',  path: '/producer/voices' },
