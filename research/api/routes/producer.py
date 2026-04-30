@@ -40,6 +40,7 @@ from research.core.pixelle import (
     EdgeTTSAdapter,
     LongFormScene,
     SceneAsset,
+    VideoSceneAsset,
     captions_to_srt,
     count_words,
     estimate_scene_count,
@@ -267,6 +268,25 @@ class SceneAssetSpec(BaseModel):
     _strip_path = field_validator("image_path", mode="before")(classmethod(lambda cls, v: _strip(v)))
 
 
+class VideoSceneAssetSpec(BaseModel):
+    """One pre-rendered per-scene motion clip to splice into the composed
+    short. Mirrors :class:`research.core.pixelle.VideoSceneAsset` but as a
+    request schema. Like :class:`SceneAssetSpec`, disk-existence checks
+    are deferred to the route so a missing/unrenderable clip becomes a
+    friendly warning + ``videos_missing++`` instead of a 422.
+
+    Sourced from ``I2VService.generateBatch`` ``savedFile`` outputs in the
+    typical AutoGrok/Veo3 pipeline; the bridge populates this list once
+    each scene has produced a downloaded mp4.
+    """
+
+    video_path: str = Field(..., min_length=1, description="Absolute path to an mp4 on disk (typically from I2VService.generateBatch.savedFile).")
+    start_s: float = Field(..., ge=0.0, description="Start time on the audio timeline in seconds.")
+    duration_s: float = Field(..., gt=0.0, description="How long this clip stays on screen in seconds (composer trims/loops the source clip to fit).")
+
+    _strip_path = field_validator("video_path", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+
 class ShortRequest(BaseModel):
     script: str = Field(..., min_length=1, description="Full narration script (single voice).")
     voice: str = Field(_DEFAULT_VOICE, description="Edge-TTS voice short name (e.g. 'en-US-AriaNeural').")
@@ -283,6 +303,21 @@ class ShortRequest(BaseModel):
             "provided, the composer skips the gradient placeholder and Ken-Burns "
             "the supplied images instead. Missing files are skipped with a warning "
             "(not a 422) so a partial AutoGrok batch still composes."
+        ),
+    )
+    video_scene_assets: list[VideoSceneAssetSpec] | None = Field(
+        None,
+        description=(
+            "Optional per-scene motion clips (e.g. Grok I2V / Veo3 mp4s). When at "
+            "least one resolves to an existing file, the composer prefers the "
+            "video timeline over still images (``video_scene_assets`` wins over "
+            "``scene_assets`` per scene-priority — see "
+            ":func:`research.core.pixelle.composer.make_short`). Each entry pins "
+            "one clip to a [start_s, start_s+duration_s] window; the composer "
+            "trims clips longer than ``duration_s`` and loops clips that are "
+            "shorter. Missing files are skipped with a warning (not a 422) so a "
+            "partial I2V batch still composes — if every video drops out and "
+            "``scene_assets`` was supplied, the route falls back to images."
         ),
     )
 
@@ -305,6 +340,8 @@ class ShortResponse(BaseModel):
     output_dir: str
     scenes_used: int = 0
     scenes_missing: int = 0
+    videos_used: int = 0
+    videos_missing: int = 0
     warnings: list[str] = []
     notes: str = ""
 
@@ -369,6 +406,8 @@ def compose_short(req: ShortRequest) -> ShortResponse:
             output_dir=str(output_dir),
             scenes_used=0,
             scenes_missing=len(req.scene_assets or []),
+            videos_used=0,
+            videos_missing=len(req.video_scene_assets or []),
             warnings=warnings,
         )
 
@@ -397,6 +436,39 @@ def compose_short(req: ShortRequest) -> ShortResponse:
         resolved_scene_assets.append(
             SceneAsset(
                 image_path=p,
+                start_s=float(spec.start_s),
+                duration_s=float(spec.duration_s),
+            )
+        )
+
+    # ─── Resolve video_scene_assets (PR-20A) ────────────────────────────
+    # Same robust-failure contract as scene_assets above: a partial I2V
+    # batch (e.g. 4 of 6 scenes produced a usable mp4) still composes,
+    # with missing entries dropped + counted in ``videos_missing``. When
+    # every video drops out the composer naturally falls back to the
+    # ``scene_assets`` image path (and gradient if those are missing too)
+    # — the priority chain lives in
+    # :func:`research.core.pixelle.composer.make_short`.
+    resolved_video_scene_assets: list[VideoSceneAsset] = []
+    videos_missing = 0
+    for spec in req.video_scene_assets or []:
+        p = Path(spec.video_path).expanduser()
+        if not p.exists():
+            videos_missing += 1
+            warnings.append(
+                f"Video scene asset skipped (file not found): {spec.video_path} "
+                f"@ start={spec.start_s:.2f}s dur={spec.duration_s:.2f}s"
+            )
+            continue
+        if not p.is_file():
+            videos_missing += 1
+            warnings.append(
+                f"Video scene asset skipped (not a regular file): {spec.video_path}"
+            )
+            continue
+        resolved_video_scene_assets.append(
+            VideoSceneAsset(
+                video_path=p,
                 start_s=float(spec.start_s),
                 duration_s=float(spec.duration_s),
             )
@@ -468,6 +540,7 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 duration_hint=duration_s or None,
                 options=opts,
                 scene_assets=resolved_scene_assets or None,
+                video_scene_assets=resolved_video_scene_assets or None,
             )
             composed_ok = mp4_path.exists()
         except Exception as exc:  # noqa: BLE001
@@ -494,6 +567,8 @@ def compose_short(req: ShortRequest) -> ShortResponse:
         output_dir=str(output_dir),
         scenes_used=len(resolved_scene_assets),
         scenes_missing=scenes_missing,
+        videos_used=len(resolved_video_scene_assets),
+        videos_missing=videos_missing,
         warnings=warnings,
     )
 

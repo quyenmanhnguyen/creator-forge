@@ -789,3 +789,285 @@ def test_short_rejects_invalid_scene_asset_timings():
         },
     )
     assert r.status_code == 422, r.text
+
+
+# ─── /producer/short — video_scene_assets wiring (PR-20A) ───────────────────
+
+
+def test_short_passes_video_scene_assets_to_composer(monkeypatch, tmp_path):
+    """Happy path: every video_scene_assets entry has an existing mp4 →
+    all pass through to ``_make_short`` as ``VideoSceneAsset`` instances
+    and the response counts ``videos_used``. ``scene_assets`` is None so
+    the composer receives ``scene_assets=None`` (gradient unused — video
+    path wins per :func:`make_short`).
+    """
+    captured: dict[str, Any] = {}
+
+    v_a = tmp_path / "scene_a.mp4"
+    v_b = tmp_path / "scene_b.mp4"
+    v_a.write_bytes(b"\x00" * 1024)
+    v_b.write_bytes(b"\x00" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "out_video_scene_assets_ok"
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(out),
+            "video_scene_assets": [
+                {"video_path": str(v_a), "start_s": 0.0, "duration_s": 2.0},
+                {"video_path": str(v_b), "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["videos_used"] == 2
+    assert body["videos_missing"] == 0
+    assert body["scenes_used"] == 0
+    assert body["scenes_missing"] == 0
+    assert body["warnings"] == []
+
+    # _make_short must have received exactly two VideoSceneAsset instances,
+    # in declaration order, with the requested timings.
+    vassets = captured["video_scene_assets"]
+    assert vassets is not None
+    assert len(vassets) == 2
+    assert all(a.__class__.__name__ == "VideoSceneAsset" for a in vassets)
+    assert vassets[0].video_path == v_a
+    assert vassets[0].start_s == 0.0
+    assert vassets[0].duration_s == 2.0
+    assert vassets[1].video_path == v_b
+    assert vassets[1].start_s == 2.0
+    assert vassets[1].duration_s == 2.0
+    # Image path must be untouched.
+    assert captured["scene_assets"] is None
+
+
+def test_short_skips_missing_video_scene_asset_with_warning(monkeypatch, tmp_path):
+    """Robust failure mode: a video_scene_assets entry whose video_path
+    doesn't exist must NOT 422 the whole request — it gets a friendly
+    warning, is dropped from the composer payload, and counted in
+    ``videos_missing``. Mirrors the ``scene_assets`` contract (PR-14)."""
+    captured: dict[str, Any] = {}
+
+    v_a = tmp_path / "scene_a.mp4"
+    v_a.write_bytes(b"\x00" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "out_video_scene_assets_partial"
+    missing_path = str(tmp_path / "nope.mp4")
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(out),
+            "video_scene_assets": [
+                {"video_path": str(v_a), "start_s": 0.0, "duration_s": 2.0},
+                {"video_path": missing_path, "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["videos_used"] == 1
+    assert body["videos_missing"] == 1
+    assert any("nope.mp4" in w for w in body["warnings"]), body["warnings"]
+
+    vassets = captured["video_scene_assets"]
+    assert vassets is not None
+    assert len(vassets) == 1
+    assert vassets[0].video_path == v_a
+
+
+def test_short_passes_both_scene_and_video_scene_assets(monkeypatch, tmp_path):
+    """Mixed: caller supplies BOTH ``scene_assets`` and
+    ``video_scene_assets``. The route forwards both lists untouched —
+    the composer applies its priority chain (video > image > gradient,
+    see :func:`research.core.pixelle.composer.make_short`). The
+    ``ShortResponse`` reports each list independently so the UI can tell
+    how many of each made it through."""
+    captured: dict[str, Any] = {}
+
+    img = tmp_path / "fallback.jpg"
+    img.write_bytes(b"\xff" * 1024)
+    vid = tmp_path / "scene.mp4"
+    vid.write_bytes(b"\x00" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(tmp_path / "out_mixed"),
+            "scene_assets": [
+                {"image_path": str(img), "start_s": 0.0, "duration_s": 4.0},
+            ],
+            "video_scene_assets": [
+                {"video_path": str(vid), "start_s": 0.0, "duration_s": 4.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_used"] == 1
+    assert body["scenes_missing"] == 0
+    assert body["videos_used"] == 1
+    assert body["videos_missing"] == 0
+    assert body["warnings"] == []
+
+    # Both lists reach the composer — composer handles priority itself.
+    sassets = captured["scene_assets"]
+    vassets = captured["video_scene_assets"]
+    assert sassets is not None and len(sassets) == 1
+    assert vassets is not None and len(vassets) == 1
+    assert sassets[0].image_path == img
+    assert vassets[0].video_path == vid
+
+
+def test_short_video_all_missing_falls_back_to_image_assets(monkeypatch, tmp_path):
+    """Fallback chain: every ``video_scene_assets`` entry is missing →
+    composer is invoked with ``video_scene_assets=None`` and
+    ``scene_assets`` is preserved, so the existing image timeline still
+    drives the visuals (matches the composer's
+    ``elif scene_assets:`` branch). Response surfaces every drop as a
+    warning + counts ``videos_missing`` so the UI can tell."""
+    captured: dict[str, Any] = {}
+
+    img = tmp_path / "img.jpg"
+    img.write_bytes(b"\xff" * 1024)
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["scene_assets"] = scene_assets
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "output_dir": str(tmp_path / "out_video_fallback"),
+            "scene_assets": [
+                {"image_path": str(img), "start_s": 0.0, "duration_s": 4.0},
+            ],
+            "video_scene_assets": [
+                {"video_path": str(tmp_path / "missing_a.mp4"),
+                 "start_s": 0.0, "duration_s": 2.0},
+                {"video_path": str(tmp_path / "missing_b.mp4"),
+                 "start_s": 2.0, "duration_s": 2.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_used"] == 1
+    assert body["videos_used"] == 0
+    assert body["videos_missing"] == 2
+    assert sum("missing_a.mp4" in w for w in body["warnings"]) == 1
+    assert sum("missing_b.mp4" in w for w in body["warnings"]) == 1
+
+    # Composer must see the image list and a None video list — that's
+    # the trigger for the gradient/image fallback path.
+    assert captured["video_scene_assets"] is None
+    assert captured["scene_assets"] is not None
+    assert len(captured["scene_assets"]) == 1
+
+
+def test_short_omits_video_scene_assets_preserves_default(monkeypatch, tmp_path):
+    """Backwards-compat: when the caller omits ``video_scene_assets`` the
+    composer must still be invoked with ``video_scene_assets=None`` and
+    the response reports ``videos_used=0`` / ``videos_missing=0``."""
+    captured: dict[str, Any] = {}
+
+    def fake_compose(audio_path, output_path, *, captions=None, duration_hint=None,
+                     options=None, scene_assets=None, video_scene_assets=None, **_):
+        captured["video_scene_assets"] = video_scene_assets
+        Path(output_path).write_bytes(b"\x00" * 16)
+        return Path(output_path)
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", _basic_fake_tts())
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    r = client.post(
+        "/producer/short",
+        json={"script": SHORT_SCRIPT, "output_dir": str(tmp_path / "out_no_video")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["videos_used"] == 0
+    assert body["videos_missing"] == 0
+    assert captured["video_scene_assets"] is None
+
+
+def test_short_rejects_invalid_video_scene_asset_timings():
+    """Pydantic-level validation: duration_s must be > 0, start_s must be
+    >= 0, video_path must be non-empty after stripping. These are
+    programmer errors (not partial-batch failures) so a 422 is
+    appropriate."""
+    # duration_s = 0 → 422
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "video_scene_assets": [
+                {"video_path": "/tmp/x.mp4", "start_s": 0.0, "duration_s": 0.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text
+
+    # start_s < 0 → 422
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "video_scene_assets": [
+                {"video_path": "/tmp/x.mp4", "start_s": -1.0, "duration_s": 1.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text
+
+    # whitespace-only video_path → 422 after strip
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "video_scene_assets": [
+                {"video_path": "   ", "start_s": 0.0, "duration_s": 1.0},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text

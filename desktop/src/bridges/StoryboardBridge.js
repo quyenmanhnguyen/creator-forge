@@ -305,17 +305,57 @@ class StoryboardBridge {
 
     /**
      * For each scene that has a hero image, run image-to-video to get motion.
-     * @param {{ scenes: Array, account?: string }} params
+     *
+     * The IPC contract (``i2v:generate`` in
+     * ``desktop/electron/main.js``) is ``{ items, config, startIdx }`` —
+     * each ``item`` is ``{ imagePath, prompt }`` (consumed by
+     * :class:`I2VService.generateOne`). Earlier this method shipped
+     * ``{ jobs, account }`` with ``image_path``/``video_prompt`` field
+     * names, both of which were silently dropped by the IPC handler's
+     * destructure (so ``items.length`` blew up the first time anyone
+     * actually wired the I2V flow). Pre-PR-20A this never went over the
+     * wire because no caller existed yet — PR-20B's
+     * ``composeWithVideoScenes`` is the first caller, hence the fix
+     * lands here.
+     *
+     * Scenes without a usable hero image (or without a non-empty video
+     * prompt — we accept ``video_prompt`` *or* ``flow_video_prompt`` so
+     * the scene_breakdown output drops in directly) are silently
+     * dropped from the batch; the caller surfaces them via
+     * ``perSceneStatus`` in the orchestrator.
+     *
+     * @param {{
+     *   scenes: Array<{
+     *     scene_id?: number,
+     *     hero_image_path?: string,
+     *     video_prompt?: string,
+     *     flow_video_prompt?: string,
+     *     duration_s?: number,
+     *   }>,
+     *   config?: object,
+     *   startIdx?: number,
+     * }} params
      */
-    async animateScenes({ scenes, account } = {}) {
-        if (!this.i2v) throw new Error('i2v service unavailable');
-        const jobs = (scenes || []).map((s) => ({
-            id: s.scene_id,
-            image_path: s.hero_image_path,
-            prompt: s.video_prompt,
-            length_s: s.duration_s || 6,
-        }));
-        return this.i2v.generate({ jobs, account });
+    async animateScenes({ scenes, config, startIdx } = {}) {
+        if (!this.i2v || typeof this.i2v.generate !== 'function') {
+            throw new Error('StoryboardBridge.animateScenes: electronAPI.i2v.generate is unavailable.');
+        }
+        const items = (scenes || [])
+            .map((s) => {
+                if (!s) return null;
+                const imagePath = typeof s.hero_image_path === 'string' ? s.hero_image_path.trim() : '';
+                const prompt = (
+                    typeof s.video_prompt === 'string' && s.video_prompt.trim()
+                ) ? s.video_prompt.trim()
+                    : (typeof s.flow_video_prompt === 'string' ? s.flow_video_prompt.trim() : '');
+                if (!imagePath || !prompt) return null;
+                return { imagePath, prompt };
+            })
+            .filter((it) => it !== null);
+        const payload = { items };
+        if (config && typeof config === 'object') payload.config = config;
+        if (typeof startIdx === 'number') payload.startIdx = startIdx;
+        return this.i2v.generate(payload);
     }
 }
 
