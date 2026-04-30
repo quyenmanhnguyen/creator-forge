@@ -430,9 +430,13 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     else:
         style = req.style
 
-    if req.voice not in voice_short_names():
-        # Edge-TTS supports many voices outside our curated picker — pass
-        # the value through but flag it so the UI can show a hint.
+    # PR-23: only check the curated Edge-TTS voice list when the request
+    # actually targets edge-tts. The curated list is Edge-TTS specific
+    # (`voice_short_names()` returns Microsoft voices) so blindly applying
+    # it to Piper would emit a misleading "passing through to Edge-TTS"
+    # warning on every Piper call.
+    _provider_key = (req.tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
+    if _provider_key == "edge-tts" and req.voice not in voice_short_names():
         warnings.append(
             f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
         )

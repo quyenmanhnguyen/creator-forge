@@ -1404,6 +1404,53 @@ def test_short_keeps_explicit_factory_monkeypatch_for_back_compat(
     assert body["engine"] == "fake-back-compat"
 
 
+def test_short_piper_request_skips_edge_tts_curated_voice_warning(monkeypatch, tmp_path):
+    """PR-23 — the curated voice list is Edge-TTS specific. Piper voices
+    (e.g. 'vi_VN-vais1000-medium') are NEVER in that list, so the
+    'passing through to Edge-TTS as-is' warning would fire on every
+    Piper request — misleading and noisy. Suppress it for non-edge-tts
+    providers.
+    """
+
+    class FakePiper:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            wav = Path(output_path).with_suffix(".wav")
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            wav.write_bytes(b"\x00" * 32)
+            return TTSResult(
+                audio_path=wav,
+                duration_seconds=2.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(
+        producer_route, "_tts_factory_func", lambda provider: FakePiper()
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_make_short",
+        lambda *a, **kw: Path(kw.get("output_path") or a[1]).write_bytes(b"\x00" * 16) or Path(kw.get("output_path") or a[1]),
+    )
+
+    r = client.post(
+        "/producer/short",
+        json={
+            "script": SHORT_SCRIPT,
+            "tts_provider": "piper-tts",
+            "voice": "vi_VN-vais1000-medium",
+            "output_dir": str(tmp_path / "out_piper_no_warn"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    edge_warnings = [w for w in body["warnings"] if "Edge-TTS" in w or "curated list" in w]
+    assert edge_warnings == [], f"unexpected Edge-TTS curated-voice warning on Piper request: {edge_warnings}"
+
+
 def test_short_zero_duration_warning_is_format_aware_for_wav(monkeypatch, tmp_path):
     """PR-23 — when Piper produces a WAV and the duration probe returns
     0, the warning must NOT mention `mutagen` (which is the MP3 probe
