@@ -829,8 +829,8 @@
             showError('swc-result', { message: 'electronAPI.producer.composeShort is unavailable — sidecar bridge missing.' });
             return;
         }
-        if (!api.file || typeof api.file.statBytes !== 'function') {
-            showError('swc-result', { message: 'electronAPI.file.statBytes is unavailable — preload.js out of date (rebuild Electron).' });
+        if (typeof api.statBytes !== 'function') {
+            showError('swc-result', { message: 'electronAPI.statBytes is unavailable — preload.js out of date (rebuild Electron).' });
             return;
         }
 
@@ -881,7 +881,7 @@
         // ── Phase 2: pick ≥50KB files + compose ────────────────────────
         showLoading('swc-result', 'Composing 9:16 mp4 (TTS + captions + Ken Burns over Grok images)...');
 
-        const statBytesAsync = (p) => api.file.statBytes(p);
+        const statBytesAsync = (p) => api.statBytes(p);
         const { sceneAssets, skipped: pickSkipped } = await helpers.buildSceneAssetsFromImageBatch(
             scenes, imageGenerate, statBytesAsync,
         );

@@ -246,6 +246,32 @@ async function run() {
         assert.match(skipped[0].reason, /no files/);
     });
 
+    // ── preload.js / renderer namespace contract ──────────────────────────
+    // Regression guard: `electronAPI.statBytes` must be exposed at the top
+    // level (matching `readFile` / `deleteFile` etc.), not nested under a
+    // `file: {...}` namespace, and the renderer must access it the same way.
+    // PR #21 review (BUG_pr-review-job-c0e1d787e7af4d4690859527c6d9eb36_0001)
+    // caught a mismatch here that caused the "Compose with AutoGrok" button
+    // to early-return on every click.
+
+    test("preload.js exposes statBytes at the top level of electronAPI", () => {
+        const fs = require("fs");
+        const path = require("path");
+        const src = fs.readFileSync(path.join(__dirname, "..", "electron", "preload.js"), "utf8");
+        // Top-level binding inside the contextBridge.exposeInMainWorld map.
+        assert.match(src, /statBytes:\s*\(filePath\)\s*=>\s*ipcRenderer\.invoke\('file:statBytes'/,
+            "preload.js must expose `statBytes` at the top level (not under `file: { statBytes }`)");
+    });
+
+    test("creator-forge.js calls api.statBytes (not api.file.statBytes)", () => {
+        const fs = require("fs");
+        const path = require("path");
+        const src = fs.readFileSync(path.join(__dirname, "..", "dist", "creator-forge.js"), "utf8");
+        assert.ok(src.includes("api.statBytes"), "renderer must call `api.statBytes`");
+        assert.ok(!src.includes("api.file.statBytes"),
+            "renderer must NOT call `api.file.statBytes` — that namespace doesn't exist in preload.js");
+    });
+
     // ── stripSceneAssetForComposer ────────────────────────────────────────
 
     test("stripSceneAssetForComposer: drops scene_id annotation", () => {

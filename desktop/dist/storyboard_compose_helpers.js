@@ -12,7 +12,7 @@
  * main process. We deliberately don't call the bridge from the renderer
  * because the dist UI has no module bundler — the renderer instead
  * issues two IPCs (`image:generate` then `producer:composeShort`) and uses
- * the new `electronAPI.file.statBytes` IPC for the ≥ 50 KB blur-rejection
+ * the new `electronAPI.statBytes` IPC for the ≥ 50 KB blur-rejection
  * check (PR-9).
  */
 (function (root, factory) {
@@ -96,7 +96,7 @@
      *
      * `statBytesFn(path)` is async and must return `{ exists:boolean,
      * size:number }` (or null). In the renderer we wire this to
-     * `electronAPI.file.statBytes`; in tests it can be a plain stub.
+     * `electronAPI.statBytes`; in tests it can be a plain stub.
      *
      * @param {string[]} savedFiles
      * @param {(path:string)=>Promise<{exists:boolean,size:number}|null>} statBytesFn
