@@ -203,10 +203,12 @@
             if (acc && typeof acc.password === 'string' && acc.password) {
                 // Replace any literal password occurrence with a
                 // fixed sigil so a misbehaving log line cannot
-                // surface the plaintext.
-                while (safe.indexOf(acc.password) !== -1) {
-                    safe = safe.replace(acc.password, '●●●');
-                }
+                // surface the plaintext. Use split/join (atomic) so a
+                // password that contains the sigil character (e.g.
+                // ``●``) cannot create an infinite feedback loop —
+                // ``"●".replace("●", "●●●")`` would otherwise re-spawn
+                // matches inside the replacement.
+                safe = safe.split(acc.password).join('●●●');
             }
         });
         return safe;

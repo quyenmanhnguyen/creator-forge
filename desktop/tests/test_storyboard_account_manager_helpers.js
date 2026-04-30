@@ -197,6 +197,32 @@ test("sanitizeProgressLog: handles non-string input safely", () => {
     assert.strictEqual(helpers.sanitizeProgressLog(42, []), '');
 });
 
+test("sanitizeProgressLog: terminates when password contains the sigil character", () => {
+    // Devin Review #31 caught an infinite loop when a password is a
+    // substring of the replacement sigil (e.g. password === '●'):
+    // each replace() spawned new matches inside the inserted sigil.
+    // The fix uses split/join so the substitution is atomic.
+    const start = Date.now();
+    const safe = helpers.sanitizeProgressLog(
+        'leaked ● here',
+        [{ email: 'a@b.co', password: '●' }]
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 1000, `sanitizeProgressLog must not hang (took ${elapsed}ms)`);
+    // Single replacement step → '●' → '●●●'.
+    assert.strictEqual(safe, 'leaked ●●● here');
+});
+
+test("sanitizeProgressLog: still redacts when password equals the sigil string itself", () => {
+    const safe = helpers.sanitizeProgressLog(
+        'oops ●●● leaked',
+        [{ email: 'a@b.co', password: '●●●' }]
+    );
+    // The password equals the sigil — split/join produces the same
+    // string back. No hang, no extra mutation.
+    assert.strictEqual(safe, 'oops ●●● leaked');
+});
+
 // ─── deriveBannerCta ─────────────────────────────────────────────
 test("deriveBannerCta: ready → Refresh status", () => {
     const cta = helpers.deriveBannerCta({ status: 'ready', configured_count: 1 });
