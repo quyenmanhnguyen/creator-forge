@@ -85,3 +85,4 @@ jobs:
         run: |
           node desktop/tests/test_image_service_config.js
           node desktop/tests/test_storyboard_bridge.js
+          node desktop/tests/test_grok_profile_dir.js

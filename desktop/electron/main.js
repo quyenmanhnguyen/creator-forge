@@ -345,6 +345,8 @@ const VideoService = require('../src/services/VideoService');
 const I2VService = require('../src/services/I2VService');
 const RefImageService = require('../src/services/RefImageService');
 const LicenseService = require('../src/services/LicenseService');
+const { openManualLogin: browserOpenManualLogin } = require('../src/browser');
+const { SESSIONS_DIR: GROK_SESSIONS_DIR } = require('../src/config');
 
 let licenseService = null;
 function getLicenseService() {
@@ -664,6 +666,35 @@ ipcMain.handle('auth:getSessions', async () => {
 ipcMain.handle('auth:clearSessions', async () => {
     AuthService.clearAllSessions();
     return { success: true };
+});
+
+// Open a headful Puppeteer window pointed at the Grok login page using a
+// persistent userDataDir. The user logs in by hand; cookies/session are
+// written to the profile dir and reused by ImageService/RefImageService etc.
+// on the next launch. Defaults to GROK_SESSIONS_DIR/manual (which honors the
+// GROK_PROFILE_DIR env override). Caller may pass `profileDir` to override.
+ipcMain.handle('auth:openManualLogin', async (_, payload = {}) => {
+    try {
+        const profileDir = payload.profileDir
+            || process.env.GROK_PROFILE_DIR
+            || path.join(GROK_SESSIONS_DIR, 'manual');
+        sendLog('info', `Opening manual Grok login (profile: ${profileDir})...`);
+        const result = await browserOpenManualLogin({
+            profileDir,
+            label: 'GrokLogin',
+            timeoutMs: typeof payload.timeoutMs === 'number' ? payload.timeoutMs : undefined,
+        });
+        if (result.ok) {
+            sendLog('success', `Grok login complete — profile saved at ${result.profileDir}`);
+        } else {
+            sendLog('error', `Grok login failed: ${result.error || 'unknown error'}`);
+        }
+        return result;
+    } catch (error) {
+        const msg = error?.message || String(error) || 'Unknown error';
+        sendLog('error', `auth:openManualLogin failed: ${msg}`);
+        return { ok: false, profileDir: '', error: msg };
+    }
 });
 
 // IPC Handlers - Image generation (parallel multi-account)

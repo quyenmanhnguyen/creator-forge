@@ -210,7 +210,7 @@ CREATOR_FORGE_UI=autogrok npm run dev
 | --- | --- | --- |
 | `YOUTUBE_API_KEY` | [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → enable *YouTube Data API v3* | Niche, Keyword, Outlier, Cloner |
 | `DEEPSEEK_API_KEY` | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | Studio (5-step), Niche verdict, Cloner |
-| Grok login | Puppeteer flow inside Electron — sign in once, session persists | Image / Video / I2V / RefImage |
+| Grok login | Puppeteer flow inside Electron — sign in once, session persists in `GROK_PROFILE_DIR` (or `<userData>/sessions/`); see [Troubleshooting → Grok login](#grok-login-keeps-disappearing--app-launches-a-fresh-browser-every-time) | Image / Video / I2V / RefImage |
 
 Add them to `.env` at repo root; both Electron and the sidecar load it via `python-dotenv` / `process.env`.
 
@@ -395,6 +395,51 @@ filter inside the `completed` handler that `harvestPartialFinals` already
 used, and surfaces a `moderatedCount` field on the result so callers can
 distinguish moderation rejects from normal failures.
 
+### Grok login keeps disappearing / app launches a fresh browser every time
+Fixed in PR-11. Grok login uses a **persistent Puppeteer `userDataDir`**, so
+cookies/session survive across launches. The default profile root is
+`<userData>/sessions/` (per-account subdir keyed by email), or
+`desktop/sessions/` in dev mode.
+
+To put the profile in a stable location outside the repo, export
+`GROK_PROFILE_DIR`:
+
+```bash
+# macOS / Linux
+export GROK_PROFILE_DIR="$HOME/.creator-forge/grok-profile"
+
+# Windows (PowerShell)
+$env:GROK_PROFILE_DIR = "$env:USERPROFILE\.creator-forge\grok-profile"
+```
+
+Both `desktop/src/config.js` and `desktop/src/config/app.config.js` honor
+this override; the launch options for every Puppeteer service
+(`AuthService`, `ImageService`, `VideoService`, `I2VService`,
+`RefImageService`) flow through `SESSIONS_DIR` and pick it up automatically.
+
+#### Manual login (no email/password stored)
+If you don't want to put credentials in `accounts.json`, the renderer can
+trigger a headful login window:
+
+```js
+const result = await window.electronAPI.auth.openManualLogin({
+  // optional — defaults to <SESSIONS_DIR>/manual or $GROK_PROFILE_DIR
+  profileDir: "/Users/me/.creator-forge/grok-profile",
+});
+// → { ok: true, profileDir: "..." }   when the user finishes login
+// → { ok: false, error: "..." }       on timeout / cancel
+```
+
+The window opens at `https://accounts.x.ai/sign-in?redirect=grok-com&email=true`,
+waits up to 10 minutes for the URL to leave `/sign-in`, then closes itself —
+cookies are written to the persistent profile dir and reused on the next
+`AuthService.setupAccount(...)` (or any other Puppeteer launch pointed at
+the same `userDataDir`). No password is stored anywhere on disk by the app.
+
+The profile directory contains live cookies — **never commit it** and never
+paste cookie blobs into chat. `.gitignore` already covers `sessions/`,
+`grok-profile/`, and `desktop/{sessions,grok-profile}/`.
+
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
 `{ prompts: object[], count, account }`, but the IPC handler
@@ -421,6 +466,7 @@ This repo's first commit is **PR-0: integration scaffold**. Each remaining FastA
 - **PR-8** — port `05_Producer.py` short mode → `/producer/short` (Edge-TTS + captions + ffmpeg compose, real `/producer/voices` and `/producer/providers`) (**done**, see `research/api/routes/producer.py::compose_short` + `research/tests/test_api_producer.py`).
 - **PR-9** — fix the two open AutoGrok bugs (only-1-image, blur moderation) carried over from autogrok-veo3 (**done**, see `desktop/src/services/ImageService.js`, `desktop/src/services/RefImageService.js`, `desktop/src/bridges/StoryboardBridge.js`, and `desktop/tests/test_image_service_config.js` / `test_storyboard_bridge.js`).
 - **PR-10** — polish: probe-and-reuse for the sidecar (no port-conflict crashes when uvicorn is started in a separate terminal), expanded README setup, troubleshooting section.
+- **PR-11** — persistent Grok login session: `GROK_PROFILE_DIR` env override + `auth:openManualLogin` IPC for headful manual login (**done**, see `desktop/src/browser.js::openManualLogin`, `desktop/src/config.js`, `desktop/tests/test_grok_profile_dir.js`).
 
 ---
 
