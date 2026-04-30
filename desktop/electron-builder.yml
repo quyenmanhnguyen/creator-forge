@@ -1,0 +1,132 @@
+# electron-builder config for creator-forge.
+#
+# Priorities (PR-18):
+#   - Windows .exe (NSIS installer, x64) is the primary target.
+#   - macOS DMG and Linux AppImage configs are present so the same
+#     `npm run dist:<target>` works on those hosts, but they are not
+#     code-signed in this PR.
+#   - Python research/ sidecar is shipped as `extraResources` so the
+#     packaged app can spawn `python3 -m uvicorn research.api.main:app`
+#     against the bundled source without re-cloning the repo. The user
+#     still needs Python 3.10+ + `pip install -r research/requirements.txt`
+#     on the host (we do NOT bundle the interpreter or its deps in PR-18).
+#
+# This file is loaded automatically by electron-builder when run from
+# `desktop/` (CWD of `npm run dist`).
+
+appId: com.quyenmanhnguyen.creatorforge
+productName: Creator Forge
+copyright: "Copyright © 2026 ${author}"
+
+directories:
+  # `npm run dist` writes installers + unpacked builds here. Gitignored
+  # at the repo root (`desktop/dist-electron/`). Do NOT commit anything
+  # under this path — it can be hundreds of MB.
+  output: dist-electron
+  # `build/` (relative to desktop/) holds icons + entitlements when we
+  # add them. The directory may not exist yet; that's fine — electron-
+  # builder only complains when a referenced asset is missing.
+  buildResources: build
+
+# What goes inside the Electron asar.
+#
+# Anything not matched here is excluded — that's how we keep the
+# packaged app slim and how we keep the legacy `test-fix.js` /
+# `test-ws.js` smoke scripts and the offline test suite out of the
+# shipped product.
+files:
+  - "electron/**/*"
+  - "src/**/*"
+  - "dist/**/*"
+  - "package.json"
+  - "!**/*.map"
+  - "!**/*.test.js"
+  - "!**/__tests__/**"
+  - "!tests/**"
+  - "!test-fix.js"
+  - "!test-ws.js"
+  - "!**/.DS_Store"
+
+# Ship the Python sidecar source alongside the asar so
+# `electron/researchSidecar.js` can locate `research/api/main.py` in a
+# packaged build (looks under `process.resourcesPath/research`). We
+# explicitly do NOT pull in caches / bytecode / venvs / test outputs.
+extraResources:
+  - from: "../research"
+    to: "research"
+    filter:
+      - "**/*"
+      - "!__pycache__/**"
+      - "!**/__pycache__/**"
+      - "!*.pyc"
+      - "!**/*.pyc"
+      - "!.pytest_cache/**"
+      - "!.ruff_cache/**"
+      - "!.venv/**"
+      - "!venv/**"
+      - "!tests/**"
+      - "!**/*.egg-info/**"
+
+# Use asar so the JS source is one file (faster startup, smaller disk).
+asar: true
+asarUnpack:
+  # puppeteer-extra-plugin-stealth occasionally needs to write to its own
+  # node_modules at runtime; pulling its dir out of the asar avoids
+  # EROFS-style issues without disabling asar entirely.
+  - "node_modules/puppeteer-extra-plugin-stealth/**/*"
+
+# Pre-emptive: don't auto-detect "language asset" files we never use.
+# Keeps the shipped Electron payload minimal.
+electronLanguages:
+  - en-US
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "${productName}-Setup-${version}-${arch}.${ext}"
+  # icon: build/icon.ico   # add later; electron-builder uses Electron default if absent
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  artifactName: "${productName}-Setup-${version}-${arch}.${ext}"
+  # The installer warns if our app's display name and EXE name don't
+  # match — pin them both to "Creator Forge".
+  shortcutName: "Creator Forge"
+
+mac:
+  category: public.app-category.video
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+  # No code signing in PR-18 — user will see Gatekeeper warning. Future
+  # PR can wire `CSC_LINK` / `CSC_KEY_PASSWORD` env vars.
+  identity: null
+
+dmg:
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+
+linux:
+  category: AudioVideo
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+
+# Cross-platform: don't try to rebuild native deps for the target. We
+# only have JS deps + Electron (no native modules). Disabling this
+# saves a noisy `npm rebuild` step on first build.
+nodeGypRebuild: false
+buildDependenciesFromSource: false
+
+# We're not publishing to GitHub Releases automatically in PR-18 —
+# `electron-updater` is wired in code (autoUpdater.js) but the
+# distribution channel is left for a future PR.
+publish: null

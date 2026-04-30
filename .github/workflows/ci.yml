@@ -91,6 +91,7 @@ jobs:
           node desktop/tests/test_grok_profile_dir.js
           node desktop/tests/test_e2e_compose_script.js
           node desktop/tests/test_storyboard_compose_helpers.js
+          node desktop/tests/test_research_sidecar_lookup.js
 
       - name: Syntax check standalone E2E scripts
         run: |

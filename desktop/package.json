@@ -1,11 +1,26 @@
 {
-  "name": "autogrok-hieummo",
-  "version": "2.0.0",
-  "description": "AutoGrok Hieummo - 0347854097",
-  "author": "AutoGrok Hieummo",
+  "name": "creator-forge",
+  "productName": "Creator Forge",
+  "version": "0.1.0",
+  "description": "End-to-end YouTube creator suite — research, scriptwriting, AutoGrok image generation, and 9:16 mp4 compose. Electron desktop + Python FastAPI sidecar.",
+  "author": {
+    "name": "quyenmanhnguyen",
+    "url": "https://github.com/quyenmanhnguyen"
+  },
+  "homepage": "https://github.com/quyenmanhnguyen/creator-forge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quyenmanhnguyen/creator-forge.git"
+  },
+  "license": "MIT",
   "main": "electron/main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win --x64",
+    "dist:mac": "electron-builder --mac --x64 --arm64",
+    "dist:linux": "electron-builder --linux --x64"
   },
   "dependencies": {
     "axios": "^1.13.5",
@@ -18,6 +33,7 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
   }
 }

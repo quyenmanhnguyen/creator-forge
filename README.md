@@ -204,6 +204,92 @@ CREATOR_FORGE_UI=autogrok npm run dev
 
 ---
 
+## 📦 Build & package (PR-18)
+
+Once you're past development, `electron-builder` produces installable
+artifacts straight from `desktop/`:
+
+```bash
+cd desktop
+npm install                     # picks up electron-builder devDep
+npm run pack                    # unpacked dir build for the host platform
+npm run dist:win                # Windows NSIS installer (.exe, x64)
+npm run dist:mac                # macOS DMG (x64 + arm64; not code-signed)
+npm run dist:linux              # Linux AppImage (x64)
+```
+
+Artifacts land in `desktop/dist-electron/` (gitignored). The Windows
+NSIS installer is the primary target — the `Creator-Forge-Setup-<ver>-x64.exe`
+output lets the user choose an install dir and creates a Start-menu
+shortcut.
+
+### What ships in the package
+
+The build config (`desktop/electron-builder.yml`) is conservative on
+purpose:
+
+- **Bundled into the asar:** `electron/`, `src/`, `dist/` (renderer
+  HTML/JS/CSS), and `package.json`. Test suites, the legacy
+  `test-fix.js` / `test-ws.js` smoke scripts, and `*.map` files are
+  excluded.
+- **Bundled as `extraResources`:** the `research/` Python sidecar
+  source — minus `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`,
+  `.venv/`, `tests/`, and `*.egg-info/`. Lands at
+  `<resourcesPath>/research/api/main.py` inside the installed app.
+- **NOT bundled:** Chromium runtime binaries (Electron ships its own),
+  Node binaries, the user's `.venv/`, the Python interpreter, or any
+  `e2e-output/` / `~/.creator-forge/` artifacts.
+
+### Python sidecar at runtime
+
+`electron-builder` does NOT bundle the Python interpreter or
+`research/requirements.txt` deps — the packaged app still spawns
+`python3 -m uvicorn research.api.main:app` against the bundled
+`research/` source on first launch. Users of the installer therefore
+need:
+
+1. Python 3.10+ on `PATH` (or pinned via `CREATOR_FORGE_PYTHON`).
+2. `pip install -r research/requirements.txt` against that interpreter
+   (the same one the dev workflow uses).
+3. `ffmpeg` on `PATH` for the compose pipeline.
+
+The first launch fails fast with a friendly error (`researchSidecar:
+cannot locate research/api/main.py` or `python3: command not found`)
+when any of these are missing.
+
+### Cross-compiling Windows installers from Linux/macOS
+
+`electron-builder` invokes `signtool.exe` / `wine` even when no code-signing
+identity is configured (it stamps Windows EXE metadata). Cross-compile is
+therefore a separate prerequisite:
+
+- **Native Windows host** — `npm run dist:win` works out of the box.
+- **Linux / macOS host** — install [`wine`](https://www.winehq.org/) and
+  rerun. Without `wine` you'll see
+  `⨯ wine is required, please see https://electron.build/multi-platform-build`
+  and the build aborts after producing the unpacked `linux-unpacked/`
+  directory.
+
+### Code signing (out of scope for PR-18)
+
+The current config explicitly opts out of code signing:
+
+- `mac.identity: null` — packaged DMG is unsigned, so first launch shows
+  Gatekeeper's "unidentified developer" warning. Users right-click → Open
+  to bypass.
+- Windows builds are unsigned — SmartScreen will warn until reputation
+  builds up. A future PR can wire `CSC_LINK` / `CSC_KEY_PASSWORD` env vars
+  into the existing config.
+
+### Auto-updater
+
+`desktop/electron/autoUpdater.js` already wires `electron-updater`, but
+`electron-builder.yml` sets `publish: null` — no GitHub release feed is
+generated yet. Wire `publish:` to a `provider: github` block when ready
+to ship updates.
+
+---
+
 ## 🔑 API keys
 
 | Key | Where | Used by |
@@ -519,6 +605,28 @@ node scripts/e2e_compose_with_scene_assets.js \
     --input-dir e2e-output/<timestamp> \
     --allow-partial
 ```
+
+### Packaged app launches but the sidecar dot stays red (PR-18)
+
+The installer ships the Python sidecar source under
+`<install-dir>/resources/research/`, but you still need a Python
+interpreter on the host. The most common causes:
+
+- **`python3` (or `python` on Windows) is not on PATH.** Install Python
+  3.10+ from python.org and re-launch the app.
+- **Python is on PATH but `research/requirements.txt` isn't installed.**
+  From a shell with the same Python on PATH:
+  `pip install -r <install-dir>/resources/research/requirements.txt`
+  (or point `CREATOR_FORGE_PYTHON` at a venv that already has them).
+- **Port 5050 is taken by an unrelated service.** Set
+  `CREATOR_FORGE_RESEARCH_PORT=<free port>` before launching the app, or
+  free the port. The sidecar refuses to spawn on a busy port that
+  doesn't carry the `creator-forge.research` service tag.
+- **`ffmpeg` missing.** Compose works only when `ffmpeg` is on PATH (or
+  `imageio-ffmpeg` is installed in the same Python env).
+
+The error appears verbatim in the renderer console (DevTools →
+Console) and in the user-data `electron-runtime.log`.
 
 ### `npm run dev` works but `count_per_scene` from Storyboard is ignored
 Fixed in PR-9. `StoryboardBridge.generateImages` used to send
