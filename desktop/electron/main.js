@@ -346,6 +346,8 @@ const I2VService = require('../src/services/I2VService');
 const RefImageService = require('../src/services/RefImageService');
 const LicenseService = require('../src/services/LicenseService');
 const VideoValidation = require('../dist/video_validation_helpers');
+const { runFanOut } = require('../src/orchestration/multi_account_fan_out');
+const { PROCESSING_CONFIG } = require('../src/config/app.config');
 const { openManualLogin: browserOpenManualLogin } = require('../src/browser');
 const { SESSIONS_DIR: GROK_SESSIONS_DIR } = require('../src/config');
 
@@ -861,7 +863,16 @@ ipcMain.handle('auth:openManualLogin', async (_, payload = {}) => {
     }
 });
 
-// IPC Handlers - Image generation (parallel multi-account)
+// IPC Handlers - Image generation (work-stealing multi-account fan-out)
+//
+// PR-47: replaces the old static-slice fan-out
+// (``Math.ceil(N/M)`` items per session, dispatched via
+// ``ImageService.generateBatch`` per session) with a shared work
+// queue. Each session pulls the next prompt from the queue the
+// moment it finishes its previous one, so a fast account does not
+// idle while a slow / rate-limited account drains its slice. See
+// ``desktop/src/orchestration/multi_account_fan_out.js`` for the
+// scheduler internals.
 ipcMain.handle('image:generate', async (_, params) => {
     try {
         const { prompts, config, startIdx: baseIdx = 0 } = params;
@@ -872,8 +883,11 @@ ipcMain.handle('image:generate', async (_, params) => {
             return { success: false, error: 'No active sessions. Please setup accounts first.' };
         }
 
-        const perAcc = Math.ceil(prompts.length / sessions.length);
-        sendLog('info', `Generating ${prompts.length} images across ${sessions.length} account(s) (${perAcc} per acc)...`);
+        const perSessionConcurrency = Math.max(1, Math.min(
+            Number(config?.batchSize) || PROCESSING_CONFIG.BATCH_SIZE || 30,
+            30,
+        ));
+        sendLog('info', `Generating ${prompts.length} images across ${sessions.length} account(s) — work-stealing queue, up to ${perSessionConcurrency}/account = up to ${sessions.length * perSessionConcurrency} parallel...`);
 
         // Refresh cookies from live browser sessions before generating
         await AuthService.refreshAllCookies();
@@ -881,31 +895,75 @@ ipcMain.handle('image:generate', async (_, params) => {
         // Reset re-login counters for fresh batch
         AuthService.resetAllReloginCounts();
 
-        const allResults = await Promise.all(
-            sessions.map(async (session, ai) => {
-                const sliceStart = ai * perAcc;
-                const sliceEnd = Math.min((ai + 1) * perAcc, prompts.length);
-                const myPrompts = prompts.slice(sliceStart, sliceEnd);
-                if (myPrompts.length === 0) return [];
-                const nameStart = baseIdx + sliceStart;
-                sendLog('info', `[Acc${session.accIdx + 1}] 📋 Assigned prompts #${nameStart + 1}→#${nameStart + myPrompts.length} (${myPrompts.length} items)`);
-                console.log(`[Main] [Acc${session.accIdx + 1}] Processing ${myPrompts.length} images...`);
-                return ImageService.generateBatch(myPrompts, session, config || {}, (prompt, progress, result, localIdx) => {
-                    const globalIdx = nameStart + (localIdx != null ? localIdx : 0);
-                    sendProgress('image', { prompt, progress, result, globalIdx });
-                    if (result) {
-                        const status = result.success ? 'success' : 'error';
-                        const label = result.title || prompt.substring(0, 50);
-                        const errorMsg = result.error ? ` | Error: ${result.error}` : '';
-                        sendLog(status, `[Acc${session.accIdx + 1}] Image ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
-                    }
-                }, nameStart).then(batchResults => batchResults.map(r => ({ ...r, globalIdx: nameStart + (r.localIdx != null ? r.localIdx : 0) })));
-            })
-        );
+        const fanOut = await runFanOut({
+            sessions,
+            items: prompts,
+            perSessionConcurrency,
+            workerStaggerMs: 75,
+            isCancelled: () => ImageService._cancelled,
+            onProgress: ({ idx, result, session }) => {
+                if (!result) return;
+                const globalIdx = baseIdx + idx;
+                sendProgress('image', {
+                    prompt: result.prompt,
+                    progress: 100,
+                    result,
+                    globalIdx,
+                });
+                const status = result.success ? 'success' : 'error';
+                const label = result.title || (result.prompt || '').substring(0, 50);
+                const errorMsg = result.error ? ` | Error: ${result.error}` : '';
+                sendLog(status, `[Acc${session.accIdx + 1}] Image ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
+            },
+            processOne: async (prompt, session, idx) => {
+                const globalNum = baseIdx + idx + 1;
+                const onItemProgress = (p, progress, result, _localIdx) => {
+                    // Per-item live progress (0..99). Final 100% +
+                    // result are emitted from the fan-out's onProgress
+                    // hook above so we don't double-fire.
+                    if (result) return;
+                    sendProgress('image', {
+                        prompt: p,
+                        progress,
+                        result: null,
+                        globalIdx: baseIdx + idx,
+                    });
+                };
+                return ImageService._processOneBatchItem(
+                    prompt,
+                    session,
+                    config || {},
+                    onItemProgress,
+                    idx,
+                    globalNum,
+                    prompts.length,
+                );
+            },
+        });
 
-        const results = allResults.flat();
+        const results = fanOut.results.map((r, idx) => {
+            const globalIdx = baseIdx + idx;
+            if (!r) {
+                // Slot was never reached — every session quarantined or
+                // batch was cancelled before this index was taken.
+                return {
+                    prompt: prompts[idx],
+                    localIdx: idx,
+                    globalIdx,
+                    success: false,
+                    error: ImageService._cancelled ? 'cancelled' : 'no session available',
+                    savedFiles: [],
+                    outputPath: null,
+                };
+            }
+            return { ...r, globalIdx };
+        });
+
         const successCount = results.filter(r => r.success).length;
-        sendLog('info', `Image generation complete: ${successCount}/${results.length} successful`);
+        const perSessionLog = fanOut.stats.perSession
+            .map(s => `Acc${(s.accIdx ?? -1) + 1}=${s.ok}/${s.taken}${s.quarantined ? '⛔' : ''}`)
+            .join(' ');
+        sendLog('info', `Image generation complete: ${successCount}/${results.length} successful | ${perSessionLog}`);
 
         return { success: true, results };
     } catch (error) {
