@@ -59,6 +59,24 @@ def _ffprobe_stdout(duration: float = 3.0) -> str:
     })
 
 
+def _ffprobe_stdout_split(*, container: float, video_stream: float) -> str:
+    """ffprobe output where ``format.duration`` exceeds the video stream's
+    ``duration`` — the post-PR-31 mov_text "soft subs extend container"
+    case.
+    """
+    return json.dumps({
+        "format": {"duration": str(container)},
+        "streams": [
+            {
+                "codec_type": "video", "codec_name": "h264",
+                "width": 720, "height": 1280, "duration": str(video_stream),
+            },
+            {"codec_type": "audio", "codec_name": "aac"},
+            {"codec_type": "subtitle", "codec_name": "mov_text"},
+        ],
+    })
+
+
 def _runner_factory(
     *,
     ffprobe_stdout: str = "",
@@ -256,6 +274,97 @@ def test_assemble_no_usable_scenes_aborts_before_ffmpeg(tmp_path, monkeypatch):
     # ffmpeg should never have been spawned.
     assert all("ffmpeg" not in str(cmd[0]) for cmd in calls)
     assert any("No usable scene videos" in w for w in r.warnings)
+
+
+def test_assemble_reports_video_stream_duration_not_container(tmp_path, monkeypatch):
+    """Reproduces the May-01 live-E2E finding: with ``caption_mode="soft"``
+    the soft-subs SRT extends the mp4 container past the visual track,
+    and the legacy code path (``check.duration_sec``) erroneously
+    reported the longer container duration. ``duration_s`` must reflect
+    the v:0 stream's duration so callers can sanity-check against the
+    summed scene durations.
+    """
+    _force_binaries(monkeypatch)
+    scene1 = _make_scene_file(tmp_path, "shot1.mp4")
+    scene2 = _make_scene_file(tmp_path, "shot2.mp4")
+    scene3 = _make_scene_file(tmp_path, "shot3.mp4")
+    audio = _make_audio_file(tmp_path)
+    srt = _make_srt_file(tmp_path)
+    out_dir = tmp_path / "assembly"
+
+    def runner(cmd, **_kwargs):
+        binary = str(cmd[0])
+        target = str(cmd[-1])
+        if "ffprobe" in binary:
+            # final.mp4 is the only path that exhibits the split (mov_text
+            # extends container). Scene probes use the symmetric helper.
+            if target.endswith("final.mp4"):
+                return _Proc(
+                    returncode=0,
+                    stdout=_ffprobe_stdout_split(container=11.18, video_stream=10.0),
+                    stderr="",
+                )
+            # Each scene returns 3.333s so summed = 9.999s ≈ 10s.
+            return _Proc(returncode=0, stdout=_ffprobe_stdout(3.333), stderr="")
+        # ffmpeg — pretend it wrote a realistic-sized final.mp4.
+        (out_dir / "final.mp4").write_bytes(b"y" * 300_000)
+        return _Proc(returncode=0, stdout="", stderr="")
+
+    r = assembler.assemble_final_mp4(
+        scene_videos=[str(scene1), str(scene2), str(scene3)],
+        audio_path=str(audio), srt_path=str(srt),
+        output_dir=out_dir,
+        runner=runner,
+    )
+
+    assert r.final_path == str(out_dir / "final.mp4")
+    # The headline assertion: video stream length, not container length.
+    assert r.duration_s == pytest.approx(10.0, abs=0.01)
+    # Specifically NOT the container duration — that would silently
+    # over-report by ~1.18s when soft-subs are attached.
+    assert r.duration_s != pytest.approx(11.18)
+    assert r.captions_attached is True
+
+
+def test_assemble_falls_back_to_video_total_when_stream_duration_missing(
+    tmp_path, monkeypatch,
+):
+    """When ffprobe reports ``format.duration`` only (no per-stream
+    ``duration`` field — some encoders skip it), we fall back to the
+    summed scene durations rather than the container.
+    """
+    _force_binaries(monkeypatch)
+    scene1 = _make_scene_file(tmp_path, "shot1.mp4")
+    out_dir = tmp_path / "assembly"
+
+    def runner(cmd, **_kwargs):
+        binary = str(cmd[0])
+        target = str(cmd[-1])
+        if "ffprobe" in binary:
+            if target.endswith("final.mp4"):
+                # format only, no streams[].duration.
+                no_stream_dur = json.dumps({
+                    "format": {"duration": "11.18"},
+                    "streams": [
+                        {"codec_type": "video", "codec_name": "h264",
+                         "width": 720, "height": 1280},
+                    ],
+                })
+                return _Proc(returncode=0, stdout=no_stream_dur, stderr="")
+            return _Proc(returncode=0, stdout=_ffprobe_stdout(4.0), stderr="")
+        (out_dir / "final.mp4").write_bytes(b"y" * 300_000)
+        return _Proc(returncode=0, stdout="", stderr="")
+
+    r = assembler.assemble_final_mp4(
+        scene_videos=[str(scene1)],
+        audio_path=None, srt_path=None,
+        output_dir=out_dir,
+        runner=runner,
+    )
+
+    assert r.final_path == str(out_dir / "final.mp4")
+    # Falls back to summed scene durations, not the inflated container.
+    assert r.duration_s == pytest.approx(4.0)
 
 
 def test_assemble_happy_path_writes_final_mp4(tmp_path, monkeypatch):

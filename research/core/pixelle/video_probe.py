@@ -41,12 +41,22 @@ FFPROBE_TIMEOUT_SEC = 15
 
 @dataclass
 class VideoProbeResult:
-    """Structured probe result; mirrors the JS helper's return shape."""
+    """Structured probe result; mirrors the JS helper's return shape.
+
+    ``duration_sec`` is the **container** duration (``format.duration``),
+    which equals the longest stream — typically the visual track but it
+    can be the soft-subtitle track when the SRT extends past the video
+    (PR-31 / PR-32). ``video_stream_duration_sec`` is the v:0 stream's
+    own ``duration`` field; callers that care about *visual* length
+    (e.g. ``/producer/assemble``'s response) should prefer that and only
+    fall back to the container duration if it is unavailable.
+    """
 
     exists: bool = False
     size: int = 0
     ffprobe_available: bool = False
     duration_sec: float | None = None
+    video_stream_duration_sec: float | None = None
     has_video_stream: bool | None = None
     width: int | None = None
     height: int | None = None
@@ -169,16 +179,23 @@ def probe_video_file(
         (s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"),
         None,
     )
-    duration: float | None
-    try:
-        if fmt.get("duration") is not None:
-            duration = float(fmt["duration"])
-        elif video_stream and video_stream.get("duration") is not None:
-            duration = float(video_stream["duration"])
-        else:
-            duration = None
-    except (TypeError, ValueError):
-        duration = None
+    def _safe_float(val):
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    container_duration = _safe_float(fmt.get("duration"))
+    video_duration = _safe_float((video_stream or {}).get("duration"))
+
+    # Container duration is reported as the legacy ``duration_sec`` for
+    # backwards compatibility with /producer/short callers. When it's
+    # missing (some encoders skip ``format.duration``), fall back to the
+    # video stream's own duration so the existing
+    # ``duration_sec > MIN_DURATION_SEC`` validation still passes.
+    duration: float | None = container_duration
+    if duration is None:
+        duration = video_duration
 
     def _safe_int(val):
         try:
@@ -191,6 +208,7 @@ def probe_video_file(
         size=size,
         ffprobe_available=True,
         duration_sec=duration,
+        video_stream_duration_sec=video_duration,
         has_video_stream=bool(video_stream),
         width=_safe_int((video_stream or {}).get("width")),
         height=_safe_int((video_stream or {}).get("height")),
@@ -224,6 +242,7 @@ def validate_video_output(
             size=probe.size,
             ffprobe_available=probe.ffprobe_available,
             duration_sec=probe.duration_sec,
+            video_stream_duration_sec=probe.video_stream_duration_sec,
             has_video_stream=probe.has_video_stream,
             width=probe.width,
             height=probe.height,
@@ -237,6 +256,7 @@ def validate_video_output(
             size=probe.size,
             ffprobe_available=probe.ffprobe_available,
             duration_sec=probe.duration_sec,
+            video_stream_duration_sec=probe.video_stream_duration_sec,
             has_video_stream=probe.has_video_stream,
             width=probe.width,
             height=probe.height,
@@ -254,6 +274,7 @@ def validate_video_output(
                 size=probe.size,
                 ffprobe_available=True,
                 duration_sec=probe.duration_sec,
+                video_stream_duration_sec=probe.video_stream_duration_sec,
                 has_video_stream=probe.has_video_stream,
                 width=probe.width,
                 height=probe.height,
@@ -272,6 +293,7 @@ def validate_video_output(
                 size=probe.size,
                 ffprobe_available=True,
                 duration_sec=probe.duration_sec,
+                video_stream_duration_sec=probe.video_stream_duration_sec,
                 has_video_stream=probe.has_video_stream,
                 width=probe.width,
                 height=probe.height,
@@ -284,6 +306,7 @@ def validate_video_output(
             size=probe.size,
             ffprobe_available=True,
             duration_sec=probe.duration_sec,
+            video_stream_duration_sec=probe.video_stream_duration_sec,
             has_video_stream=True,
             width=probe.width,
             height=probe.height,

@@ -475,9 +475,23 @@ def assemble_final_mp4(
             warnings=warnings,
         )
 
+    # Report the *video stream's* duration, not the container's. With
+    # ``caption_mode="soft"`` ffmpeg attaches the SRT as a ``mov_text``
+    # track without re-trimming it, so the container duration ends up
+    # being the longest stream — typically the SRT's last cue, which can
+    # extend past the visual content. Callers (and the desktop's
+    # Assembly panel) want the visual length so they can sanity-check
+    # against the summed scene durations.
+    final_duration_s = float(
+        check.video_stream_duration_sec
+        or video_total_s
+        or check.duration_sec
+        or 0.0
+    )
+
     return AssembleResult(
         final_path=str(output_path),
-        duration_s=float(check.duration_sec or video_total_s or 0.0),
+        duration_s=final_duration_s,
         scene_count=len(resolved_scenes),
         audio_attached=audio is not None and audio_mode == "replace",
         captions_attached=srt is not None and caption_mode == "soft",
