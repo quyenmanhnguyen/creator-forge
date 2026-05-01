@@ -884,6 +884,7 @@
             else if (action === 'delete') sbbDeleteRow(kind, rowId);
             else if (action === 'refs') sbbAddRowRefs(rowId).catch((err) => console.warn('add row refs failed:', err));
             else if (action === 'clear-refs') sbbClearRowRefs(rowId);
+            else if (action === 'retry') sbbRetryRow(kind, rowId).catch((err) => console.warn('retry failed:', err));
         } else if (t.matches('button[data-sbb-ref-remove]')) {
             // PR-28 — ✕ button on a global-ref list entry.
             sbbRemoveGlobalRef(t.getAttribute('data-sbb-ref-remove'));
@@ -1005,9 +1006,10 @@
         if (!target) return;
         if (!sbbState.imageRows.length) {
             target.innerHTML = '<div class="empty">No prompts loaded. Click "Auto-fill from scenes" after running "Break into scenes" above.</div>';
-            return;
+        } else {
+            target.innerHTML = sbbRenderTable(sbbState.imageRows, 'image');
         }
-        target.innerHTML = sbbRenderTable(sbbState.imageRows, 'image');
+        sbbUpdateGenerateButton('image');
     }
 
     /** Repaint just the video batch table. */
@@ -1016,9 +1018,47 @@
         if (!target) return;
         if (!sbbState.videoRows.length) {
             target.innerHTML = '<div class="empty">No prompts loaded. Click "Auto-fill from scenes" after running "Break into scenes" above.</div>';
+        } else {
+            target.innerHTML = sbbRenderTable(sbbState.videoRows, 'video');
+        }
+        sbbUpdateGenerateButton('video');
+    }
+
+    /**
+     * PR-29 — update the "Generate images / videos" primary button to
+     * reflect the current selection state.
+     *
+     *   - 0 selected → label "Select rows to generate", button disabled.
+     *   - N selected → label "Generate selected (N)", button enabled.
+     *   - 0 rows in the table → fall back to the original "Generate
+     *     images / videos" label so the cold-start affordance stays
+     *     intact (Auto-fill is what populates rows; the user still
+     *     needs to see the button to know it exists).
+     */
+    function sbbUpdateGenerateButton(kind) {
+        const btn = document.querySelector(
+            `button[data-run="storyboard-batch-${kind === 'video' ? 'video' : 'image'}"]`,
+        );
+        if (!btn) return;
+        const rows = kind === 'video' ? sbbState.videoRows : sbbState.imageRows;
+        const selected = kind === 'video' ? sbbState.videoSelected : sbbState.imageSelected;
+        const noun = kind === 'video' ? 'videos' : 'images';
+        const selSize = (selected && typeof selected.size === 'number') ? selected.size : 0;
+        if (!rows.length) {
+            btn.textContent = `Generate ${noun}`;
+            btn.removeAttribute('disabled');
+            btn.title = `Auto-fill from scenes first, then check rows to generate ${noun}.`;
             return;
         }
-        target.innerHTML = sbbRenderTable(sbbState.videoRows, 'video');
+        if (selSize === 0) {
+            btn.textContent = 'Select rows to generate';
+            btn.setAttribute('disabled', '');
+            btn.title = 'Check at least one row (or click "Select all" in the toolbar) to enable this.';
+            return;
+        }
+        btn.textContent = `Generate selected (${selSize})`;
+        btn.removeAttribute('disabled');
+        btn.title = `Run ${noun} generation on the ${selSize} selected row${selSize === 1 ? '' : 's'}.`;
     }
 
     /**
@@ -1085,7 +1125,14 @@
         for (const r of rows) {
             const label = helpers.statusLabel(r.status);
             const cls = helpers.statusClass(r.status);
-            let statusCell = `<span class="pill ${escapeHtml(cls)}">${escapeHtml(label)} (${escapeHtml(r.attempts || 0)}x)</span>`;
+            // PR-29: surface the row's reason (Grok error string,
+            // moderation hint, etc.) as a `title=` tooltip on the pill
+            // so the user can hover-discover it even when the inline
+            // <div class="reason"> is wrapped or off-screen on a tall
+            // table.
+            const pillTitle = (r.reason && (r.status === 'fallback' || r.status === 'skipped'))
+                ? ` title="${escapeHtml(r.reason)}"` : '';
+            let statusCell = `<span class="pill ${escapeHtml(cls)}"${pillTitle}>${escapeHtml(label)} (${escapeHtml(r.attempts || 0)}x)</span>`;
             if (r.status === 'generating') {
                 statusCell += `<div class="progress-bar"><div style="width:${escapeHtml(r.progress || 0)}%"></div></div>`;
             }
@@ -1129,8 +1176,18 @@
             const delBtn = `<button class="sbb-icon-btn danger" data-sbb-row-action="delete"`
                 + ` data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(r.row_id || '')}"`
                 + ` title="Drop this row from the table"${deletable ? '' : ' disabled'}>Delete</button>`;
+            // PR-29 — per-row Retry button for failed rows. The
+            // handler (`sbbRetryRow`) re-runs exactly this row's
+            // generation regardless of the current bulk-select set,
+            // so the user can recover one row without re-checking the
+            // selection or running the whole batch again.
+            const retryBtn = (r.status === 'fallback')
+                ? `<button class="sbb-icon-btn" data-sbb-row-action="retry"`
+                    + ` data-sbb-kind="${escapeHtml(kind)}" data-sbb-row="${escapeHtml(r.row_id || '')}"`
+                    + ` title="Re-run just this row">Retry</button>`
+                : '';
             const refButtons = kind === 'image' ? sbbRenderRefRowButtons(r) : '';
-            const rowActions = `<div class="sbb-row-actions">${editBtn}${delBtn}${refButtons}${baseActions}${bridgeChip}</div>`;
+            const rowActions = `<div class="sbb-row-actions">${editBtn}${retryBtn}${delBtn}${refButtons}${baseActions}${bridgeChip}</div>`;
             const rowKey = `${kind}:${r.row_id}`;
             const inEdit = editKey === rowKey;
             const promptCell = inEdit
@@ -2169,35 +2226,74 @@
         });
     }
 
+    /**
+     * PR-29 — public Generate handler. Reads the user's checkbox
+     * selection from ``sbbState.imageSelected`` and refuses to run
+     * when nothing is selected (we now require explicit intent
+     * instead of silently generating every row). Bulk Generate goes
+     * through this; per-row Retry calls ``sbbRunImageBatchForRowIds``
+     * directly with a synthetic single-id set so a Retry click never
+     * fans out to siblings.
+     */
     async function sbbGenerateImages() {
-        const helpers = window.StoryboardBatchHelpers;
-        if (!helpers) return;
         if (!sbbState.imageRows.length) {
             sbbAutoFill();
             if (!sbbState.imageRows.length) return;
         }
+        const banner = $('sbb-image-result');
+        if (!sbbState.imageSelected.size) {
+            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">Select at least one row first (or click "Select all" in the toolbar).</div>');
+            return;
+        }
+        return sbbRunImageBatchForRowIds(sbbState.imageSelected);
+    }
+
+    /**
+     * PR-29 — body of the image-generation flow, scoped to a specific
+     * set of row_ids. Used by both bulk Generate and per-row Retry.
+     * Skipped / empty-prompt rows in the subset are filtered out by
+     * the planners so they don't bleed into the IPC payload.
+     */
+    async function sbbRunImageBatchForRowIds(rowIds) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const banner = $('sbb-image-result');
         if (!api || !api.image || typeof api.image.generate !== 'function') {
-            $('sbb-image-result').innerHTML = '<div class="error">electronAPI.image.generate unavailable.</div>';
+            if (banner) banner.innerHTML = '<div class="error">electronAPI.image.generate unavailable.</div>';
+            return;
+        }
+        const subset = helpers.filterRowsBySelection(sbbState.imageRows, rowIds);
+        if (!subset.length) {
+            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">No matching rows to generate.</div>');
             return;
         }
         // PR-28: when any row resolves to ≥1 ref image, we route those
         // rows through `refimg:generate` (Grok's imagine-image-edit
         // model) and the remainder through plain `image:generate`.
         const refOpts = { rowRefMap: sbbState.rowRefMap, globalRefs: sbbState.globalRefs };
-        const split = helpers.partitionRowsByRefs(sbbState.imageRows, refOpts);
+        const split = helpers.partitionRowsByRefs(subset, refOpts);
         const plainPlan = helpers.planImageGenerate(split.withoutRefs);
         const refPlan = helpers.planRefImageGenerate(split.withRefs, refOpts);
         const eligibleCount = plainPlan.prompts.length + refPlan.items.length;
         if (!eligibleCount) {
-            $('sbb-image-result').innerHTML = '<div class="error">No eligible image prompts (every scene was skipped — check image_prompt).</div>';
+            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">No eligible image prompts in the selection (every row was skipped — check image_prompt).</div>');
             return;
         }
         if (refPlan.items.length && (!api.refimg || typeof api.refimg.generate !== 'function')) {
-            $('sbb-image-result').innerHTML = '<div class="error">electronAPI.refimg.generate unavailable — drop the reference images or update the desktop shell.</div>';
+            if (banner) banner.innerHTML = '<div class="error">electronAPI.refimg.generate unavailable — drop the reference images or update the desktop shell.</div>';
             return;
         }
         sbbInstallListener();
-        sbbState.imageRows = helpers.startBatchPhase(sbbState.imageRows);
+        // PR-29: only flip the subset rows to "generating"; siblings
+        // outside the subset stay in their current status so a retry
+        // / partial run doesn't visually obliterate the rest of the
+        // table. Skipped rows in the subset are still left alone.
+        const subsetIds = new Set(subset.map((r) => String(r.row_id)));
+        sbbState.imageRows = sbbState.imageRows.map((row) => {
+            if (!subsetIds.has(String(row.row_id))) return row;
+            if (row.status === 'skipped') return row;
+            return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
+        });
         // currentImageBatch* covers BOTH plans so progress events for
         // either IPC channel route through the same row mapping.
         sbbState.currentImageBatchSceneIds = [...plainPlan.sceneIds, ...refPlan.sceneIds];
@@ -2210,7 +2306,6 @@
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
         if (aspect) config.aspectRatio = aspect;
-        const banner = $('sbb-image-result');
 
         const tasks = [];
         if (plainPlan.prompts.length) {
@@ -2248,35 +2343,78 @@
         sbbResolveUrls(sbbState.imageRows, 'image').catch(() => {});
     }
 
+    /**
+     * PR-29 — per-row Retry. Always re-runs exactly one row,
+     * regardless of the current selection, by passing a synthetic
+     * single-element row_id set to the matching batch helper. Failed
+     * (status=fallback) rows are the primary use case but the
+     * handler is permissive — re-running a settled row is harmless
+     * since the planners will skip already-generated rows.
+     */
+    async function sbbRetryRow(kind, rowId) {
+        if (rowId == null || rowId === '') return;
+        const set = new Set([String(rowId)]);
+        if (kind === 'video') return sbbRunVideoBatchForRowIds(set);
+        return sbbRunImageBatchForRowIds(set);
+    }
+
+    /**
+     * PR-29 — public Generate handler for the video table. Same
+     * selection-aware contract as ``sbbGenerateImages``: refuses to
+     * run with an empty selection so the user can't accidentally
+     * fan out a single-row retry to all 60 rows.
+     */
     async function sbbGenerateVideos() {
-        const helpers = window.StoryboardBatchHelpers;
-        if (!helpers) return;
         if (!sbbState.videoRows.length) {
             sbbAutoFill();
             if (!sbbState.videoRows.length) return;
         }
+        const banner = $('sbb-video-result');
+        if (!sbbState.videoSelected.size) {
+            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">Select at least one row first (or click "Select all" in the toolbar).</div>');
+            return;
+        }
+        return sbbRunVideoBatchForRowIds(sbbState.videoSelected);
+    }
+
+    /**
+     * PR-29 — body of the video-generation flow, scoped to a row_id
+     * subset. Used by both bulk Generate and per-row Retry. Honors
+     * the i2v / t2v selector and re-pairs image_path bindings before
+     * planning so a freshly generated image is picked up by an
+     * adjacent retry.
+     */
+    async function sbbRunVideoBatchForRowIds(rowIds) {
+        const helpers = window.StoryboardBatchHelpers;
+        if (!helpers) return;
+        const banner = $('sbb-video-result');
         const mode = ($('sbb-video-mode') || {}).value || 'i2v';
         if (mode === 'i2v') {
             if (!api || !api.i2v || typeof api.i2v.generate !== 'function') {
-                $('sbb-video-result').innerHTML = '<div class="error">electronAPI.i2v.generate unavailable.</div>';
+                if (banner) banner.innerHTML = '<div class="error">electronAPI.i2v.generate unavailable.</div>';
                 return;
             }
         } else {
             if (!api || !api.video || typeof api.video.generate !== 'function') {
-                $('sbb-video-result').innerHTML = '<div class="error">electronAPI.video.generate unavailable (T2V).</div>';
+                if (banner) banner.innerHTML = '<div class="error">electronAPI.video.generate unavailable (T2V).</div>';
                 return;
             }
         }
         // Always re-pair before planning so the latest image table state
         // is reflected in I2V eligibility.
         sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
-        const plan = helpers.planVideoGenerate(sbbState.videoRows, mode);
+        const subset = helpers.filterRowsBySelection(sbbState.videoRows, rowIds);
+        if (!subset.length) {
+            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">No matching rows to generate.</div>');
+            return;
+        }
+        const plan = helpers.planVideoGenerate(subset, mode);
         const eligibleCount = mode === 'i2v' ? plan.items.length : plan.prompts.length;
         if (!eligibleCount) {
             const reason = mode === 'i2v'
-                ? 'No eligible scenes — generate images first or switch to T2V mode.'
-                : 'No video prompts — every scene is missing video_prompt / flow_video_prompt.';
-            $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(reason)}</div>`);
+                ? 'No eligible rows in the selection — generate images first or switch to T2V mode.'
+                : 'No video prompts in the selection — every row is missing video_prompt / flow_video_prompt.';
+            if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(reason)}</div>`);
             return;
         }
         sbbInstallListener();
@@ -2284,6 +2422,10 @@
         // skipped rows from the plan (e.g. I2V rows missing an image).
         // PR-23: gate by row_id when the plan supplies it so variant 0
         // can flip to `generating` while siblings remain pending.
+        // PR-29: rows OUTSIDE the subset are left untouched — a partial
+        // run never resets siblings, even if they're in the planner's
+        // "skipped" bucket from a previous run.
+        const subsetIds = new Set(subset.map((r) => String(r.row_id != null ? r.row_id : r.scene_id)));
         const eligibleRowIdSet = new Set((plan.rowIds || []).map(String));
         const eligibleSceneSet = new Set(plan.sceneIds.map(String));
         const skippedRowMap = new Map(
@@ -2292,6 +2434,7 @@
         sbbState.videoRows = sbbState.videoRows.map((row) => {
             const rid = String(row.row_id != null ? row.row_id : row.scene_id);
             const sid = String(row.scene_id);
+            if (!subsetIds.has(rid)) return row;
             const eligible = plan.rowIds ? eligibleRowIdSet.has(rid) : eligibleSceneSet.has(sid);
             if (eligible) {
                 return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
