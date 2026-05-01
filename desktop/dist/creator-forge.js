@@ -914,6 +914,157 @@
         $('ps-result').innerHTML = html;
     }
 
+    // ─── PR-31: Video Assembly handlers ─────────────────────────────────────
+
+    // Helper handle to the pure-functions module loaded via <script>
+    // tag (storyboard_assemble_helpers.js). Reading through window.*
+    // at call time (not module load) lets the helpers be re-loaded in
+    // dev without a full reload.
+    function paHelpers() {
+        return window.StoryboardAssembleHelpers;
+    }
+
+    // Read every form input into a single object so the helpers can
+    // build the POST body (and the validator can mirror it).
+    function paReadForm() {
+        const sceneText = ($('pa-scene-videos') && $('pa-scene-videos').value) || '';
+        const helpers = paHelpers();
+        const scenePaths = helpers
+            ? helpers.parseSceneVideoPaths(sceneText)
+            : sceneText.split('\n').map((l) => l.trim()).filter(Boolean);
+        return {
+            scenePaths,
+            audioPath: ($('pa-audio-path') && $('pa-audio-path').value) || '',
+            srtPath: ($('pa-srt-path') && $('pa-srt-path').value) || '',
+            outputDir: ($('pa-output-dir') && $('pa-output-dir').value) || '',
+            audioMode: ($('pa-audio-mode') && $('pa-audio-mode').value) || 'replace',
+            trimTo: ($('pa-trim-to') && $('pa-trim-to').value) || 'video',
+            captionMode: ($('pa-caption-mode') && $('pa-caption-mode').value) || 'soft',
+        };
+    }
+
+    async function paPickAudioFile() {
+        if (!api || !api.dialog || typeof api.dialog.chooseInputFile !== 'function') return;
+        const res = await api.dialog.chooseInputFile({
+            title: 'Choose narration audio',
+            filters: [
+                { name: 'Audio', extensions: ['mp3', 'wav', 'm4a', 'aac'] },
+                { name: 'All files', extensions: ['*'] },
+            ],
+        });
+        if (res && !res.canceled && res.path && $('pa-audio-path')) {
+            $('pa-audio-path').value = res.path;
+        }
+    }
+
+    async function paPickSrtFile() {
+        if (!api || !api.dialog || typeof api.dialog.chooseInputFile !== 'function') return;
+        const res = await api.dialog.chooseInputFile({
+            title: 'Choose captions.srt',
+            filters: [
+                { name: 'Subtitles', extensions: ['srt'] },
+                { name: 'All files', extensions: ['*'] },
+            ],
+        });
+        if (res && !res.canceled && res.path && $('pa-srt-path')) {
+            $('pa-srt-path').value = res.path;
+        }
+    }
+
+    async function paPullFromBatch() {
+        const helpers = paHelpers();
+        const target = $('pa-result');
+        if (!helpers) {
+            if (target) showError('pa-result', { message: 'StoryboardAssembleHelpers not loaded.' });
+            return;
+        }
+        const paths = helpers.pullScenePathsFromBatch(sbbState.videoRows);
+        const ta = $('pa-scene-videos');
+        if (ta) ta.value = paths.join('\n');
+        if (target) {
+            if (paths.length === 0) {
+                target.innerHTML = `<div class="info">No settled video rows found. Generate the Video batch first, or check that rows have a saved file path.</div>`;
+            } else {
+                target.innerHTML = `<div class="info">Filled ${paths.length} scene path${paths.length === 1 ? '' : 's'} from the Video batch (in scene order). Edit the textarea to reorder or drop entries.</div>`;
+            }
+        }
+    }
+
+    async function paUseLatestAudio() {
+        const target = $('pa-result');
+        if (!api || !api.producer || typeof api.producer.latestAudioOutput !== 'function') {
+            if (target) showError('pa-result', { message: 'electronAPI.producer.latestAudioOutput is unavailable — run via `npm start`.' });
+            return;
+        }
+        try {
+            const res = await api.producer.latestAudioOutput();
+            if (!res || !res.path) {
+                if (target) target.innerHTML = `<div class="info">No /producer/audio output found yet. Render audio in the Compose panel first (mode = Audio only).</div>`;
+                return;
+            }
+            if ($('pa-audio-path')) $('pa-audio-path').value = res.path;
+            if (res.srtPath && $('pa-srt-path')) $('pa-srt-path').value = res.srtPath;
+            if (target) {
+                target.innerHTML = `<div class="info">Using narration from <code>${escapeHtml(res.dir || '')}</code>. Reusing srt: ${res.srtPath ? '<code>' + escapeHtml(res.srtPath) + '</code>' : 'not found'}.</div>`;
+            }
+        } catch (err) {
+            if (target) showError('pa-result', err);
+        }
+    }
+
+    async function runAssemble() {
+        const target = $('pa-result');
+        const helpers = paHelpers();
+        if (!helpers) {
+            showError('pa-result', { message: 'StoryboardAssembleHelpers not loaded.' });
+            return;
+        }
+        if (!api || !api.producer || typeof api.producer.assemble !== 'function') {
+            showError('pa-result', { message: 'electronAPI.producer.assemble is unavailable — run via `npm start` and confirm the sidecar is up.' });
+            return;
+        }
+        const form = paReadForm();
+        const validation = helpers.validateAssembleForm(form);
+        if (!validation.enabled) {
+            showError('pa-result', { status: 0, message: validation.reason || 'Form invalid.' });
+            return;
+        }
+        const payload = helpers.buildAssemblePayload(form);
+        showLoading('pa-result', 'Assembling final.mp4 (ffmpeg concat + audio replace + soft subs)...');
+        try {
+            const data = await api.producer.assemble(payload);
+            renderAssemble(data);
+        } catch (err) {
+            showError('pa-result', err);
+        }
+    }
+
+    // PR-31 — render the /producer/assemble response. Mirrors
+    // ``renderComposeAudio`` style so the panels feel consistent;
+    // surfaces the booleans (audio_attached / captions_attached) so
+    // the user can confirm at a glance whether ffmpeg actually
+    // attached the inputs the form sent.
+    function renderAssemble(data) {
+        const d = data || {};
+        let html = '';
+        html += `<div class="stats-row">
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
+            <span>Scenes<b>${escapeHtml(d.scene_count || 0)}</b></span>
+            <span>Audio<b>${d.audio_attached ? 'attached' : '—'}</b></span>
+            <span>Captions<b>${d.captions_attached ? 'attached (soft)' : '—'}</b></span>
+        </div>`;
+        if (d.video_path) {
+            html += `<div class="scene-card"><div class="scene-title">Final video</div>`;
+            html += `<div class="scene-block"><span class="scene-label">final.mp4</span><code>${escapeHtml(d.video_path)}</code></div>`;
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
+        } else {
+            html += renderEmpty('No final.mp4 produced. Check warnings below — ffmpeg likely failed or no scene videos resolved.');
+        }
+        html += renderWarnings(d.warnings);
+        html += renderRawJson(d);
+        $('pa-result').innerHTML = html;
+    }
+
     function renderComposeShort(data) {
         const d = data || {};
         let html = '';
@@ -2639,6 +2790,14 @@
         // matching <input>. Cancel is a no-op (preserves current value).
         'storyboard-batch-pick-output': async () => sbbPickOutputDir('sbb-output-dir'),
         'producer-short-pick-output': async () => sbbPickOutputDir('ps-output-dir'),
+        // PR-31: Video Assembly panel — file pickers + autofill +
+        // POST /producer/assemble.
+        'assemble-pick-output': async () => sbbPickOutputDir('pa-output-dir'),
+        'assemble-pick-audio': paPickAudioFile,
+        'assemble-pick-srt': paPickSrtFile,
+        'assemble-pull-from-batch': paPullFromBatch,
+        'assemble-use-latest-audio': paUseLatestAudio,
+        'assemble': runAssemble,
         // PR-21: the always-on banner swaps its CTA to "Refresh status"
         // when the session is `ready`. The handler is intentionally a
         // re-poll, not a re-login.

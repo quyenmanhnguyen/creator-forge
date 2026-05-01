@@ -1296,6 +1296,67 @@
                 </div>
                 <div class="result" id="ps-result"></div>
             </div>
+
+            <!-- PR-31: Video Assembly. Stitches per-scene mp4s + audio mp3 +
+                 captions.srt into a single final.mp4 via the sidecar's
+                 /producer/assemble route. Audio mode "replace" + trim to
+                 "video" + soft mov_text subs are the defaults; burn-in is
+                 deferred to PR-32. -->
+            <div class="panel" data-form="assemble">
+                <h2>Video Assembly <span class="pill">/producer/assemble</span></h2>
+                <div class="desc">
+                    Concat the scene videos generated above, replace the audio with a narration track
+                    (typically the <code>voice.mp3</code> from <em>Audio only</em> Compose), and attach
+                    <code>captions.srt</code> as soft subtitles. ffmpeg runs in the sidecar — keep it running.
+                </div>
+                <div class="form-grid">
+                    <label class="form-row-full" title="One absolute path per line, in playback order. Click 'Pull from Video batch' to auto-fill from settled rows above.">Scene videos
+                        <textarea id="pa-scene-videos" rows="5" placeholder="/abs/path/shot1.mp4&#10;/abs/path/shot2.mp4&#10;/abs/path/shot3.mp4"></textarea>
+                    </label>
+                    <label title="Path to the narration mp3/wav. Leave blank to keep whatever audio the scene videos already carry.">Narration audio
+                        <span class="dir-picker-row">
+                            <input id="pa-audio-path" type="text" placeholder="/abs/path/voice.mp3 (blank = scene audio)" />
+                            <button type="button" class="secondary" data-run="assemble-pick-audio">Browse…</button>
+                        </span>
+                    </label>
+                    <label title="Optional path to captions.srt. When set with caption_mode='soft', attaches as a selectable subtitle track (mov_text). Burn-in is deferred to PR-32.">Captions (.srt, optional)
+                        <span class="dir-picker-row">
+                            <input id="pa-srt-path" type="text" placeholder="/abs/path/captions.srt" />
+                            <button type="button" class="secondary" data-run="assemble-pick-srt">Browse…</button>
+                        </span>
+                    </label>
+                    <label title="Where to write final.mp4. Leave blank to auto-create ~/.creator-forge/output/assembly-<timestamp>/.">Output folder (optional)
+                        <span class="dir-picker-row">
+                            <input id="pa-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/assembly-<timestamp>/" />
+                            <button type="button" class="secondary" data-run="assemble-pick-output">Browse…</button>
+                        </span>
+                    </label>
+                    <label title="'replace' drops scene audio and uses the narration as the only audio (default). 'none' keeps whatever audio the scene videos already carry.">Audio mode
+                        <select id="pa-audio-mode">
+                            <option value="replace" selected>replace (use narration only)</option>
+                            <option value="none">none (keep scene audio)</option>
+                        </select>
+                    </label>
+                    <label title="'video' caps the output at the summed scene durations — extra narration is cut. 'audio' uses ffmpeg -shortest so the audio length wins.">Trim to
+                        <select id="pa-trim-to">
+                            <option value="video" selected>video (default)</option>
+                            <option value="audio">audio (-shortest)</option>
+                        </select>
+                    </label>
+                    <label title="'soft' attaches the srt as a mov_text subtitle track. 'none' ignores the srt path. Burn-in is deferred to PR-32.">Caption mode
+                        <select id="pa-caption-mode">
+                            <option value="soft" selected>soft (mov_text track)</option>
+                            <option value="none">none (drop srt)</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="ghost" data-run="assemble-pull-from-batch" title="Auto-fill the scene videos textarea with all settled rows from the Video batch above, in scene order.">Pull from Video batch</button>
+                    <button class="ghost" data-run="assemble-use-latest-audio" title="Set the narration audio to the most recent voice.mp3 from /producer/audio.">Use latest /producer/audio</button>
+                    <button class="primary" id="pa-run-btn" data-run="assemble">Assemble final MP4</button>
+                </div>
+                <div class="result" id="pa-result"></div>
+            </div>
         </section>
     </main>
     <script src="storyboard_compose_helpers.js"></script>
@@ -1304,6 +1365,8 @@
     <script src="storyboard_batch_helpers.js"></script>
     <script src="storyboard_login_banner_helpers.js"></script>
     <script src="storyboard_account_manager_helpers.js"></script>
+    <!-- PR-31: Video Assembly form-payload + scene-paths helpers. -->
+    <script src="storyboard_assemble_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>

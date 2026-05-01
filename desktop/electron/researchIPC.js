@@ -75,6 +75,10 @@ const CHANNELS = {
     // compose. Request shape is a strict subset of /producer/short
     // (no style / scene_assets / aspect / visual_provider).
     'producer:composeAudio':      { method: 'POST', path: '/producer/audio' },
+    // PR-31: Video Assembly — concat per-scene MP4s, replace audio with
+    // /producer/audio output, attach soft mov_text subs, write
+    // ~/.creator-forge/output/assembly-<ts>/final.mp4.
+    'producer:assemble':          { method: 'POST', path: '/producer/assemble' },
     'producer:listVoices':        { method: 'GET',  path: '/producer/voices' },
     'producer:listProviders':     { method: 'GET',  path: '/producer/providers' },
 };

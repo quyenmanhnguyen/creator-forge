@@ -76,6 +76,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // an <input> without parsing dialog internals.
     dialog: {
         chooseOutputDir: (opts) => ipcRenderer.invoke('dialog:chooseOutputDir', opts),
+        // PR-31: single-file picker (audio / srt) for Video Assembly.
+        chooseInputFile: (opts) => ipcRenderer.invoke('dialog:chooseInputFile', opts),
     },
 
     onProgress: (callback) => {
@@ -123,6 +125,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
         composeShort: (params) => ipcRenderer.invoke('producer:composeShort', params),
         // PR-30: TTS-only render (mp3/wav + optional srt), no mp4.
         composeAudio: (params) => ipcRenderer.invoke('producer:composeAudio', params),
+        // PR-31: stitch scene mp4s + narration mp3 into a single final mp4.
+        assemble: (params) => ipcRenderer.invoke('producer:assemble', params),
+        // PR-31: discover the most recent /producer/audio render so the
+        // Video Assembly panel can autofill the audio input.
+        latestAudioOutput: () => ipcRenderer.invoke('producer:latestAudioOutput'),
         listVoices: () => ipcRenderer.invoke('producer:listVoices'),
         listProviders: () => ipcRenderer.invoke('producer:listProviders'),
     },

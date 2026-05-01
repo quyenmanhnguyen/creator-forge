@@ -580,6 +580,71 @@ ipcMain.handle('dialog:chooseOutputDir', async (_, opts) => {
     }
 });
 
+// PR-31: native single-file picker for the Video Assembly panel
+// (narration audio + captions.srt). ``opts.filters`` follows
+// Electron's ``Filters[]`` shape; passing nothing shows all files.
+// Renderer is responsible for stuffing the returned path into the
+// matching <input>.
+ipcMain.handle('dialog:chooseInputFile', async (_, opts) => {
+    try {
+        const title = (opts && typeof opts.title === 'string') ? opts.title : 'Choose file';
+        const defaultPath = (opts && typeof opts.defaultPath === 'string' && opts.defaultPath) ? opts.defaultPath : undefined;
+        const filters = (opts && Array.isArray(opts.filters)) ? opts.filters : undefined;
+        const result = await dialog.showOpenDialog(mainWindow, {
+            title,
+            defaultPath,
+            filters,
+            properties: ['openFile'],
+        });
+        if (result.canceled || !result.filePaths.length) {
+            return { canceled: true, path: '' };
+        }
+        return { canceled: false, path: result.filePaths[0] };
+    } catch (error) {
+        return { canceled: true, path: '', error: (error && error.message) || String(error) };
+    }
+});
+
+// PR-31: walk ~/.creator-forge/output/ to find the most recent
+// audio-<ts>/voice.{mp3,wav} written by /producer/audio. The Video
+// Assembly panel's "Use latest /producer/audio" button calls this so
+// the user doesn't have to browse manually after each Compose-audio
+// run. Returns ``{ path, srtPath, dir }`` (any of which may be empty
+// when nothing's been rendered yet).
+ipcMain.handle('producer:latestAudioOutput', async () => {
+    try {
+        const baseDir = path.join(os.homedir(), '.creator-forge', 'output');
+        if (!fs.existsSync(baseDir)) {
+            return { path: '', srtPath: '', dir: '' };
+        }
+        const entries = fs.readdirSync(baseDir, { withFileTypes: true })
+            .filter(e => e.isDirectory() && e.name.startsWith('audio-'))
+            .map(e => {
+                const full = path.join(baseDir, e.name);
+                let mtime = 0;
+                try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
+                return { name: e.name, full, mtime };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+        for (const entry of entries) {
+            for (const ext of ['mp3', 'wav']) {
+                const candidate = path.join(entry.full, `voice.${ext}`);
+                if (fs.existsSync(candidate)) {
+                    const srt = path.join(entry.full, 'captions.srt');
+                    return {
+                        path: candidate,
+                        srtPath: fs.existsSync(srt) ? srt : '',
+                        dir: entry.full,
+                    };
+                }
+            }
+        }
+        return { path: '', srtPath: '', dir: '' };
+    } catch (error) {
+        return { path: '', srtPath: '', dir: '', error: (error && error.message) || String(error) };
+    }
+});
+
 ipcMain.handle('account:importTxt', async () => {
     try {
         const result = await dialog.showOpenDialog(mainWindow, {
