@@ -1063,6 +1063,158 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     )
 
 
+# ─── /producer/assemble — concat scene videos + replace audio + soft subs ───
+
+# PR-31 — Video Assembly. Once the user has narration mp3 (from
+# /producer/audio) and per-scene mp4s (from the desktop's I2V/T2V
+# batch), this route stitches them into a final 9:16 mp4 in one ffmpeg
+# pass. Audio replace + trim-to-video + soft mov_text subs are the
+# defaults; burn-in subtitles + audio mixing are deferred to PR-32.
+#
+# All heavy lifting lives in ``research.core.pixelle.assembler``; this
+# route is just request validation + adapter to the public response
+# shape. Same robust-failure contract as the rest of /producer/* —
+# ffmpeg / probe failures land in ``warnings[]`` and ``video_path=""``
+# is returned, never a 500.
+
+
+def _default_assembly_output_dir() -> Path:
+    """Per-call output dir for assembled final mp4s.
+
+    Distinct from ``_default_output_dir()`` (``short-<ts>/``) and
+    ``_default_audio_output_dir()`` (``audio-<ts>/``) so a user with
+    runs in flight can tell at a glance which folder is which.
+    """
+    base = Path.home() / ".creator-forge" / "output"
+    return base / f"assembly-{int(time.time() * 1000)}"
+
+
+class AssembleRequest(BaseModel):
+    scene_videos: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Absolute paths to scene mp4/mov/m4v/webm files, in playback order. "
+            "Typically the ``savedFile`` of each settled row in the desktop's "
+            "Video batch table."
+        ),
+    )
+    audio_path: str | None = Field(
+        None,
+        description=(
+            "Path to a narration mp3/wav. When set with audio_mode='replace' "
+            "(the default), the scene audio tracks are dropped and this file "
+            "becomes the only audio. When unset, the route falls back to "
+            "muxing whatever audio the scene videos already carry."
+        ),
+    )
+    srt_path: str | None = Field(
+        None,
+        description=(
+            "Optional path to a captions.srt. Attached as a soft subtitle "
+            "track (mov_text codec) when ``caption_mode='soft'`` (default). "
+            "Burn-in is not supported in PR-31."
+        ),
+    )
+    output_dir: str | None = Field(
+        None,
+        description=(
+            "Where to write final.mp4. Defaults to "
+            "~/.creator-forge/output/assembly-<ts>/."
+        ),
+    )
+    audio_mode: Literal["replace", "none"] = Field(
+        "replace",
+        description=(
+            "'replace' replaces scene audio with audio_path. 'none' keeps "
+            "the scene-native audio (or silent if scenes have none). Audio "
+            "mixing is deferred to a follow-up PR."
+        ),
+    )
+    trim_to: Literal["video", "audio"] = Field(
+        "video",
+        description=(
+            "'video' caps output at summed scene durations (default — extra "
+            "narration is cut). 'audio' uses ``-shortest`` so the audio "
+            "track length wins."
+        ),
+    )
+    caption_mode: Literal["soft", "none"] = Field(
+        "soft",
+        description=(
+            "'soft' attaches the srt as a mov_text subtitle track. 'none' "
+            "ignores ``srt_path``. Burn-in is deferred to PR-32."
+        ),
+    )
+
+    _strip_audio = field_validator("audio_path", mode="before")(
+        classmethod(lambda cls, v: _strip(v) if v is not None else v)
+    )
+    _strip_srt = field_validator("srt_path", mode="before")(
+        classmethod(lambda cls, v: _strip(v) if v is not None else v)
+    )
+
+    @field_validator("scene_videos", mode="before")
+    @classmethod
+    def _strip_scene_videos(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    cleaned.append(stripped)
+            elif item is not None:
+                cleaned.append(str(item))
+        return cleaned
+
+
+class AssembleResponse(BaseModel):
+    video_path: str
+    duration_s: float = 0.0
+    scene_count: int = 0
+    audio_attached: bool = False
+    captions_attached: bool = False
+    output_dir: str
+    warnings: list[str] = []
+    notes: str = ""
+
+
+@router.post("/assemble", response_model=AssembleResponse)
+def assemble(req: AssembleRequest) -> AssembleResponse:
+    """Concat ``scene_videos`` → replace audio → attach soft subs → mp4."""
+    # Lazy import so the rest of the routes don't have to pay for the
+    # video_probe / ffmpeg resolution dance at module load time.
+    from research.core.pixelle.assembler import assemble_final_mp4
+
+    output_dir = (
+        Path(req.output_dir).expanduser()
+        if req.output_dir
+        else _default_assembly_output_dir()
+    )
+
+    result = assemble_final_mp4(
+        scene_videos=req.scene_videos,
+        audio_path=req.audio_path,
+        srt_path=req.srt_path,
+        output_dir=output_dir,
+        audio_mode=req.audio_mode,
+        trim_to=req.trim_to,
+        caption_mode=req.caption_mode,
+    )
+
+    return AssembleResponse(
+        video_path=result.final_path,
+        duration_s=result.duration_s,
+        scene_count=result.scene_count,
+        audio_attached=result.audio_attached,
+        captions_attached=result.captions_attached,
+        output_dir=result.output_dir,
+        warnings=result.warnings,
+    )
+
+
 # ─── /producer/voices — curated Edge-TTS voice picker ───────────────────────
 
 

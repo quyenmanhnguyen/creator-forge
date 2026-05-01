@@ -1736,3 +1736,139 @@ def test_audio_default_output_dir_uses_audio_prefix(monkeypatch, tmp_path):
     body = r.json()
     assert body["output_dir"] == str(sentinel)
     assert sentinel.exists()
+
+
+# ─── /producer/assemble — PR-31 (concat scene videos + audio + soft subs) ───
+#
+# These tests stub ``assembler.assemble_final_mp4`` (and its underlying
+# ffmpeg / ffprobe runners) so the route logic can be exercised
+# without touching ffmpeg on the host. The deeper structural
+# guarantees (argv shape, codec normalisation, trim policy) live in
+# ``research/tests/test_assembler.py``; here we cover request
+# validation, default ``assembly-<ts>`` output dir, and the response
+# shape adapter.
+
+ASSEMBLE_SCRIPT_DIR_PREFIX = "assembly-"
+
+
+@pytest.mark.parametrize("payload", [
+    {"scene_videos": []},                # min_length=1 violated
+    {"scene_videos": ["", "  "]},        # all-whitespace → cleaned to []
+    {},                                  # missing scene_videos entirely
+])
+def test_assemble_rejects_empty_or_blank_scene_videos(payload):
+    r = client.post("/producer/assemble", json=payload)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("audio_mode", ["replace", "none"])
+@pytest.mark.parametrize("trim_to", ["video", "audio"])
+def test_assemble_accepts_documented_modes(monkeypatch, tmp_path, audio_mode, trim_to):
+    from research.core.pixelle import assembler as assembler_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembler_mod.AssembleResult(
+            final_path=str(kwargs["output_dir"] / "final.mp4"),
+            duration_s=12.0,
+            scene_count=len(kwargs["scene_videos"]),
+            audio_attached=kwargs["audio_mode"] == "replace",
+            captions_attached=kwargs["caption_mode"] == "soft",
+            output_dir=str(kwargs["output_dir"]),
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+
+    out = tmp_path / "out"
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4", "/tmp/b.mp4"],
+            "audio_path": "/tmp/voice.mp3",
+            "output_dir": str(out),
+            "audio_mode": audio_mode,
+            "trim_to": trim_to,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["video_path"].endswith("final.mp4")
+    assert body["scene_count"] == 2
+    assert body["audio_attached"] is (audio_mode == "replace")
+    assert captured["audio_mode"] == audio_mode
+    assert captured["trim_to"] == trim_to
+    assert captured["caption_mode"] == "soft"
+
+
+def test_assemble_default_output_dir_uses_assembly_prefix(monkeypatch, tmp_path):
+    """The auto-generated output dir must use the ``assembly-<ts>`` prefix
+    so a user with concurrent short / audio / assembly runs can tell
+    them apart at a glance.
+    """
+    from research.core.pixelle import assembler as assembler_mod
+
+    sentinel = tmp_path / "auto-assembly-9999"
+    captured: dict[str, Any] = {}
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembler_mod.AssembleResult(
+            final_path=str(kwargs["output_dir"] / "final.mp4"),
+            duration_s=4.0,
+            scene_count=1,
+            audio_attached=False,
+            captions_attached=False,
+            output_dir=str(kwargs["output_dir"]),
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+    monkeypatch.setattr(
+        producer_route, "_default_assembly_output_dir", lambda: sentinel,
+    )
+
+    r = client.post(
+        "/producer/assemble",
+        json={"scene_videos": ["/tmp/a.mp4"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["output_dir"] == str(sentinel)
+    # The route must hand the resolved path through to the helper —
+    # we don't want the helper re-resolving and racing the timestamp.
+    assert captured["output_dir"] == sentinel
+
+
+def test_assemble_route_passes_warnings_through(monkeypatch, tmp_path):
+    """When the helper reports warnings (ffmpeg failure, missing audio,
+    etc.) the route must surface them verbatim instead of swallowing
+    them. The route never returns 500.
+    """
+    from research.core.pixelle import assembler as assembler_mod
+
+    def fake_assemble(**kwargs):
+        return assembler_mod.AssembleResult(
+            final_path="",
+            scene_count=1,
+            output_dir=str(kwargs["output_dir"]),
+            warnings=[
+                "ffmpeg exited 1: moov atom not found",
+                "audio_path not on disk, will render silent video.",
+            ],
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "output_dir": str(tmp_path),
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["video_path"] == ""
+    assert any("moov atom not found" in w for w in body["warnings"])
+    assert any("audio_path not on disk" in w for w in body["warnings"])
