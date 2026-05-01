@@ -962,6 +962,50 @@ test("PR-29: filterRowsBySelection composes with planImageGenerate (selection-aw
     assert.deepStrictEqual(plan.rowIds.sort(), ["1#0", "2#0"]);
 });
 
+// ─── PR-46: "Generate all (N)" fallback when nothing selected ───────────
+// PR-29 originally disabled the Generate button when no rows were
+// checked. Live testing showed users hit the button (the panel
+// hint even tells them to click it after pairing an image) and
+// got nothing. PR-46 routes empty-selection through
+// ``selectAllRowIds`` so the call path silently degrades to
+// "generate every row" — same effect as the user clicking
+// "Select all" first. The pure helpers must compose cleanly for
+// that path to work.
+
+test("PR-46: empty-selection Generate falls back to selectAllRowIds (every row picked up)", () => {
+    const rows = pr27Rows();
+    // Caller pattern from sbbGenerateImages / sbbGenerateVideos:
+    // when the user's selection Set is empty, fall back to
+    // ``selectAllRowIds`` and feed it through filterRowsBySelection.
+    // This must yield every row, in input order, with no losses.
+    const fallback = helpers.selectAllRowIds(rows);
+    const subset = helpers.filterRowsBySelection(rows, fallback);
+    assert.strictEqual(subset.length, rows.length,
+        "fallback must include every row when nothing is explicitly selected");
+    assert.deepStrictEqual(
+        subset.map((r) => r.row_id),
+        rows.map((r) => r.row_id),
+        "fallback must preserve input order",
+    );
+});
+
+test("PR-46: empty-selection fallback still partitions by refs (mixed rowRefMap / global refs)", () => {
+    // Sanity-check that the empty-selection path doesn't break
+    // PR-28 ref-image partitioning. A user with a global ref
+    // image who hits "Generate all" without selecting anything
+    // should still see the ref payload on every row.
+    const rows = pr27Rows();
+    const fallback = helpers.selectAllRowIds(rows);
+    const subset = helpers.filterRowsBySelection(rows, fallback);
+    const split = helpers.partitionRowsByRefs(subset, {
+        rowRefMap: {},
+        globalRefs: ["/abs/global-ref.png"],
+    });
+    // With a non-empty global, every row goes through the ref path.
+    assert.strictEqual(split.withRefs.length, rows.length);
+    assert.strictEqual(split.withoutRefs.length, 0);
+});
+
 test("PR-29: mapBatchResponse — image with no error gives an actionable hint instead of 'no usable image'", () => {
     const resp = { success: true, results: [{ savedFiles: [], success: false, error: null }] };
     const mapped = helpers.mapBatchResponse(resp, [42], "image", ["42#0"]);

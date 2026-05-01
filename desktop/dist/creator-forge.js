@@ -107,7 +107,43 @@
     }
 
     function showLoading(targetId, label = 'Working...') {
-        $(targetId).innerHTML = `<div class="loading"><span class="spinner"></span>${escapeHtml(label)}</div>`;
+        const target = $(targetId);
+        if (!target) return;
+        target.innerHTML = `<div class="loading"><span class="spinner"></span>${escapeHtml(label)}</div>`;
+        // PR-46 — scroll the just-painted result panel into view so
+        // the user can see the spinner / output without manually
+        // scrolling past the form they just submitted. Used by every
+        // panel (Studio wizard steps, Research niche/keywords/outlier,
+        // Cloner) since they all funnel through this helper. The
+        // scroll is gated on ``scrollIntoView`` existing — jsdom and
+        // very old WebViews lack it — and on the target not already
+        // being visible, so it's a no-op for short forms whose
+        // result is already in the viewport.
+        scrollResultIntoView(target);
+    }
+
+    /**
+     * PR-46 — scroll a freshly painted result panel into view if
+     * it isn't already visible. Smooth-scrolls to the start of the
+     * panel so the user sees the spinner / first lines of output
+     * rather than the bottom edge. Defensive against missing DOM
+     * APIs (jsdom) and against panels that are already in view
+     * (no-op when the top edge is already on-screen).
+     */
+    function scrollResultIntoView(target) {
+        if (!target || typeof target.getBoundingClientRect !== 'function') return;
+        if (typeof target.scrollIntoView !== 'function') return;
+        const rect = target.getBoundingClientRect();
+        const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+        // Already fully visible (top in viewport, bottom not far off)
+        // — skip the scroll so we don't fight the user's own scroll.
+        if (rect.top >= 0 && rect.top < viewportH * 0.66) return;
+        try {
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } catch (_) {
+            // older WebViews: fallback to instant scroll.
+            try { target.scrollIntoView(); } catch (__) { /* ignore */ }
+        }
     }
 
     function showError(targetId, err) {
@@ -1140,6 +1176,21 @@
             if (action === 'select-all') sbbToggleSelectAll(kind);
             else if (action === 'reroll') sbbRerollSelected(kind).catch((err) => console.warn('reroll failed:', err));
             else if (action === 'delete') sbbDeleteSelected(kind);
+        } else {
+            // PR-46 — click-to-expand on a clamped prompt cell.
+            // Walks up so a click on the inner ``.prompt-cell-body``
+            // or the hint span still hits the wrapper. Skips when
+            // the user clicked an action button inside the same row
+            // (Edit / Delete / Refs / Retry / Make video / a link)
+            // — those bubble up too and we don't want a stray
+            // toggle to fire alongside them.
+            const toggle = t.closest && t.closest('[data-sbb-prompt-toggle]');
+            if (toggle) {
+                const inAction = t.closest('button, a, input, textarea, .sbb-edit-shell, .sbb-row-actions');
+                if (!inAction) {
+                    sbbTogglePromptExpansion(toggle.getAttribute('data-sbb-prompt-toggle'));
+                }
+            }
         }
     });
 
@@ -1230,6 +1281,12 @@
         // bridge and don't expose their own ref UI.
         globalRefs: [],
         rowRefMap: {},
+        // PR-46 — Set<"image:row_id" | "video:row_id"> of prompt cells
+        // the user has expanded. Persisted across re-renders so a
+        // progress tick on a sibling row doesn't silently re-collapse
+        // the one the user just opened. Cleared per-kind when the
+        // table is rebuilt from a fresh scene_breakdown.
+        promptExpanded: new Set(),
     };
 
     /** Repaint both image and video tables. */
@@ -1263,15 +1320,28 @@
     }
 
     /**
-     * PR-29 — update the "Generate images / videos" primary button to
-     * reflect the current selection state.
+     * PR-29 / PR-46 — update the "Generate images / videos" primary
+     * button to reflect the current selection state.
      *
-     *   - 0 selected → label "Select rows to generate", button disabled.
-     *   - N selected → label "Generate selected (N)", button enabled.
-     *   - 0 rows in the table → fall back to the original "Generate
-     *     images / videos" label so the cold-start affordance stays
-     *     intact (Auto-fill is what populates rows; the user still
-     *     needs to see the button to know it exists).
+     *   - 0 rows in the table → label "Generate images / videos",
+     *     enabled. Cold-start affordance: clicking it just shows
+     *     a friendly empty-state hint.
+     *   - 0 selected, ≥1 row → label "Generate all (N)", enabled.
+     *     Matches the user's stated requirement from the live-E2E
+     *     backlog ("When nothing checked, show 'Generate all (60)'
+     *     as fallback"). PR-29 originally disabled the button in
+     *     this state, but that broke the natural flow where a user
+     *     pairs one image and clicks Generate without first ticking
+     *     a checkbox — the help-text below the panel even tells them
+     *     to "Click Generate videos to start I2V", contradicting
+     *     the disabled state.
+     *   - ≥1 selected → label "Generate selected (M)", enabled.
+     *     User explicitly opted into a subset, scope the run to
+     *     that subset.
+     *
+     * The button never disables itself when rows are present — that
+     * way the affordance stays consistent and the user never has to
+     * hunt for why Generate is greyed out.
      */
     function sbbUpdateGenerateButton(kind) {
         const btn = document.querySelector(
@@ -1285,13 +1355,13 @@
         if (!rows.length) {
             btn.textContent = `Generate ${noun}`;
             btn.removeAttribute('disabled');
-            btn.title = `Auto-fill from scenes first, then check rows to generate ${noun}.`;
+            btn.title = `Auto-fill from scenes first to populate the table, then click Generate.`;
             return;
         }
         if (selSize === 0) {
-            btn.textContent = 'Select rows to generate';
-            btn.setAttribute('disabled', '');
-            btn.title = 'Check at least one row (or click "Select all" in the toolbar) to enable this.';
+            btn.textContent = `Generate all (${rows.length})`;
+            btn.removeAttribute('disabled');
+            btn.title = `Run ${noun} generation on all ${rows.length} row${rows.length === 1 ? '' : 's'}. Tick checkboxes above to scope a smaller run.`;
             return;
         }
         btn.textContent = `Generate selected (${selSize})`;
@@ -1428,9 +1498,13 @@
             const rowActions = `<div class="sbb-row-actions">${editBtn}${retryBtn}${delBtn}${refButtons}${baseActions}${bridgeChip}</div>`;
             const rowKey = `${kind}:${r.row_id}`;
             const inEdit = editKey === rowKey;
+            // PR-46 — wrap the prompt body in a clamp container so a
+            // 250-word variant prompt only consumes ~5 lines until
+            // the user clicks to expand. Edit-mode bypasses the clamp
+            // so the textarea can size freely.
             const promptCell = inEdit
                 ? sbbRenderEditShell(kind, r)
-                : escapeHtml(r.prompt || '');
+                : sbbRenderPromptCell(kind, r);
             const isSelected = selected.has(String(r.row_id));
             const trCls = isSelected ? ' class="sbb-row-selected"' : '';
             html += `<tr${trCls}>
@@ -1445,6 +1519,51 @@
         }
         html += '</tbody></table>';
         return html;
+    }
+
+    /**
+     * PR-46 — render a clamp-wrapped read-only prompt cell. The
+     * outer wrapper carries ``data-sbb-prompt-toggle`` so the
+     * delegated click handler can flip ``is-expanded`` on the same
+     * element. Long prompts default to clamped (5 lines via CSS);
+     * "click to expand" / "click to collapse" hint inside the
+     * wrapper appears on hover. The expansion state is keyed by
+     * ``kind:row_id`` so re-renders preserve the user's choice for
+     * the rows they've already opened — without that, every
+     * progress tick on a sibling row would silently re-collapse the
+     * one the user just opened.
+     */
+    function sbbRenderPromptCell(kind, row) {
+        const rowId = row && row.row_id != null ? String(row.row_id) : '';
+        const key = `${kind}:${rowId}`;
+        const expanded = sbbState.promptExpanded && sbbState.promptExpanded.has(key);
+        const cls = expanded ? 'prompt-cell-content is-expanded' : 'prompt-cell-content';
+        const hint = expanded ? 'click to collapse ↑' : 'click to expand ↓';
+        return `<div class="${cls}" data-sbb-prompt-toggle="${escapeHtml(key)}">`
+            + `<div class="prompt-cell-body">${escapeHtml(row.prompt || '')}</div>`
+            + `<span class="prompt-cell-hint">${escapeHtml(hint)}</span>`
+            + `</div>`;
+    }
+
+    /**
+     * PR-46 — toggle the expansion state of a single clamped prompt
+     * cell. Repaints just the affected kind so progress on the other
+     * table doesn't re-collapse this user's open cell. The state
+     * lives in ``sbbState.promptExpanded`` (Set<"kind:row_id">) so
+     * the renderer's ``sbbRenderPromptCell`` call picks it up on the
+     * next paint without needing a separate DOM walk.
+     */
+    function sbbTogglePromptExpansion(key) {
+        if (!key) return;
+        if (!sbbState.promptExpanded) sbbState.promptExpanded = new Set();
+        if (sbbState.promptExpanded.has(key)) {
+            sbbState.promptExpanded.delete(key);
+        } else {
+            sbbState.promptExpanded.add(key);
+        }
+        const kind = key.split(':')[0];
+        if (kind === 'image') sbbRepaintImage();
+        else if (kind === 'video') sbbRepaintVideo();
     }
 
     /**
@@ -2478,12 +2597,17 @@
             sbbAutoFill();
             if (!sbbState.imageRows.length) return;
         }
-        const banner = $('sbb-image-result');
-        if (!sbbState.imageSelected.size) {
-            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">Select at least one row first (or click "Select all" in the toolbar).</div>');
-            return;
-        }
-        return sbbRunImageBatchForRowIds(sbbState.imageSelected);
+        // PR-46 — when nothing is explicitly selected, fall back to
+        // "generate all rows" instead of refusing. This matches the
+        // user-facing button label ("Generate all (N)") and the
+        // original feature spec from the live-E2E backlog.
+        const helpers = window.StoryboardBatchHelpers;
+        const ids = sbbState.imageSelected.size
+            ? sbbState.imageSelected
+            : (helpers && typeof helpers.selectAllRowIds === 'function'
+                ? helpers.selectAllRowIds(sbbState.imageRows)
+                : new Set(sbbState.imageRows.map((r) => String(r.row_id))));
+        return sbbRunImageBatchForRowIds(ids);
     }
 
     /**
@@ -2607,12 +2731,19 @@
             sbbAutoFill();
             if (!sbbState.videoRows.length) return;
         }
-        const banner = $('sbb-video-result');
-        if (!sbbState.videoSelected.size) {
-            if (banner) banner.insertAdjacentHTML('afterbegin', '<div class="error">Select at least one row first (or click "Select all" in the toolbar).</div>');
-            return;
-        }
-        return sbbRunVideoBatchForRowIds(sbbState.videoSelected);
+        // PR-46 — same "generate all" fallback as the image side
+        // when no explicit selection. The screenshot-driven UX
+        // finding was: user pairs an image, sees the panel hint
+        // "Click Generate videos to start I2V", clicks it, nothing
+        // happens because they didn't tick a checkbox. The button
+        // label now matches behaviour.
+        const helpers = window.StoryboardBatchHelpers;
+        const ids = sbbState.videoSelected.size
+            ? sbbState.videoSelected
+            : (helpers && typeof helpers.selectAllRowIds === 'function'
+                ? helpers.selectAllRowIds(sbbState.videoRows)
+                : new Set(sbbState.videoRows.map((r) => String(r.row_id))));
+        return sbbRunVideoBatchForRowIds(ids);
     }
 
     /**
