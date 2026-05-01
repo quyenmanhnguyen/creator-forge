@@ -95,6 +95,13 @@
         return sortable.map((r) => String(r.savedFile).trim());
     }
 
+    // Whitelist of caption modes the backend's AssembleRequest will
+    // accept (see research/api/routes/producer.py). Kept in this
+    // module — not the schema layer — because the helper is the only
+    // place the renderer needs to map UI strings to wire values.
+    const CAPTION_MODES = ['soft', 'burn', 'none'];
+    const DEFAULT_CAPTION_MODE = 'soft';
+
     /**
      * Build the JSON body for POST /producer/assemble from form
      * inputs. Empty string fields collapse to `null` to match the
@@ -108,7 +115,9 @@
      * @param {string} [form.outputDir]
      * @param {string} [form.audioMode]
      * @param {string} [form.trimTo]
-     * @param {string} [form.captionMode]
+     * @param {string} [form.captionMode] - one of 'soft' (default,
+     *   mov_text track), 'burn' (PR-32, rendered into video), 'none'
+     *   (drop srt). Unknown values fall back to 'soft'.
      * @returns {object}
      */
     function buildAssemblePayload(form) {
@@ -124,6 +133,10 @@
             return t.length > 0 ? t : null;
         };
 
+        const captionMode = CAPTION_MODES.includes(f.captionMode)
+            ? f.captionMode
+            : DEFAULT_CAPTION_MODE;
+
         return {
             scene_videos: cleaned,
             audio_path: blankToNull(f.audioPath),
@@ -131,7 +144,7 @@
             output_dir: blankToNull(f.outputDir),
             audio_mode: (f.audioMode === 'none') ? 'none' : 'replace',
             trim_to: (f.trimTo === 'audio') ? 'audio' : 'video',
-            caption_mode: (f.captionMode === 'none') ? 'none' : 'soft',
+            caption_mode: captionMode,
         };
     }
 
@@ -165,6 +178,8 @@
 
     return {
         SUPPORTED_VIDEO_EXTS,
+        CAPTION_MODES,
+        DEFAULT_CAPTION_MODE,
         parseSceneVideoPaths,
         pullScenePathsFromBatch,
         buildAssemblePayload,

@@ -14,9 +14,21 @@ a single 9:16 MP4 in one ffmpeg invocation:
 3. **Audio replace** maps the narration MP3 in as the only audio
    track. Scene videos may carry ambient/no audio; PR-31's contract is
    that the narration is the master.
-4. **Soft subs** (``-c:s mov_text``) attach the captions.srt as a
-   selectable subtitle track. Burn-in is deferred to PR-32 because it
-   needs fontconfig + a font file on the VM.
+4. **Captions** — three modes:
+
+   - ``"soft"`` (default) attaches the SRT as a selectable
+     ``mov_text`` subtitle track. Plays back in QuickTime / VLC /
+     Chrome; ignored by platforms that don't render soft subs (some
+     social uploads).
+   - ``"none"`` ignores the SRT entirely.
+   - ``"burn"`` (PR-32) renders the SRT pixels into the video stream
+     via ffmpeg's ``subtitles`` filter so every player sees them. We
+     stage the SRT as ``_subs.srt`` in ``output_dir`` and run ffmpeg
+     with ``cwd=output_dir`` so the filter resolves it by relative
+     name — sidesteps the Windows ``C:\\…`` path-colon escaping
+     headache and means we don't have to special-case spaces or
+     filter-graph metacharacters in user-supplied filenames.
+
 5. **Trim policy** defaults to *video* — the output is exactly the
    summed scene durations; audio is cut to fit. ``trim_to="audio"``
    uses ``-shortest`` and lets the audio cap the output instead.
@@ -62,7 +74,14 @@ FFMPEG_TIMEOUT_SEC = 600  # 10 min — long enough for ~10 min of source
 
 AudioMode = Literal["replace", "none"]
 TrimMode = Literal["video", "audio"]
-CaptionMode = Literal["soft", "none"]
+CaptionMode = Literal["soft", "none", "burn"]
+
+# Filename used when staging the SRT for ``caption_mode="burn"``. Lives
+# in ``output_dir`` next to ``final.mp4`` and is cleaned up after
+# ffmpeg returns (best-effort). The ``_`` prefix matches the existing
+# ``_concat_list.txt`` so a ``ls`` of the output dir cleanly groups the
+# transient files.
+BURN_SRT_STAGED_NAME = "_subs.srt"
 
 
 # ─── Public result ──────────────────────────────────────────────────────────
@@ -226,10 +245,17 @@ def _build_ffmpeg_args(
     caption_mode: CaptionMode,
     trim_to: TrimMode,
     video_total_s: float,
+    burn_srt_relname: str | None = None,
 ) -> list[str]:
     """Construct the single-pass ffmpeg command.
 
     Kept pure / no I/O so tests can assert on the argv shape.
+
+    ``burn_srt_relname`` is the relative filename ffmpeg will see
+    inside the working directory when ``caption_mode="burn"`` — the
+    caller is responsible for staging the SRT there before invoking
+    ffmpeg with that ``cwd``. This separation keeps the args builder
+    pure (no copying).
     """
     args: list[str] = ["-y", "-fflags", "+genpts"]
     args += ["-f", "concat", "-safe", "0", "-i", str(list_path)]
@@ -244,14 +270,20 @@ def _build_ffmpeg_args(
         audio_input_idx = next_idx
         next_idx += 1
 
-    use_subs = srt is not None and caption_mode == "soft"
-    if use_subs:
+    use_soft_subs = srt is not None and caption_mode == "soft"
+    use_burn_subs = (
+        srt is not None
+        and caption_mode == "burn"
+        and burn_srt_relname is not None
+    )
+    if use_soft_subs:
         args += ["-i", str(srt)]
         srt_input_idx = next_idx
         next_idx += 1
 
     # Map: video from concat (input 0), audio from narration if present,
-    # subs from srt if present.
+    # soft subs from srt if present. Burn-in subs don't need a -map
+    # entry — they're rendered into 0:v:0 by the filter graph.
     args += ["-map", "0:v:0"]
     if audio_input_idx is not None:
         args += ["-map", f"{audio_input_idx}:a:0"]
@@ -263,10 +295,20 @@ def _build_ffmpeg_args(
         args += ["-map", f"{srt_input_idx}:s:0"]
 
     # Re-encode video for codec/SAR/framerate consistency. Same
-    # normalisation as the desktop video:merge handler.
+    # normalisation as the desktop video:merge handler. When burning
+    # subs in we append the ``subtitles`` filter to the same chain so
+    # ffmpeg only does one decode/encode pass.
+    vf_chain = "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p"
+    if use_burn_subs:
+        # ``subtitles`` filter resolves the filename from cwd. The
+        # caller stages the SRT as ``_subs.srt`` inside ``output_dir``
+        # and runs ffmpeg with ``cwd=output_dir`` so this relative
+        # filename works on every OS — no path-colon / quote / brace
+        # escaping needed for user-supplied source paths.
+        vf_chain += f",subtitles={burn_srt_relname}"
     args += [
         "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p",
+        vf_chain,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "18",
@@ -283,7 +325,7 @@ def _build_ffmpeg_args(
         "-ac", "2",
     ]
 
-    if use_subs:
+    if use_soft_subs:
         # mov_text is the only soft-sub codec that mp4 reliably plays
         # back across QuickTime / VLC / Chrome.
         args += ["-c:s", "mov_text"]
@@ -308,26 +350,32 @@ def _run_ffmpeg(
     args: list[str],
     *,
     runner: Callable | None = None,
+    cwd: Path | None = None,
 ) -> tuple[bool, int, str, str]:
     """Execute ffmpeg with the given args.
 
     ``runner`` is the test injection seam (mirror of
-    :func:`video_probe._run_ffprobe`). Returns
-    ``(available, returncode, stdout, stderr)``. Never raises.
+    :func:`video_probe._run_ffprobe`). ``cwd``, when provided, is
+    forwarded to ``subprocess.run`` — used by ``caption_mode="burn"``
+    so the ``subtitles`` filter resolves the staged ``_subs.srt`` by
+    relative name. Returns ``(available, returncode, stdout, stderr)``.
+    Never raises.
     """
     binary = _resolve_ffmpeg()
     if not binary:
         return False, -1, "", "ffmpeg not on PATH and FFMPEG_PATH not set"
     cmd = [binary, *args]
     run = runner or subprocess.run
+    run_kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": FFMPEG_TIMEOUT_SEC,
+        "check": False,
+    }
+    if cwd is not None:
+        run_kwargs["cwd"] = str(cwd)
     try:
-        proc = run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SEC,
-            check=False,
-        )
+        proc = run(cmd, **run_kwargs)
     except FileNotFoundError as exc:
         return False, -1, "", f"ffmpeg binary not executable: {exc}"
     except subprocess.TimeoutExpired:
@@ -415,25 +463,68 @@ def assemble_final_mp4(
             warnings=warnings,
         )
 
+    # Stage the SRT for burn-in (PR-32). When the user asked for burn
+    # but the SRT can't be staged (read-only volume, source missing
+    # mid-call) we fall back to soft subs and warn — same robust-
+    # failure pattern the audio-not-on-disk path uses. Tracking
+    # ``effective_caption_mode`` separately from the user's requested
+    # ``caption_mode`` lets us reflect that fallback in the response's
+    # ``captions_attached`` flag.
+    effective_caption_mode: CaptionMode = caption_mode
+    burn_srt_relname: str | None = None
+    staged_srt_path: Path | None = None
+    if caption_mode == "burn":
+        if srt is None:
+            warnings.append(
+                "caption_mode='burn' but no usable srt_path — skipping captions."
+            )
+            effective_caption_mode = "none"
+        else:
+            try:
+                staged_srt_path = output_dir / BURN_SRT_STAGED_NAME
+                shutil.copyfile(str(srt), str(staged_srt_path))
+                burn_srt_relname = BURN_SRT_STAGED_NAME
+            except OSError as exc:
+                warnings.append(
+                    f"Could not stage srt for burn-in ({exc}); "
+                    "falling back to soft subtitles."
+                )
+                effective_caption_mode = "soft"
+                staged_srt_path = None
+                burn_srt_relname = None
+
     args = _build_ffmpeg_args(
         list_path=list_path,
         output_path=output_path,
         audio=audio,
         srt=srt,
         audio_mode=audio_mode,
-        caption_mode=caption_mode,
+        caption_mode=effective_caption_mode,
         trim_to=trim_to,
         video_total_s=video_total_s,
+        burn_srt_relname=burn_srt_relname,
     )
 
-    available, code, _stdout, stderr = _run_ffmpeg(args, runner=runner)
+    # Burn-in needs cwd=output_dir so the ``subtitles`` filter
+    # resolves the staged ``_subs.srt`` by relative name.
+    ffmpeg_cwd = output_dir if effective_caption_mode == "burn" else None
+    available, code, _stdout, stderr = _run_ffmpeg(
+        args, runner=runner, cwd=ffmpeg_cwd,
+    )
 
-    # Best-effort cleanup of the concat list. Failures here are
-    # non-fatal — the file is small and lives next to the output.
+    # Best-effort cleanup of the concat list + the staged srt. Failures
+    # here are non-fatal — both files are small and live next to the
+    # output, and a stale ``_subs.srt`` is not user-visible (the prefix
+    # ``_`` is the project's convention for transient files).
     try:
         list_path.unlink()
     except OSError:
         pass
+    if staged_srt_path is not None:
+        try:
+            staged_srt_path.unlink()
+        except OSError:
+            pass
 
     if not available:
         warnings.append(
@@ -494,7 +585,9 @@ def assemble_final_mp4(
         duration_s=final_duration_s,
         scene_count=len(resolved_scenes),
         audio_attached=audio is not None and audio_mode == "replace",
-        captions_attached=srt is not None and caption_mode == "soft",
+        captions_attached=(
+            srt is not None and effective_caption_mode in ("soft", "burn")
+        ),
         output_dir=str(output_dir),
         warnings=warnings,
     )

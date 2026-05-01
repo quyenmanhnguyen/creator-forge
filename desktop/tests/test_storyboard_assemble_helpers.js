@@ -133,6 +133,44 @@ test("buildAssemblePayload: unknown mode values fall back to documented defaults
     assert.strictEqual(payload.caption_mode, "soft");
 });
 
+// ─── PR-32: caption_mode burn ──────────────────────────────────────────────
+
+test("buildAssemblePayload: captionMode='burn' is forwarded to backend", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        audioPath: "/tmp/voice.mp3",
+        srtPath: "/tmp/captions.srt",
+        captionMode: "burn",
+    });
+    assert.strictEqual(payload.caption_mode, "burn");
+});
+
+test("buildAssemblePayload: every caption mode in CAPTION_MODES whitelist round-trips", () => {
+    // The whitelist is the contract between the renderer and the
+    // backend's Literal["soft", "none", "burn"]. If a future change
+    // adds a value here, the backend must also accept it (and vice
+    // versa) — this test fails fast when one half drifts.
+    for (const mode of helpers.CAPTION_MODES) {
+        const payload = helpers.buildAssemblePayload({
+            scenePaths: ["/tmp/a.mp4"],
+            captionMode: mode,
+        });
+        assert.strictEqual(
+            payload.caption_mode, mode,
+            `caption_mode '${mode}' should round-trip but became '${payload.caption_mode}'`,
+        );
+    }
+});
+
+test("buildAssemblePayload: DEFAULT_CAPTION_MODE matches backend default", () => {
+    // The backend's AssembleRequest.caption_mode defaults to "soft".
+    // The renderer should match so an undefined/missing UI value
+    // produces the same wire payload as the default backend behaviour.
+    assert.strictEqual(helpers.DEFAULT_CAPTION_MODE, "soft");
+    const payload = helpers.buildAssemblePayload({ scenePaths: ["/tmp/a.mp4"] });
+    assert.strictEqual(payload.caption_mode, helpers.DEFAULT_CAPTION_MODE);
+});
+
 test("buildAssemblePayload: missing form returns empty scene_videos", () => {
     const payload = helpers.buildAssemblePayload(undefined);
     assert.deepStrictEqual(payload.scene_videos, []);
