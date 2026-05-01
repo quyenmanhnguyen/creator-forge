@@ -1313,12 +1313,160 @@ class ImageService {
     }
 
     /**
-     * Generate images with multiple prompts (concurrent worker pool)
+     * Process a single prompt — generate the image via Grok, persist
+     * any base64 / URL outputs to ``outputFolder``, and return a
+     * ``jobResult`` with the same shape ``generateBatch`` produces.
+     *
+     * Extracted from the inner worker function of ``generateBatch``
+     * (PR-47) so the cross-session work-stealing fan-out scheduler in
+     * ``electron/main.js`` can dispatch single items directly to a
+     * pool of sessions without going through ``generateBatch``'s
+     * static-slice contract.
+     *
+     * The behaviour, file-naming convention, base64-vs-URL precedence,
+     * and progress reporting are unchanged from the previous worker;
+     * any deviation is a regression.
+     *
+     * @param {string} prompt
+     * @param {object} session
+     * @param {object} [config={}]
+     * @param {Function|null} [onProgress=null] - (prompt, progress, result|null, localIdx) => void
+     * @param {number} myIdx - 0-based per-session index reported back via onProgress.
+     * @param {number} globalNum - 1-based global shot number used for ``shot####`` naming.
+     * @param {number} totalForLog - "N" used in the "#i/N" log decoration.
+     * @param {string} [outputFolder] - Where to write images. Defaults to ``config.outputFolder`` / ``PATHS.IMAGE_DIR``.
+     * @returns {Promise<object>} jobResult: { prompt, localIdx, title, savedFiles, outputPath, success, error }
+     */
+    async _processOneBatchItem(
+        prompt,
+        session,
+        config = {},
+        onProgress = null,
+        myIdx = 0,
+        globalNum = 1,
+        totalForLog = 1,
+        outputFolder = null,
+    ) {
+        const folder = outputFolder || config.outputFolder || PATHS.IMAGE_DIR;
+        const label = `Acc${session.accIdx + 1}`;
+
+        console.log(`[ImageService] [${label}] 🖼️ #${myIdx + 1}/${totalForLog} (shot${String(globalNum).padStart(4, '0')}) starting: ${prompt.substring(0, 50)}...`);
+
+        const result = await this.generateOne(prompt, session, config, (prog) => {
+            if (onProgress) onProgress(prompt, prog.progress, null, myIdx);
+        });
+
+        const savedFiles = [];
+        const shotNum = String(globalNum).padStart(4, '0');
+        const batchTs = Date.now().toString(36);
+        const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
+
+        if ((result.imageBase64 || []).length > 0) {
+            // Track used filenames within this shot to avoid collisions
+            // when multiple images share the same order/imageIndex.
+            const usedNames = new Set();
+            for (let imgIdx = 0; imgIdx < result.imageBase64.length; imgIdx++) {
+                const img = result.imageBase64[imgIdx];
+                try {
+                    let base64Data = img.data;
+                    let ext = 'png';
+                    if (base64Data.startsWith('data:image/')) {
+                        const match = base64Data.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
+                        if (match) {
+                            ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+                            base64Data = base64Data.substring(match[0].length);
+                        }
+                    }
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    // Use sequential imgIdx as fallback to guarantee unique names
+                    const imgNum = img.imageIndex != null ? img.imageIndex : imgIdx;
+                    let filename = titleSlug
+                        ? `shot${shotNum}_${batchTs}_${titleSlug}_i${imgNum}.${ext}`
+                        : `shot${shotNum}_${batchTs}_i${imgNum}.${ext}`;
+                    // If this name was already used (duplicate order), append loop index
+                    if (usedNames.has(filename)) {
+                        filename = titleSlug
+                            ? `shot${shotNum}_${batchTs}_${titleSlug}_i${imgIdx}.${ext}`
+                            : `shot${shotNum}_${batchTs}_i${imgIdx}.${ext}`;
+                    }
+                    usedNames.add(filename);
+                    const filePath = FileService.saveFile(buffer, filename, folder);
+                    savedFiles.push(filePath);
+                    img.size = buffer.length;
+                    console.log(`[ImageService] [${label}] 💾 Saved base64 image: ${filename} (${buffer.length} bytes)`);
+                } catch (error) {
+                    console.error(`[ImageService] [${label}] Base64 save error:`, error.message);
+                }
+            }
+        }
+
+        const bestBase64Size = savedFiles.length > 0 ? Math.max(...(result.imageBase64 || []).map(i => i.size || 0), 0) : 0;
+        if ((result.imageUrls || []).length > 0 && bestBase64Size < 50000) {
+            for (const img of result.imageUrls) {
+                try {
+                    let dl = await this.downloadImage(img.imageUrl, session);
+                    if (dl && dl.size < 50000 && session._page) {
+                        console.log('[ImageService] Image too small (' + dl.size + 'b), trying browser download...');
+                        const browserDl = await this.downloadViaBrowser(img.imageUrl, session);
+                        if (browserDl && browserDl.size > dl.size) {
+                            console.log('[ImageService] Browser download better: ' + browserDl.size + 'b vs ' + dl.size + 'b');
+                            dl = browserDl;
+                        }
+                    }
+                    if (!dl && session._page) {
+                        dl = await this.downloadViaBrowser(img.imageUrl, session);
+                    }
+                    if (dl && dl.size > bestBase64Size) {
+                        const ext = dl.contentType?.includes('png') ? 'png' : 'jpg';
+                        const cdnIdx = img.imageIndex || 0;
+                        const filename = titleSlug ? `shot${shotNum}_${batchTs}_${titleSlug}_cdn_i${cdnIdx}.${ext}` : `shot${shotNum}_${batchTs}_cdn_i${cdnIdx}.${ext}`;
+                        const filePath = FileService.saveFile(dl.data, filename, folder);
+                        savedFiles.push(filePath);
+                        console.log(`[ImageService] [${label}] 💾 Saved URL image: ${filename} (${dl.size} bytes)`);
+                    } else if (dl) {
+                        console.log(`[ImageService] [${label}] Skipping URL image (${dl.size}b <= base64 ${bestBase64Size}b)`);
+                    }
+                } catch (error) {
+                    console.error(`[ImageService] [${label}] Download error:`, error.message);
+                }
+            }
+        } else if (bestBase64Size >= 50000) {
+            console.log(`[ImageService] [${label}] Skipping URL downloads — already have good base64 (${bestBase64Size}b)`);
+        }
+
+        const jobResult = {
+            prompt,
+            localIdx: myIdx,
+            title: result.title,
+            savedFiles,
+            outputPath: savedFiles.length > 0 ? savedFiles[0] : null,
+            success: savedFiles.length > 0,
+            error: result.error,
+        };
+
+        if (onProgress) {
+            onProgress(prompt, 100, jobResult, myIdx);
+        }
+
+        console.log(`[ImageService] [${label}] #${myIdx + 1}/${totalForLog} ${savedFiles.length > 0 ? '✅' : '❌'} ${result.title || prompt.substring(0, 50)}`);
+
+        return jobResult;
+    }
+
+    /**
+     * Generate images for multiple prompts on a SINGLE session via a
+     * per-session worker pool. Kept for back-compat — the cross-
+     * session fan-out scheduler in ``electron/main.js`` calls
+     * ``_processOneBatchItem`` directly so the body here is just a
+     * thin wrapper that drives the same per-item processor in a
+     * static-slice context.
+     *
      * @param {Array<string>} prompts - Array of prompts
      * @param {Object} session - Session data
      * @param {Object} config - Config with batchSize
      * @param {Function} onProgress - Progress callback (prompt, progress, result)
-     * @returns {Promise<Array<Object>>} Results array
+     * @param {number} [startIdx=0] - Global offset for ``shot####`` naming.
+     * @returns {Promise<Array<Object>>} Results array (jobResults).
      */
     async generateBatch(prompts, session, config = {}, onProgress = null, startIdx = 0) {
         const N = prompts.length;
@@ -1341,108 +1489,17 @@ class ImageService {
                 const myIdx = nextIdx++;
                 const prompt = prompts[myIdx];
                 const globalNum = startIdx + myIdx + 1;
-
-                console.log(`[ImageService] [${label}] 🖼️ #${myIdx + 1}/${N} (shot${String(globalNum).padStart(4, '0')}) starting: ${prompt.substring(0, 50)}...`);
-
-                const result = await self.generateOne(prompt, session, config, (prog) => {
-                    if (onProgress) onProgress(prompt, prog.progress, null, myIdx);
-                });
-
-                const savedFiles = [];
-                const shotNum = String(globalNum).padStart(4, '0');
-                const batchTs = Date.now().toString(36);
-                const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
-
-                if ((result.imageBase64 || []).length > 0) {
-                    // Track used filenames within this shot to avoid collisions
-                    // when multiple images share the same order/imageIndex.
-                    const usedNames = new Set();
-                    for (let imgIdx = 0; imgIdx < result.imageBase64.length; imgIdx++) {
-                        const img = result.imageBase64[imgIdx];
-                        try {
-                            let base64Data = img.data;
-                            let ext = 'png';
-                            if (base64Data.startsWith('data:image/')) {
-                                const match = base64Data.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
-                                if (match) {
-                                    ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-                                    base64Data = base64Data.substring(match[0].length);
-                                }
-                            }
-                            const buffer = Buffer.from(base64Data, 'base64');
-                            // Use sequential imgIdx as fallback to guarantee unique names
-                            const imgNum = img.imageIndex != null ? img.imageIndex : imgIdx;
-                            let filename = titleSlug
-                                ? `shot${shotNum}_${batchTs}_${titleSlug}_i${imgNum}.${ext}`
-                                : `shot${shotNum}_${batchTs}_i${imgNum}.${ext}`;
-                            // If this name was already used (duplicate order), append loop index
-                            if (usedNames.has(filename)) {
-                                filename = titleSlug
-                                    ? `shot${shotNum}_${batchTs}_${titleSlug}_i${imgIdx}.${ext}`
-                                    : `shot${shotNum}_${batchTs}_i${imgIdx}.${ext}`;
-                            }
-                            usedNames.add(filename);
-                            const filePath = FileService.saveFile(buffer, filename, outputFolder);
-                            savedFiles.push(filePath);
-                            img.size = buffer.length;
-                            console.log(`[ImageService] [${label}] 💾 Saved base64 image: ${filename} (${buffer.length} bytes)`);
-                        } catch (error) {
-                            console.error(`[ImageService] [${label}] Base64 save error:`, error.message);
-                        }
-                    }
-                }
-
-                const bestBase64Size = savedFiles.length > 0 ? Math.max(...(result.imageBase64 || []).map(i => i.size || 0), 0) : 0;
-                if ((result.imageUrls || []).length > 0 && bestBase64Size < 50000) {
-                    for (const img of result.imageUrls) {
-                        try {
-                            let dl = await self.downloadImage(img.imageUrl, session);
-                            if (dl && dl.size < 50000 && session._page) {
-                                console.log('[ImageService] Image too small (' + dl.size + 'b), trying browser download...');
-                                const browserDl = await self.downloadViaBrowser(img.imageUrl, session);
-                                if (browserDl && browserDl.size > dl.size) {
-                                    console.log('[ImageService] Browser download better: ' + browserDl.size + 'b vs ' + dl.size + 'b');
-                                    dl = browserDl;
-                                }
-                            }
-                            if (!dl && session._page) {
-                                dl = await self.downloadViaBrowser(img.imageUrl, session);
-                            }
-                            if (dl && dl.size > bestBase64Size) {
-                                const ext = dl.contentType?.includes('png') ? 'png' : 'jpg';
-                                const cdnIdx = img.imageIndex || 0;
-                                const filename = titleSlug ? `shot${shotNum}_${batchTs}_${titleSlug}_cdn_i${cdnIdx}.${ext}` : `shot${shotNum}_${batchTs}_cdn_i${cdnIdx}.${ext}`;
-                                const filePath = FileService.saveFile(dl.data, filename, outputFolder);
-                                savedFiles.push(filePath);
-                                console.log(`[ImageService] [${label}] 💾 Saved URL image: ${filename} (${dl.size} bytes)`);
-                            } else if (dl) {
-                                console.log(`[ImageService] [${label}] Skipping URL image (${dl.size}b <= base64 ${bestBase64Size}b)`);
-                            }
-                        } catch (error) {
-                            console.error(`[ImageService] [${label}] Download error:`, error.message);
-                        }
-                    }
-                } else if (bestBase64Size >= 50000) {
-                    console.log(`[ImageService] [${label}] Skipping URL downloads — already have good base64 (${bestBase64Size}b)`);
-                }
-
-                const jobResult = {
+                const jobResult = await self._processOneBatchItem(
                     prompt,
-                    localIdx: myIdx,
-                    title: result.title,
-                    savedFiles,
-                    outputPath: savedFiles.length > 0 ? savedFiles[0] : null,
-                    success: savedFiles.length > 0,
-                    error: result.error,
-                };
-
+                    session,
+                    config,
+                    onProgress,
+                    myIdx,
+                    globalNum,
+                    N,
+                    outputFolder,
+                );
                 results.push(jobResult);
-
-                if (onProgress) {
-                    onProgress(prompt, 100, jobResult, myIdx);
-                }
-
-                console.log(`[ImageService] [${label}] #${myIdx + 1}/${N} ${savedFiles.length > 0 ? '✅' : '❌'} ${result.title || prompt.substring(0, 50)}`);
             }
         }
 
