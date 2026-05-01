@@ -94,12 +94,24 @@
         const out = [];
         let order = 1;
         scenes.forEach((s) => {
+            // PR-48: prefer the per-variant array (`video_prompts` /
+            // `flow_video_prompts`) so each video row carries the
+            // prompt that's bonded to its image variant's framing.
+            // Falls back to the singular scene-level prompt when the
+            // array is shorter than the requested variant count, so
+            // legacy (single-prompt) scene_breakdown payloads keep
+            // working unchanged.
+            const variantPromptsRaw = Array.isArray(s && s.video_prompts) && s.video_prompts.length
+                ? s.video_prompts
+                : (Array.isArray(s && s.flow_video_prompts) ? s.flow_video_prompts : []);
             const vp = (s && typeof s.video_prompt === "string") ? s.video_prompt.trim() : "";
             const fvp = (s && typeof s.flow_video_prompt === "string") ? s.flow_video_prompt.trim() : "";
-            const prompt = vp || fvp;
-            const skipped = !prompt;
+            const fallbackPrompt = vp || fvp;
             const sceneId = s ? s.scene_id : null;
             for (let v = 0; v < variants; v += 1) {
+                const variantPrompt = (typeof variantPromptsRaw[v] === "string") ? variantPromptsRaw[v].trim() : "";
+                const prompt = variantPrompt || fallbackPrompt;
+                const skipped = !prompt;
                 out.push({
                     order: order++,
                     scene_id: sceneId,
@@ -208,24 +220,35 @@
      *                          where possible.
      */
     function pairImagePathsForI2V(videoRows, imageRows) {
-        // PR-23: with multiple image variants per scene, prefer the
-        // image with the lowest variant_idx that has settled. Falls
-        // back to the first settled image we encounter when no
-        // variant_idx is set (legacy 1-row-per-scene tables).
-        const bestByScene = new Map();
+        // PR-48: variant-aware pairing. Each video row prefers the
+        // image whose ``(scene_id, variant_idx)`` matches its own —
+        // so video #N of a scene flows from image #N of that scene
+        // (matching the prompt diversity emitted by the LLM in
+        // ``flow_video_prompts``). Falls back to the lowest-variant
+        // settled image of the same scene when no exact-variant
+        // image is available (e.g. ``videosPerScene > imagesPerScene``,
+        // or a specific variant failed). The fallback preserves
+        // PR-23's hero-image behaviour for legacy 1-row-per-scene
+        // tables and for partial failures.
+        const exactByPair = new Map(); // "<scene>#<variant>" → image_path
+        const bestByScene = new Map(); // <scene> → {v, image_path}
         for (const ir of imageRows) {
             if (!ir.image_path) continue;
             if (ir.status !== "generated" && ir.status !== "retried") continue;
-            const key = String(ir.scene_id);
-            const cur = bestByScene.get(key);
+            const sceneKey = String(ir.scene_id);
             const v = (typeof ir.variant_idx === "number") ? ir.variant_idx : 0;
+            exactByPair.set(`${sceneKey}#${v}`, ir.image_path);
+            const cur = bestByScene.get(sceneKey);
             if (!cur || v < cur.v) {
-                bestByScene.set(key, { v, image_path: ir.image_path });
+                bestByScene.set(sceneKey, { v, image_path: ir.image_path });
             }
         }
         return videoRows.map((row) => {
-            const entry = bestByScene.get(String(row.scene_id));
-            const ip = entry ? entry.image_path : null;
+            const sceneKey = String(row.scene_id);
+            const variant = (typeof row.variant_idx === "number") ? row.variant_idx : 0;
+            const exact = exactByPair.get(`${sceneKey}#${variant}`);
+            const fallback = bestByScene.get(sceneKey);
+            const ip = exact || (fallback ? fallback.image_path : null);
             if (ip === row.image_path) return row;
             return Object.assign({}, row, { image_path: ip });
         });

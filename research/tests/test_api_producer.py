@@ -290,6 +290,217 @@ def test_producer_empty_scenes_warns(monkeypatch):
     assert any("zero scenes" in w for w in body["warnings"])
 
 
+def test_producer_returns_flow_video_prompts_alongside_image_prompts(monkeypatch):
+    """PR-48 — when scenes carry ``flow_video_prompts`` (variant case), the
+    response must surface them so the renderer can pair video rows 1:1."""
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, **kw):
+        s = LongFormScene(
+            scene_id=1,
+            title="Coffee shop",
+            narration="A barista pulls a shot.",
+            image_prompt="wide shot",
+            flow_video_prompt="slow push-in",
+            duration_s=6.0,
+            image_prompts=("wide shot", "low-angle", "over-the-shoulder"),
+            flow_video_prompts=(
+                "Camera dollies in from wide framing.",
+                "Tilt up from low-angle as crema flows.",
+                "Glide past shoulder toward the cup.",
+            ),
+        )
+        return [s]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "n_scenes": 3, "images_per_scene": 3},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    scene = body["scenes"][0]
+    assert scene["image_prompts"] == ["wide shot", "low-angle", "over-the-shoulder"]
+    assert scene["flow_video_prompts"] == [
+        "Camera dollies in from wide framing.",
+        "Tilt up from low-angle as crema flows.",
+        "Glide past shoulder toward the cup.",
+    ]
+    # Singular fields stay populated for back-compat callers.
+    assert scene["flow_video_prompt"] == "slow push-in"
+
+
+def test_producer_returns_empty_flow_video_prompts_for_legacy_scenes(monkeypatch):
+    """Legacy scenes (images_per_scene=1) emit empty arrays — back-compat."""
+
+    monkeypatch.setattr(
+        producer_route, "generate_scene_breakdown",
+        lambda *a, **kw: [_scene(i) for i in range(1, 4)],
+    )
+    r = client.post("/producer/scene_breakdown", json={"script": SAMPLE_SCRIPT})
+    assert r.status_code == 200
+    body = r.json()
+    for scene in body["scenes"]:
+        assert scene["image_prompts"] == []
+        assert scene["flow_video_prompts"] == []
+
+
+# ─── /producer/variant_prompts ──────────────────────────────────────────────
+
+def test_variant_prompts_returns_image_and_video_prompts(monkeypatch):
+    """PR-48 — re-rolling variants returns both image and video prompts paired 1:1."""
+
+    captured: dict[str, Any] = {}
+
+    def fake_image(scene, *, count, visual_dna, chat_fn):
+        captured["image_count"] = count
+        captured["image_dna"] = visual_dna
+        return [f"image variant {i}" for i in range(count)]
+
+    def fake_video(scene, image_prompts, *, chat_fn):
+        captured["video_image_prompts"] = list(image_prompts)
+        return [f"video for {p}" for p in image_prompts]
+
+    monkeypatch.setattr(producer_route, "expand_image_variants", fake_image)
+    monkeypatch.setattr(
+        producer_route, "expand_video_variants_for_images", fake_video
+    )
+
+    r = client.post(
+        "/producer/variant_prompts",
+        json={
+            "scene": {
+                "scene_id": 1,
+                "title": "t",
+                "narration": "n",
+                "image_prompt": "base image",
+                "flow_video_prompt": "base motion",
+            },
+            "count": 3,
+            "visual_dna": "warm cinematic",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["prompts"] == ["image variant 0", "image variant 1", "image variant 2"]
+    assert body["video_prompts"] == [
+        "video for image variant 0",
+        "video for image variant 1",
+        "video for image variant 2",
+    ]
+    assert body["warnings"] == []
+    assert captured["image_count"] == 3
+    assert captured["image_dna"] == "warm cinematic"
+    # The video call gets the *just-expanded* image prompts so the LLM
+    # can match each video 1:1 to the right framing.
+    assert captured["video_image_prompts"] == [
+        "image variant 0",
+        "image variant 1",
+        "image variant 2",
+    ]
+
+
+def test_variant_prompts_skips_video_call_for_count_one(monkeypatch):
+    """count==1 — no need to call the video LLM (no variation possible)."""
+    called: dict[str, bool] = {"video": False}
+
+    def fake_image(scene, *, count, visual_dna, chat_fn):
+        return ["only image"]
+
+    def fake_video(scene, image_prompts, *, chat_fn):
+        called["video"] = True
+        return ["should not be called"]
+
+    monkeypatch.setattr(producer_route, "expand_image_variants", fake_image)
+    monkeypatch.setattr(
+        producer_route, "expand_video_variants_for_images", fake_video
+    )
+
+    r = client.post(
+        "/producer/variant_prompts",
+        json={
+            "scene": {
+                "scene_id": 1,
+                "image_prompt": "base",
+                "flow_video_prompt": "vp",
+            },
+            "count": 1,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["prompts"] == ["only image"]
+    # Empty when count==1 — caller falls back to scene-level video prompt.
+    assert body["video_prompts"] == []
+    assert called["video"] is False
+
+
+def test_variant_prompts_skips_video_call_when_no_seed(monkeypatch):
+    """No flow_video_prompt seed → no video LLM call; empty video_prompts list."""
+    called: dict[str, bool] = {"video": False}
+
+    def fake_image(scene, *, count, visual_dna, chat_fn):
+        return ["a", "b"]
+
+    def fake_video(scene, image_prompts, *, chat_fn):
+        called["video"] = True
+        return ["should not be called", "here"]
+
+    monkeypatch.setattr(producer_route, "expand_image_variants", fake_image)
+    monkeypatch.setattr(
+        producer_route, "expand_video_variants_for_images", fake_video
+    )
+
+    r = client.post(
+        "/producer/variant_prompts",
+        json={
+            "scene": {
+                "scene_id": 1,
+                "image_prompt": "base",
+                # No flow_video_prompt → renderer must keep the scene-level one
+                # rather than ask for variant-specific prompts.
+            },
+            "count": 2,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["prompts"] == ["a", "b"]
+    assert body["video_prompts"] == []
+    assert called["video"] is False
+
+
+def test_variant_prompts_video_failure_surfaces_warning(monkeypatch):
+    """Video LLM call failure → warning + repeat the base prompt."""
+
+    def fake_image(scene, *, count, visual_dna, chat_fn):
+        return ["a", "b"]
+
+    def boom(scene, image_prompts, *, chat_fn):
+        raise RuntimeError("video LLM down")
+
+    monkeypatch.setattr(producer_route, "expand_image_variants", fake_image)
+    monkeypatch.setattr(
+        producer_route, "expand_video_variants_for_images", boom
+    )
+
+    r = client.post(
+        "/producer/variant_prompts",
+        json={
+            "scene": {
+                "scene_id": 1,
+                "image_prompt": "base",
+                "flow_video_prompt": "scene-level motion",
+            },
+            "count": 2,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["prompts"] == ["a", "b"]
+    assert body["video_prompts"] == ["scene-level motion", "scene-level motion"]
+    assert any("Variant video prompts" in w for w in body["warnings"])
+
+
 def test_producer_serializer_failure(monkeypatch):
     """If serialize_breakdown_md raises after a successful LLM call, the route
     should still 200 with empty scenes + a serialize-failure warning instead

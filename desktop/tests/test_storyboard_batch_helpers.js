@@ -1038,6 +1038,144 @@ test("PR-29: mapBatchResponse — video with no error gets its own actionable hi
     assert.notStrictEqual(mapped[0].reason, "video generation failed");
 });
 
+// ─── PR-48 ─────────────────────────────────────────────────────────
+
+test("PR-48: initVideoRowsFromScenes uses video_prompts[v] for each variant when array is present", () => {
+    const scenes = [{
+        scene_id: 1,
+        title: "coffee",
+        flow_video_prompt: "scene-level fallback",
+        video_prompts: [
+            "Camera dollies from wide framing.",
+            "Tilt up from low-angle.",
+            "Glide past shoulder.",
+        ],
+        duration_s: 4,
+    }];
+    const rows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene: 3 });
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].prompt, "Camera dollies from wide framing.");
+    assert.strictEqual(rows[1].prompt, "Tilt up from low-angle.");
+    assert.strictEqual(rows[2].prompt, "Glide past shoulder.");
+    // Each variant is "pending" not "skipped" because its prompt is non-empty.
+    assert.ok(rows.every((r) => r.status === "pending"));
+});
+
+test("PR-48: initVideoRowsFromScenes accepts flow_video_prompts as alias for video_prompts", () => {
+    const scenes = [{
+        scene_id: 1,
+        flow_video_prompt: "fallback",
+        flow_video_prompts: ["A motion", "B motion", "C motion"],
+        duration_s: 3,
+    }];
+    const rows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene: 3 });
+    assert.deepStrictEqual(
+        rows.map((r) => r.prompt),
+        ["A motion", "B motion", "C motion"],
+    );
+});
+
+test("PR-48: initVideoRowsFromScenes falls back to scene-level prompt when variant array is shorter than count", () => {
+    const scenes = [{
+        scene_id: 1,
+        flow_video_prompt: "fallback motion",
+        video_prompts: ["only first variant"],
+        duration_s: 3,
+    }];
+    const rows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene: 3 });
+    assert.strictEqual(rows[0].prompt, "only first variant");
+    // Missing variants 1 and 2 fall back — must not be empty/skipped.
+    assert.strictEqual(rows[1].prompt, "fallback motion");
+    assert.strictEqual(rows[2].prompt, "fallback motion");
+    assert.ok(rows.every((r) => r.status === "pending"));
+});
+
+test("PR-48: initVideoRowsFromScenes back-compat — scenes without variant arrays still use scene-level prompt", () => {
+    const scenes = [
+        { scene_id: 1, flow_video_prompt: "old style", duration_s: 3 },
+        { scene_id: 2, video_prompt: "old style 2", duration_s: 2 },
+    ];
+    const rows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene: 2 });
+    assert.strictEqual(rows.length, 4);
+    // Both variants of scene 1 share the scene-level prompt (no variant array).
+    assert.strictEqual(rows[0].prompt, "old style");
+    assert.strictEqual(rows[1].prompt, "old style");
+    assert.strictEqual(rows[2].prompt, "old style 2");
+    assert.strictEqual(rows[3].prompt, "old style 2");
+});
+
+test("PR-48: pairImagePathsForI2V matches by (scene_id, variant_idx) — video variant N ↔ image variant N", () => {
+    // 1 scene × 4 image variants, all settled with distinct paths.
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 4 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/img-v0.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", { status: "generated", image_path: "/img-v1.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#2", { status: "generated", image_path: "/img-v2.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#3", { status: "generated", image_path: "/img-v3.png" });
+
+    // 4 video variants — each must pair to the same-index image.
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 4 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired.length, 4);
+    assert.strictEqual(paired[0].image_path, "/img-v0.png", "video #0 must pair to image #0");
+    assert.strictEqual(paired[1].image_path, "/img-v1.png", "video #1 must pair to image #1");
+    assert.strictEqual(paired[2].image_path, "/img-v2.png", "video #2 must pair to image #2");
+    assert.strictEqual(paired[3].image_path, "/img-v3.png", "video #3 must pair to image #3");
+});
+
+test("PR-48: pairImagePathsForI2V — video variant with no exact image variant falls back to lowest-variant_idx settled", () => {
+    // Image variants 0 + 1 settled. Video has 4 variants — variants 2, 3
+    // should fall back to lowest-settled image (variant 0).
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 2 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/img-v0.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", { status: "generated", image_path: "/img-v1.png" });
+
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 4 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v0.png", "video #0 → image #0 (exact)");
+    assert.strictEqual(paired[1].image_path, "/img-v1.png", "video #1 → image #1 (exact)");
+    assert.strictEqual(paired[2].image_path, "/img-v0.png", "video #2 → fallback to lowest settled (image #0)");
+    assert.strictEqual(paired[3].image_path, "/img-v0.png", "video #3 → fallback to lowest settled (image #0)");
+});
+
+test("PR-48: pairImagePathsForI2V — when only a high variant settled, lower video variants fall back to it", () => {
+    // Only image variant 2 settled (variants 0 and 1 failed/pending).
+    // Every video variant must still pair to /img-v2.png (the only settled image).
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 3 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#2", { status: "generated", image_path: "/img-v2.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "fallback", attempts: 1, reason: "moderated" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", { status: "fallback", attempts: 1, reason: "moderated" });
+
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 3 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v2.png", "video #0 → fallback to /img-v2.png (only settled)");
+    assert.strictEqual(paired[1].image_path, "/img-v2.png", "video #1 → fallback to /img-v2.png");
+    assert.strictEqual(paired[2].image_path, "/img-v2.png", "video #2 → exact match");
+});
+
+test("PR-48: pairImagePathsForI2V — does not mutate inputs", () => {
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 2 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/v0.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", { status: "generated", image_path: "/v1.png" });
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 2 });
+    const imageSnap = JSON.stringify(imageRows);
+    const videoSnap = JSON.stringify(videoRows);
+    helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(JSON.stringify(imageRows), imageSnap, "imageRows must not be mutated");
+    assert.strictEqual(JSON.stringify(videoRows), videoSnap, "videoRows must not be mutated");
+});
+
+test("PR-48: pairImagePathsForI2V — different scenes do NOT cross-pair", () => {
+    // Scene 1 has variant 0 settled; Scene 2 has nothing settled.
+    // Scene 2's video rows must NOT pair to scene 1's image_path.
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 2), { imagesPerScene: 1 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/scene1.png" });
+    // Scene 2's image is intentionally not settled (still pending).
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 2), { videosPerScene: 1 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/scene1.png");
+    assert.strictEqual(paired[1].image_path, null, "scene 2's video must NOT borrow scene 1's image");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {
