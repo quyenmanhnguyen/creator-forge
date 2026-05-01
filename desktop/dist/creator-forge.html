@@ -332,6 +332,46 @@
             color: var(--text-dim);
             font-size: 11px;
         }
+        /* PR-46 — clamp the prompt body so a 250-word variant prompt
+           doesn't push every row to ~400px tall. The `.prompt-cell`
+           td still flows normally for thumb / status / action cells;
+           only the inner content div is clamped. Click the body to
+           toggle expansion; Edit / Delete / Refs in the actions
+           column are unaffected because they live outside the
+           toggle target. */
+        .swc-table .prompt-cell-body {
+            display: -webkit-box;
+            -webkit-line-clamp: 5;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .swc-table .prompt-cell-content {
+            cursor: zoom-in;
+        }
+        .swc-table .prompt-cell-content.is-expanded {
+            cursor: zoom-out;
+        }
+        .swc-table .prompt-cell-content.is-expanded .prompt-cell-body {
+            -webkit-line-clamp: unset;
+            display: block;
+            overflow: visible;
+        }
+        .swc-table .prompt-cell-hint {
+            display: block;
+            margin-top: 4px;
+            font-size: 10px;
+            color: var(--accent);
+            opacity: 0;
+            transition: opacity 120ms ease-in-out;
+            pointer-events: none;
+        }
+        .swc-table .prompt-cell-content:hover .prompt-cell-hint,
+        .swc-table .prompt-cell-content.is-expanded .prompt-cell-hint {
+            opacity: 0.85;
+        }
         .swc-table .thumb-cell {
             width: 76px;
         }
