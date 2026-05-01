@@ -1495,3 +1495,244 @@ def test_short_zero_duration_warning_is_format_aware_for_wav(monkeypatch, tmp_pa
     # The misleading mutagen suggestion must NOT appear for WAV output.
     assert "mutagen" not in duration_warnings[0]
     assert "WAV" in duration_warnings[0] or "truncated" in duration_warnings[0]
+
+
+# ─── /producer/audio — PR-30 (TTS-only, no ffmpeg compose) ──────────────────
+#
+# These tests exercise the audio-only render path. They share the
+# ``_tts_adapter_factory`` indirection point with /producer/short tests
+# above so they can swap in a fake TTS engine without touching
+# edge-tts / piper / moviepy / ffmpeg.
+
+AUDIO_SCRIPT = (
+    "Welcome to creator-forge. This is a quick smoke test for the audio-only "
+    "compose path. We synthesize narration to MP3, attach captions, and stop."
+)
+
+
+@pytest.mark.parametrize("script_value", ["", " ", "   ", "\t", "\n"])
+def test_audio_rejects_empty_or_whitespace_script(script_value):
+    r = client.post("/producer/audio", json={"script": script_value})
+    assert r.status_code == 422, r.text
+
+
+def test_audio_happy_path_writes_mp3_and_srt(monkeypatch, tmp_path):
+    captured: dict[str, Any] = {}
+    compose_called = {"flag": False}
+
+    class FakeAdapter:
+        name = "fake-edge"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["text"] = text
+            captured["voice"] = voice
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=5.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[
+                    WordBoundary(start_s=0.0, end_s=1.0, text="Welcome"),
+                    WordBoundary(start_s=1.0, end_s=2.0, text="back."),
+                ],
+            )
+
+    def fake_compose(*args, **kwargs):
+        # /producer/audio MUST NOT call the composer. If this fires the
+        # route accidentally regressed to the /producer/short pipeline.
+        compose_called["flag"] = True
+        return Path(args[1]) if len(args) >= 2 else None
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeAdapter)
+    monkeypatch.setattr(producer_route, "_make_short", fake_compose)
+
+    out = tmp_path / "audio-out1"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "  " + AUDIO_SCRIPT + "  \n",
+            "voice": "en-US-AriaNeural",
+            "output_dir": str(out),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["text"].startswith("Welcome to creator-forge")
+    assert not captured["text"].endswith(" ")
+    assert compose_called["flag"] is False, (
+        "/producer/audio must not invoke make_short — it's a TTS-only route"
+    )
+    assert body["audio_path"].endswith("voice.mp3")
+    assert body["audio_format"] == "mp3"
+    assert body["srt_path"].endswith("captions.srt")
+    assert body["duration_s"] == 5.0
+    assert body["voice"] == "en-US-AriaNeural"
+    assert body["engine"] == "fake-edge"
+    assert body["captions_count"] >= 1
+    assert body["caption_source"] == "word_boundaries"
+    assert body["output_dir"] == str(out)
+    assert "mp4_path" not in body, "audio response must not carry an mp4_path field"
+    assert (out / "voice.mp3").exists()
+    assert (out / "captions.srt").exists()
+    # No mp4 should be produced.
+    assert not (out / "short.mp4").exists()
+
+
+def test_audio_falls_back_to_sentence_captions_when_no_word_boundaries(monkeypatch, tmp_path):
+    class FakeAdapter:
+        name = "fake-edge"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 32)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=8.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeAdapter)
+
+    r = client.post(
+        "/producer/audio",
+        json={"script": AUDIO_SCRIPT, "output_dir": str(tmp_path / "audio-out2")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["caption_source"] == "sentence_fallback"
+    assert body["captions_count"] >= 1
+    assert body["audio_path"]
+
+
+def test_audio_skips_srt_when_disabled(monkeypatch, tmp_path):
+    class FakeAdapter:
+        name = "fake-edge"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 16)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=3.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[WordBoundary(start_s=0.0, end_s=1.0, text="Hi.")],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeAdapter)
+
+    out = tmp_path / "audio-out3"
+    r = client.post(
+        "/producer/audio",
+        json={"script": AUDIO_SCRIPT, "output_dir": str(out), "write_srt": False},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["srt_path"] is None
+    assert not (out / "captions.srt").exists()
+    # Audio is still produced.
+    assert body["audio_path"]
+    assert (out / "voice.mp3").exists()
+
+
+def test_audio_piper_writes_wav_and_reflects_format(monkeypatch, tmp_path):
+    """Piper rewrites the output extension to ``.wav`` on its own. The
+    route must report the actual extension via ``audio_format`` so the
+    renderer can label the result correctly."""
+    class FakePiperAdapter:
+        name = "piper-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            # Mimic Piper: we got an .mp3 path in, we write a .wav out.
+            wav_path = Path(output_path).with_suffix(".wav")
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+            wav_path.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+            return TTSResult(
+                audio_path=wav_path,
+                duration_seconds=4.5,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakePiperAdapter)
+
+    out = tmp_path / "audio-out4"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "tts_provider": "piper-tts",
+            "voice": "vi_VN-vais1000-medium",
+            "output_dir": str(out),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_path"].endswith(".wav")
+    assert body["audio_format"] == "wav"
+    assert body["engine"] == "piper-tts"
+    # No spurious "voice not in curated list" warning when the provider
+    # is Piper — that warning is Edge-TTS specific.
+    assert not any("curated list" in w for w in body["warnings"])
+
+
+def test_audio_tts_exception_returns_empty_paths_with_warning(monkeypatch, tmp_path):
+    class FailingAdapter:
+        name = "broken-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            raise RuntimeError("simulated edge-tts network error")
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FailingAdapter)
+
+    r = client.post(
+        "/producer/audio",
+        json={"script": AUDIO_SCRIPT, "output_dir": str(tmp_path / "audio-out5")},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["audio_path"] == "", "audio must be empty when TTS failed"
+    assert body["srt_path"] is None
+    assert body["caption_source"] == "none"
+    assert any("simulated edge-tts" in w for w in body["warnings"])
+
+
+def test_audio_default_output_dir_uses_audio_prefix(monkeypatch, tmp_path):
+    """The auto-generated output dir must use the ``audio-<ts>`` prefix
+    (not ``short-<ts>``) so the user can tell at a glance which renders
+    were audio-only.
+    """
+    sentinel = tmp_path / "auto-audio-1234"
+
+    class FakeAdapter:
+        name = "fake-edge"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"\x00")
+            return TTSResult(
+                audio_path=Path(output_path),
+                duration_seconds=1.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeAdapter)
+    monkeypatch.setattr(
+        producer_route, "_default_audio_output_dir", lambda: sentinel
+    )
+
+    r = client.post("/producer/audio", json={"script": AUDIO_SCRIPT})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["output_dir"] == str(sentinel)
+    assert sentinel.exists()

@@ -865,6 +865,204 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     )
 
 
+# ─── /producer/audio — TTS + (optional) captions, no ffmpeg compose ─────────
+
+# PR-30 — voiceover-first workflow. The user wants the narration MP3/WAV
+# (and an SRT) without paying the ffmpeg / moviepy cost of building a
+# 9:16 mp4 yet. They'll come back later through ``/producer/short`` (or
+# the upcoming Video Assembly panel) once the visuals are ready.
+#
+# This route deliberately mirrors the TTS+captions stages of
+# ``/producer/short`` instead of refactoring them out: keeping
+# ``/producer/short`` byte-identical means the existing
+# ``test_short_*`` regression tests stay valid evidence for the
+# image+video composer pipeline. The shared logic is small enough that
+# duplication is cheaper than the coupling a helper would introduce.
+
+
+def _default_audio_output_dir() -> Path:
+    """Per-call output dir for audio-only renders.
+
+    Distinct from ``_default_output_dir()`` so an audio-only render and
+    a short render started seconds apart don't collide on the same
+    ``short-<ts>/`` folder, and the user can tell at a glance which
+    runs were audio-only.
+    """
+    base = Path.home() / ".creator-forge" / "output"
+    return base / f"audio-{int(time.time() * 1000)}"
+
+
+# ``edge-tts`` writes mp3, ``piper-tts`` writes wav. The route reflects
+# the actual format back in the response so the renderer doesn't have
+# to guess from the extension.
+_AUDIO_FORMAT_BY_PROVIDER: dict[str, Literal["mp3", "wav"]] = {
+    "edge-tts": "mp3",
+    "piper-tts": "wav",
+}
+
+
+class AudioOnlyRequest(BaseModel):
+    script: str = Field(..., min_length=1, description="Full narration script (single voice).")
+    tts_provider: str = Field(
+        DEFAULT_TTS_PROVIDER,
+        description=(
+            "TTS engine id. One of "
+            f"{list(KNOWN_TTS_PROVIDERS)}. Same semantics as /producer/short."
+        ),
+    )
+    voice: str = Field(
+        _DEFAULT_VOICE,
+        description=(
+            "Voice id. For edge-tts: short name like 'en-US-AriaNeural'. "
+            "For piper-tts: an .onnx voice short name or absolute path."
+        ),
+    )
+    output_dir: str | None = Field(
+        None,
+        description=(
+            "Where to write voice.mp3 / voice.wav / captions.srt. Defaults to "
+            "~/.creator-forge/output/audio-<ts>/."
+        ),
+    )
+    write_srt: bool = Field(
+        True,
+        description="Write a sibling captions.srt next to the audio file.",
+    )
+
+    _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
+    _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+
+class AudioOnlyResponse(BaseModel):
+    audio_path: str
+    audio_format: Literal["mp3", "wav"]
+    srt_path: str | None = None
+    duration_s: float = 0.0
+    voice: str
+    engine: str
+    captions_count: int = 0
+    caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+    output_dir: str
+    warnings: list[str] = []
+    notes: str = ""
+
+
+@router.post("/audio", response_model=AudioOnlyResponse)
+def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
+    """Render ``script`` to a TTS audio file (+ optional captions.srt).
+
+    Voiceover-first workflow: skip image/video compositing and just
+    emit the narration. Two stages, both robust-failure (warnings, no
+    500s) so a partial result still surfaces:
+
+    1. **TTS**: same adapter wiring as ``/producer/short``. Edge-TTS
+       writes ``voice.mp3``; Piper writes ``voice.wav``.
+    2. **Captions**: word boundaries first, sentence fallback when the
+       engine can't supply timing. Optionally serialised to
+       ``captions.srt``.
+    """
+    script = req.script.strip()
+    warnings: list[str] = []
+
+    _provider_key = (req.tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
+    if _provider_key == "edge-tts" and req.voice not in voice_short_names():
+        warnings.append(
+            f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
+        )
+
+    output_dir = (
+        Path(req.output_dir).expanduser() if req.output_dir else _default_audio_output_dir()
+    )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warnings.append(f"Could not create output_dir {output_dir}: {exc}")
+        return AudioOnlyResponse(
+            audio_path="",
+            audio_format=_AUDIO_FORMAT_BY_PROVIDER.get(_provider_key, "mp3"),
+            srt_path=None,
+            duration_s=0.0,
+            voice=req.voice,
+            engine=EdgeTTSAdapter.name,
+            captions_count=0,
+            caption_source="none",
+            output_dir=str(output_dir),
+            warnings=warnings,
+        )
+
+    # Edge-TTS writes mp3; Piper writes wav. We pass an ``.mp3`` path
+    # in for both; the Piper adapter rewrites the extension and
+    # returns the actual ``.wav`` path back via ``TTSResult.audio_path``
+    # — same convention as ``/producer/short``.
+    audio_path = output_dir / "voice.mp3"
+    srt_path = output_dir / "captions.srt"
+
+    audio_ok = False
+    duration_s = 0.0
+    captions: list[Caption] = []
+    caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+    engine_name = EdgeTTSAdapter.name
+
+    try:
+        adapter = _resolve_tts_adapter(req.tts_provider)
+        engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+        tts_result = adapter.synthesize_with_timing(
+            script, output_path=audio_path, voice=req.voice
+        )
+        if isinstance(getattr(tts_result, "audio_path", None), Path):
+            audio_path = tts_result.audio_path
+        audio_ok = audio_path.exists()
+        duration_s = float(tts_result.duration_seconds or 0.0)
+
+        if tts_result.word_boundaries:
+            try:
+                captions = group_word_boundaries(tts_result.word_boundaries)
+                caption_source = "word_boundaries"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Caption grouping failed: {type(exc).__name__}: {exc}")
+                captions = []
+
+        if not captions:
+            try:
+                captions = fallback_captions_from_text(
+                    script, audio_duration_s=duration_s or 0.0
+                )
+                caption_source = "sentence_fallback" if captions else "none"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Caption fallback failed: {type(exc).__name__}: {exc}")
+                captions = []
+                caption_source = "none"
+    except Exception as exc:  # noqa: BLE001 — boundary catch.
+        msg = f"TTS failed: {type(exc).__name__}: {exc}"
+        logger.warning(msg)
+        warnings.append(msg)
+
+    written_srt: Path | None = None
+    if req.write_srt and captions:
+        try:
+            srt_path.write_text(captions_to_srt(captions), encoding="utf-8")
+            written_srt = srt_path
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"SRT write failed: {type(exc).__name__}: {exc}")
+
+    audio_format: Literal["mp3", "wav"] = (
+        "wav" if audio_path.suffix.lower() == ".wav" else "mp3"
+    )
+
+    return AudioOnlyResponse(
+        audio_path=str(audio_path) if audio_ok else "",
+        audio_format=audio_format,
+        srt_path=str(written_srt) if written_srt else None,
+        duration_s=round(duration_s, 3),
+        voice=req.voice,
+        engine=engine_name,
+        captions_count=len(captions),
+        caption_source=caption_source,
+        output_dir=str(output_dir),
+        warnings=warnings,
+    )
+
+
 # ─── /producer/voices — curated Edge-TTS voice picker ───────────────────────
 
 

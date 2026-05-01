@@ -800,12 +800,48 @@
         }
     }
 
+    // PR-30 — selected output mode for the Compose panel. ``short`` is
+    // the original /producer/short flow (TTS + visuals + 9:16 mp4);
+    // ``audio`` is the new /producer/audio flow (TTS + captions only,
+    // no ffmpeg). Read by ``runComposeShort`` to route to the right
+    // IPC channel + payload.
+    function psCurrentMode() {
+        const sel = $('ps-mode');
+        const v = (sel && sel.value) || 'short';
+        return v === 'audio' ? 'audio' : 'short';
+    }
+
+    function psApplyComposeMode() {
+        const mode = psCurrentMode();
+        // Hide form fields tagged for a different mode (today only the
+        // Style picker is short-only — Voice / TTS provider / Output
+        // dir / Write captions / Script all apply in both modes).
+        const form = document.querySelector('[data-form="compose-short"]');
+        if (form) {
+            form.querySelectorAll('[data-ps-mode-show]').forEach((el) => {
+                const want = el.getAttribute('data-ps-mode-show');
+                el.style.display = (want === mode) ? '' : 'none';
+            });
+        }
+        // Reflect the active route in the panel header pill so the user
+        // can see at a glance which sidecar endpoint will be hit.
+        const pill = $('ps-mode-pill');
+        if (pill) pill.textContent = (mode === 'audio') ? '/producer/audio' : '/producer/short';
+        // Button label: 'Compose short' vs 'Compose audio'. The
+        // ``data-run="compose-short"`` attribute stays the same so the
+        // existing click delegate keeps working (the handler reads the
+        // mode at click time).
+        const btn = $('ps-run-btn');
+        if (btn) btn.textContent = (mode === 'audio') ? 'Compose audio' : 'Compose short';
+    }
+
     async function runComposeShort() {
         const script = asNonEmpty($('ps-script').value) || asNonEmpty($('sb-script').value);
         if (!script) {
             showError('ps-result', { status: 422, message: 'Paste a script (or copy from Storyboard above).' });
             return;
         }
+        const mode = psCurrentMode();
         const params = {
             script,
             // PR-23: tts_provider lets the user pick Piper (offline) over
@@ -813,11 +849,29 @@
             // value is empty / unknown so a stale UI is never a 4xx.
             tts_provider: ($('ps-tts-provider') && $('ps-tts-provider').value) || 'edge-tts',
             voice: $('ps-voice').value || 'en-US-AriaNeural',
-            style: $('ps-style').value || 'violet-pink',
             write_srt: !!$('ps-write-srt').checked,
         };
         const outDir = asNonEmpty($('ps-output-dir').value);
         if (outDir) params.output_dir = outDir;
+        if (mode === 'audio') {
+            // /producer/audio rejects unknown extra fields softly (it
+            // just ignores ``style``) but we drop it to keep the wire
+            // payload tight.
+            if (!api.producer || typeof api.producer.composeAudio !== 'function') {
+                showError('ps-result', { status: 0, message: 'electronAPI.producer.composeAudio is unavailable — desktop shell needs PR-30 preload.' });
+                return;
+            }
+            showLoading('ps-result', 'Rendering TTS audio (this usually takes a few seconds)...');
+            try {
+                const data = await api.producer.composeAudio(params);
+                renderComposeAudio(data);
+            } catch (err) {
+                showError('ps-result', err);
+            }
+            return;
+        }
+        // mode === 'short' — original flow, unchanged.
+        params.style = $('ps-style').value || 'violet-pink';
         showLoading('ps-result', 'Rendering TTS + captions + 9:16 mp4 (this can take 10–60s)...');
         try {
             const data = await api.producer.composeShort(params);
@@ -825,6 +879,39 @@
         } catch (err) {
             showError('ps-result', err);
         }
+    }
+
+    // PR-30 — render the /producer/audio response (no mp4 row, surfaces
+    // the actual audio_format reported by the sidecar so a Piper run
+    // shows ``voice.wav`` instead of ``voice.mp3``).
+    function renderComposeAudio(data) {
+        const d = data || {};
+        const fmt = (d.audio_format === 'wav') ? 'wav' : 'mp3';
+        let html = '';
+        html += `<div class="stats-row">
+            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
+            <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
+            <span>Engine<b>${escapeHtml(d.engine || '')}</b></span>
+            <span>Format<b>${escapeHtml(fmt)}</b></span>
+            <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
+            <span>Caption source<b>${escapeHtml(d.caption_source || 'none')}</b></span>
+        </div>`;
+        const paths = [
+            [`voice.${fmt}`, d.audio_path],
+            ['captions.srt', d.srt_path],
+        ].filter(([, p]) => !!p);
+        if (paths.length) {
+            html += `<div class="scene-card"><div class="scene-title">Output files</div>`;
+            paths.forEach(([label, p]) => {
+                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code></div>`;
+            });
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
+        } else {
+            html += renderEmpty('No audio produced. Check warnings — the TTS engine may be misconfigured.');
+        }
+        html += renderWarnings(d.warnings);
+        html += renderRawJson(d);
+        $('ps-result').innerHTML = html;
     }
 
     function renderComposeShort(data) {
@@ -2597,6 +2684,13 @@
         // attempt may hit the soft sentinel; retry alongside the status poll
         // so the picker fills in shortly after cold start.
         populateVoicePicker();
+        // PR-30 — paint the Compose panel's mode-aware visibility on
+        // first paint and again whenever the user flips the dropdown,
+        // so the Style picker hides / button label updates without
+        // requiring a panel rebuild.
+        psApplyComposeMode();
+        const psModeSel = $('ps-mode');
+        if (psModeSel) psModeSel.addEventListener('change', psApplyComposeMode);
         // PR-20D — paint the empty-state for the batch panel and
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.

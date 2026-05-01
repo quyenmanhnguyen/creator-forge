@@ -121,6 +121,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     producer: {
         composeShort: (params) => ipcRenderer.invoke('producer:composeShort', params),
+        // PR-30: TTS-only render (mp3/wav + optional srt), no mp4.
+        composeAudio: (params) => ipcRenderer.invoke('producer:composeAudio', params),
         listVoices: () => ipcRenderer.invoke('producer:listVoices'),
         listProviders: () => ipcRenderer.invoke('producer:listProviders'),
     },
