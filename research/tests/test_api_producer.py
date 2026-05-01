@@ -1775,7 +1775,7 @@ def test_assemble_accepts_documented_modes(monkeypatch, tmp_path, audio_mode, tr
             duration_s=12.0,
             scene_count=len(kwargs["scene_videos"]),
             audio_attached=kwargs["audio_mode"] == "replace",
-            captions_attached=kwargs["caption_mode"] == "soft",
+            captions_attached=kwargs["caption_mode"] in ("soft", "burn"),
             output_dir=str(kwargs["output_dir"]),
         )
 
@@ -1800,6 +1800,56 @@ def test_assemble_accepts_documented_modes(monkeypatch, tmp_path, audio_mode, tr
     assert captured["audio_mode"] == audio_mode
     assert captured["trim_to"] == trim_to
     assert captured["caption_mode"] == "soft"
+
+
+@pytest.mark.parametrize("caption_mode", ["soft", "none", "burn"])
+def test_assemble_accepts_documented_caption_modes(monkeypatch, tmp_path, caption_mode):
+    """PR-32 — the route must accept all three caption modes in the
+    Literal and forward them verbatim to the helper. Validates the
+    schema didn't drift after burn was added."""
+    from research.core.pixelle import assembler as assembler_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembler_mod.AssembleResult(
+            final_path=str(kwargs["output_dir"] / "final.mp4"),
+            duration_s=10.0,
+            scene_count=len(kwargs["scene_videos"]),
+            audio_attached=kwargs["audio_mode"] == "replace",
+            captions_attached=kwargs["caption_mode"] in ("soft", "burn"),
+            output_dir=str(kwargs["output_dir"]),
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+
+    out = tmp_path / "out"
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "srt_path": "/tmp/captions.srt",
+            "output_dir": str(out),
+            "caption_mode": caption_mode,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["caption_mode"] == caption_mode
+    assert r.json()["captions_attached"] is (caption_mode in ("soft", "burn"))
+
+
+def test_assemble_rejects_unknown_caption_mode():
+    """Defence-in-depth — if the renderer's whitelist drifts, the
+    backend's Literal must still reject the unknown value with 422."""
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "caption_mode": "explode",
+        },
+    )
+    assert r.status_code == 422, r.text
 
 
 def test_assemble_default_output_dir_uses_assembly_prefix(monkeypatch, tmp_path):

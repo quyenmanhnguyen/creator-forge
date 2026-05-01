@@ -206,6 +206,66 @@ def test_args_trim_to_audio_uses_shortest(tmp_path):
     assert "-t" not in args
 
 
+def test_args_caption_burn_appends_subtitles_filter_and_skips_srt_input(tmp_path):
+    """PR-32 — burn mode chains the ``subtitles=`` filter onto -vf and
+    must NOT add the srt as a separate -i input or emit -c:s mov_text.
+    """
+    list_p = tmp_path / "list.txt"
+    audio_p = _make_audio_file(tmp_path)
+    srt_p = _make_srt_file(tmp_path)
+    out_p = tmp_path / "final.mp4"
+
+    args = assembler._build_ffmpeg_args(
+        list_path=list_p, output_path=out_p,
+        audio=audio_p, srt=srt_p,
+        audio_mode="replace", caption_mode="burn",
+        trim_to="video", video_total_s=10.0,
+        burn_srt_relname="_subs.srt",
+    )
+
+    # SRT is consumed by the filter, not as an input.
+    assert str(srt_p) not in args
+    # -vf chain ends with subtitles=_subs.srt (relative — caller stages
+    # the file in cwd before invoking ffmpeg).
+    vf_idx = args.index("-vf")
+    vf_chain = args[vf_idx + 1]
+    assert vf_chain.endswith(",subtitles=_subs.srt"), (
+        f"-vf chain should end with subtitles filter, got: {vf_chain!r}"
+    )
+    # Burn does not need a soft-sub stream → no mov_text codec flag.
+    assert "-c:s" not in args
+    # 2:s:0 stream map is for soft subs; burn must not emit it.
+    assert "2:s:0" not in args
+    # The visible-input count is exactly 2 (concat list + audio).
+    assert sum(1 for a in args if a == "-i") == 2
+
+
+def test_args_caption_burn_without_relname_falls_back_to_no_filter(tmp_path):
+    """If the caller forgets to pass ``burn_srt_relname`` (e.g. SRT
+    staging failed) the args builder must NOT emit ``subtitles=`` or
+    add a soft-sub stream. The result is silent video, with the
+    caller responsible for surfacing the warning.
+    """
+    list_p = tmp_path / "list.txt"
+    audio_p = _make_audio_file(tmp_path)
+    srt_p = _make_srt_file(tmp_path)
+    out_p = tmp_path / "final.mp4"
+
+    args = assembler._build_ffmpeg_args(
+        list_path=list_p, output_path=out_p,
+        audio=audio_p, srt=srt_p,
+        audio_mode="replace", caption_mode="burn",
+        trim_to="video", video_total_s=10.0,
+        burn_srt_relname=None,  # staging failed
+    )
+
+    # Filter chain stays at the baseline scale/setsar/format.
+    vf_chain = args[args.index("-vf") + 1]
+    assert "subtitles=" not in vf_chain
+    # No soft-sub stream either.
+    assert "-c:s" not in args
+
+
 def test_args_caption_none_drops_srt_input(tmp_path):
     list_p = tmp_path / "list.txt"
     audio_p = _make_audio_file(tmp_path)
@@ -256,6 +316,108 @@ def test_assemble_no_usable_scenes_aborts_before_ffmpeg(tmp_path, monkeypatch):
     # ffmpeg should never have been spawned.
     assert all("ffmpeg" not in str(cmd[0]) for cmd in calls)
     assert any("No usable scene videos" in w for w in r.warnings)
+
+
+def test_assemble_burn_path_stages_srt_passes_cwd_and_cleans_up(tmp_path, monkeypatch):
+    """PR-32 — full-stack burn-in flow.
+
+    The assembler must:
+      1. Copy the user's SRT into ``output_dir/_subs.srt`` before
+         invoking ffmpeg (so the ``subtitles=`` filter resolves it
+         relative to cwd, dodging Windows path-colon escaping).
+      2. Invoke the runner with ``cwd=output_dir`` so the relative
+         filename actually works.
+      3. Build args containing ``subtitles=_subs.srt`` and *not*
+         containing the user's original SRT path.
+      4. Clean up the staged SRT after ffmpeg finishes.
+      5. Surface ``captions_attached=True`` on the result.
+    """
+    _force_binaries(monkeypatch)
+    scene1 = _make_scene_file(tmp_path, "shot1.mp4")
+    audio = _make_audio_file(tmp_path)
+    srt = _make_srt_file(tmp_path)
+    out_dir = tmp_path / "assembly"
+
+    captured: dict = {}
+
+    def runner(cmd, **kwargs):
+        binary = str(cmd[0])
+        if "ffprobe" in binary:
+            return _Proc(0, _ffprobe_stdout(3.0), "")
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = kwargs.get("cwd")
+        # While ffmpeg is "running" the staged srt must be on disk.
+        captured["staged_srt_present_during_run"] = (
+            (out_dir / "_subs.srt").is_file()
+        )
+        (out_dir / "final.mp4").write_bytes(b"y" * 300_000)
+        return _Proc(0, "", "")
+
+    r = assembler.assemble_final_mp4(
+        scene_videos=[str(scene1)],
+        audio_path=str(audio), srt_path=str(srt),
+        output_dir=out_dir,
+        caption_mode="burn",
+        runner=runner,
+    )
+
+    # Result surface.
+    assert r.final_path == str(out_dir / "final.mp4")
+    assert r.captions_attached is True
+    assert all("falling back to soft" not in w for w in r.warnings)
+
+    # Args contain the relative subtitles filter, not the absolute SRT.
+    cmd = captured["cmd"]
+    vf_chain = cmd[cmd.index("-vf") + 1]
+    assert vf_chain.endswith(",subtitles=_subs.srt")
+    assert str(srt) not in cmd
+    # No mov_text codec for burn.
+    assert "-c:s" not in cmd
+
+    # cwd was set to output_dir so the relative filename resolves.
+    assert captured["cwd"] == str(out_dir)
+
+    # Staged SRT existed mid-run, gone after.
+    assert captured["staged_srt_present_during_run"] is True
+    assert not (out_dir / "_subs.srt").exists(), (
+        "staged _subs.srt should be cleaned up after ffmpeg returns"
+    )
+
+
+def test_assemble_burn_without_srt_warns_and_falls_back_to_no_captions(
+    tmp_path, monkeypatch,
+):
+    """``caption_mode="burn"`` + missing ``srt_path`` is a user error
+    we surface, not silently downgrade."""
+    _force_binaries(monkeypatch)
+    scene1 = _make_scene_file(tmp_path, "shot1.mp4")
+    audio = _make_audio_file(tmp_path)
+    out_dir = tmp_path / "assembly"
+
+    def on_ffmpeg(cmd):
+        (out_dir / "final.mp4").write_bytes(b"y" * 300_000)
+        # No srt → no subtitles filter.
+        vf = cmd[cmd.index("-vf") + 1]
+        assert "subtitles=" not in vf
+
+    runner = _runner_factory(
+        ffprobe_stdout=_ffprobe_stdout(3.0),
+        on_ffmpeg=on_ffmpeg,
+    )
+
+    r = assembler.assemble_final_mp4(
+        scene_videos=[str(scene1)],
+        audio_path=str(audio), srt_path=None,
+        output_dir=out_dir,
+        caption_mode="burn",
+        runner=runner,
+    )
+
+    assert r.final_path == str(out_dir / "final.mp4")
+    assert r.captions_attached is False
+    assert any(
+        "caption_mode='burn' but no usable srt_path" in w for w in r.warnings
+    )
 
 
 def test_assemble_happy_path_writes_final_mp4(tmp_path, monkeypatch):

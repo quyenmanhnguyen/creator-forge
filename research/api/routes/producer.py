@@ -1069,7 +1069,9 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
 # /producer/audio) and per-scene mp4s (from the desktop's I2V/T2V
 # batch), this route stitches them into a final 9:16 mp4 in one ffmpeg
 # pass. Audio replace + trim-to-video + soft mov_text subs are the
-# defaults; burn-in subtitles + audio mixing are deferred to PR-32.
+# defaults. PR-32 adds caption_mode='burn' so the srt is rendered into
+# the video stream for platforms that don't honour mov_text. Audio
+# mixing (ducking the scene audio under narration) remains a follow-up.
 #
 # All heavy lifting lives in ``research.core.pixelle.assembler``; this
 # route is just request validation + adapter to the public response
@@ -1112,8 +1114,9 @@ class AssembleRequest(BaseModel):
         None,
         description=(
             "Optional path to a captions.srt. Attached as a soft subtitle "
-            "track (mov_text codec) when ``caption_mode='soft'`` (default). "
-            "Burn-in is not supported in PR-31."
+            "track (mov_text codec) when ``caption_mode='soft'`` (default), "
+            "or rendered into the video stream when ``caption_mode='burn'`` "
+            "(PR-32). Ignored when ``caption_mode='none'``."
         ),
     )
     output_dir: str | None = Field(
@@ -1139,11 +1142,18 @@ class AssembleRequest(BaseModel):
             "track length wins."
         ),
     )
-    caption_mode: Literal["soft", "none"] = Field(
+    caption_mode: Literal["soft", "none", "burn"] = Field(
         "soft",
         description=(
-            "'soft' attaches the srt as a mov_text subtitle track. 'none' "
-            "ignores ``srt_path``. Burn-in is deferred to PR-32."
+            "'soft' attaches the srt as a mov_text subtitle track (default). "
+            "'none' ignores ``srt_path``. 'burn' (PR-32) renders the srt "
+            "pixels into the video stream via ffmpeg's subtitles filter so "
+            "every player sees them — slower (re-encodes the visual track) "
+            "and depends on a usable font being resolvable by fontconfig at "
+            "runtime, but the captions are guaranteed to display on "
+            "platforms that ignore mov_text (e.g. some social uploads). "
+            "Falls back to 'soft' with a warning when the srt can't be "
+            "staged for burn (read-only output dir)."
         ),
     )
 

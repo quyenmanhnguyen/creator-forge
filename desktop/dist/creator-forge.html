@@ -1319,7 +1319,7 @@
                             <button type="button" class="secondary" data-run="assemble-pick-audio">Browse…</button>
                         </span>
                     </label>
-                    <label title="Optional path to captions.srt. When set with caption_mode='soft', attaches as a selectable subtitle track (mov_text). Burn-in is deferred to PR-32.">Captions (.srt, optional)
+                    <label title="Optional path to captions.srt. With caption_mode='soft', attaches as a selectable subtitle track (mov_text). With caption_mode='burn' (PR-32), the SRT is rendered into the video stream so every player sees them.">Captions (.srt, optional)
                         <span class="dir-picker-row">
                             <input id="pa-srt-path" type="text" placeholder="/abs/path/captions.srt" />
                             <button type="button" class="secondary" data-run="assemble-pick-srt">Browse…</button>
@@ -1343,9 +1343,10 @@
                             <option value="audio">audio (-shortest)</option>
                         </select>
                     </label>
-                    <label title="'soft' attaches the srt as a mov_text subtitle track. 'none' ignores the srt path. Burn-in is deferred to PR-32.">Caption mode
+                    <label title="'soft' attaches the srt as a selectable mov_text subtitle track (default — fast, no re-render). 'burn' renders the srt pixels into the video stream so every player sees them (PR-32 — slower, requires a font resolvable by fontconfig). 'none' drops the srt entirely.">Caption mode
                         <select id="pa-caption-mode">
                             <option value="soft" selected>soft (mov_text track)</option>
+                            <option value="burn">burn (rendered into video)</option>
                             <option value="none">none (drop srt)</option>
                         </select>
                     </label>
