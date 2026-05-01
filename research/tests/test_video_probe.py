@@ -94,6 +94,59 @@ def test_validate_happy_path_size_ok_and_ffprobe_ok(monkeypatch):
     assert r.codec == "h264"
     assert r.width == 720 and r.height == 1280
     assert r.duration_sec == pytest.approx(5.5)
+    # Video stream duration is reported alongside the container duration
+    # so callers (e.g. /producer/assemble) can distinguish the two when
+    # soft-subs extend the container.
+    assert r.video_stream_duration_sec == pytest.approx(5.5)
+
+
+def test_probe_separates_video_and_container_durations(monkeypatch):
+    """When format.duration > video_stream.duration (e.g. soft subs
+    keep the container open past the visual track), both fields must
+    be reported independently.
+    """
+    _force_ffprobe(monkeypatch, True)
+    long_container = json.dumps({
+        # Container says 11.18s — typical when mov_text SRT is longer.
+        "format": {"duration": "11.18"},
+        "streams": [
+            {"codec_type": "audio"},
+            {
+                "codec_type": "video", "codec_name": "h264",
+                "width": 720, "height": 1280, "duration": "10.000",
+            },
+        ],
+    })
+    r = video_probe.probe_video_file(
+        "/tmp/final.mp4",
+        runner=_fake_runner(stdout=long_container),
+        stat_fn=_stat_fn(200_000),
+    )
+    # Legacy field still reflects the container (back-compat).
+    assert r.duration_sec == pytest.approx(11.18)
+    # New field cleanly separates the visual length.
+    assert r.video_stream_duration_sec == pytest.approx(10.0)
+
+
+def test_probe_video_stream_duration_falls_back_when_only_format_known(monkeypatch):
+    """When ffprobe reports only ``format.duration`` (no per-stream
+    ``duration``), ``video_stream_duration_sec`` is ``None`` so callers
+    can detect the missing data and fall back to their own estimate.
+    """
+    _force_ffprobe(monkeypatch, True)
+    no_stream_dur = json.dumps({
+        "format": {"duration": "5.5"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "h264", "width": 720, "height": 1280},
+        ],
+    })
+    r = video_probe.probe_video_file(
+        "/tmp/x.mp4",
+        runner=_fake_runner(stdout=no_stream_dur),
+        stat_fn=_stat_fn(200_000),
+    )
+    assert r.duration_sec == pytest.approx(5.5)
+    assert r.video_stream_duration_sec is None
 
 
 def test_validate_size_below_floor_fails(monkeypatch):
