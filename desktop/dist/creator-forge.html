@@ -1243,12 +1243,18 @@
             </div>
 
             <div class="panel" data-form="compose-short">
-                <h2>Compose short <span class="pill">/producer/short</span></h2>
+                <h2>Compose <span class="pill" id="ps-mode-pill">/producer/short</span></h2>
                 <div class="desc">
                     TTS → captions → 9:16 mp4. Reuses the script above (or paste a different one).
                     Edge-TTS voice + placeholder gradient background; AI per-scene visuals land in PR-A3+.
                 </div>
                 <div class="form-grid">
+                    <label title="Audio-only mode skips ffmpeg/moviepy entirely — TTS writes voice.mp3 (or .wav) and an optional captions.srt, no mp4. Useful for voiceover-first workflows where you want the audio first, then build visuals later.">Output mode
+                        <select id="ps-mode">
+                            <option value="short" selected>Full short (TTS + visuals + 9:16 mp4)</option>
+                            <option value="audio">Audio only (TTS → MP3/WAV)</option>
+                        </select>
+                    </label>
                     <label title="Edge-TTS = online (Microsoft, free, requires internet). Piper-TTS = local / offline (~25MB per voice; install `pip install piper-tts` and place a voice .onnx under ~/.creator-forge/piper-voices/).">TTS provider
                         <select id="ps-tts-provider">
                             <option value="edge-tts" selected>edge-tts (online · default)</option>
@@ -1262,7 +1268,7 @@
                             <option value="vi_VN-vais1000-medium">vi_VN-vais1000-medium (piper-tts)</option>
                         </select>
                     </label>
-                    <label>Style
+                    <label data-ps-mode-show="short" title="Background gradient for the 9:16 mp4 — only used in 'Full short' mode.">Style
                         <select id="ps-style">
                             <option value="violet-pink">violet-pink</option>
                             <option value="sunset">sunset</option>
@@ -1286,7 +1292,7 @@
                 </div>
                 <div class="actions">
                     <button class="ghost" data-action="copy-script-from-storyboard">Copy script from above</button>
-                    <button class="primary" data-run="compose-short">Compose short</button>
+                    <button class="primary" id="ps-run-btn" data-run="compose-short">Compose short</button>
                 </div>
                 <div class="result" id="ps-result"></div>
             </div>

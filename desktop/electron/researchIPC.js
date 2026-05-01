@@ -71,6 +71,10 @@ const CHANNELS = {
     'storyboard:variantPrompts':  { method: 'POST', path: '/producer/variant_prompts' },
 
     'producer:composeShort':      { method: 'POST', path: '/producer/short' },
+    // PR-30: voiceover-first workflow — TTS + optional SRT, no ffmpeg
+    // compose. Request shape is a strict subset of /producer/short
+    // (no style / scene_assets / aspect / visual_provider).
+    'producer:composeAudio':      { method: 'POST', path: '/producer/audio' },
     'producer:listVoices':        { method: 'GET',  path: '/producer/voices' },
     'producer:listProviders':     { method: 'GET',  path: '/producer/providers' },
 };
