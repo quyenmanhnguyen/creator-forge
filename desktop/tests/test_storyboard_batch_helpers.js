@@ -898,6 +898,102 @@ test("PR-27: applyBatchProgress / applyBatchResult silently no-op for deleted ro
     assert.strictEqual(rows.find((r) => r.row_id === "1#1"), undefined);
 });
 
+// ─── PR-29: filterRowsBySelection + improved fallback reason ───────────
+
+test("PR-29: filterRowsBySelection — keeps only rows whose row_id is in the selection set", () => {
+    const rows = pr27Rows();
+    // pr27Rows() yields scene 1 variants 0/1, scene 2 variants 0/1.
+    const selected = new Set(["1#0", "2#1"]);
+    const out = helpers.filterRowsBySelection(rows, selected);
+    assert.strictEqual(out.length, 2);
+    assert.deepStrictEqual(out.map((r) => r.row_id).sort(), ["1#0", "2#1"]);
+    // Order from the input is preserved.
+    assert.strictEqual(out[0].row_id, "1#0");
+    assert.strictEqual(out[1].row_id, "2#1");
+});
+
+test("PR-29: filterRowsBySelection — empty selection returns empty array (no fallback to generate-all)", () => {
+    const rows = pr27Rows();
+    assert.deepStrictEqual(helpers.filterRowsBySelection(rows, new Set()), []);
+    assert.deepStrictEqual(helpers.filterRowsBySelection(rows, []), []);
+    assert.deepStrictEqual(helpers.filterRowsBySelection(rows, null), []);
+    assert.deepStrictEqual(helpers.filterRowsBySelection(rows, undefined), []);
+});
+
+test("PR-29: filterRowsBySelection — accepts any iterable, not just Set", () => {
+    const rows = pr27Rows();
+    // Plain array.
+    const fromArray = helpers.filterRowsBySelection(rows, ["1#0"]);
+    assert.deepStrictEqual(fromArray.map((r) => r.row_id), ["1#0"]);
+    // Numbers stringify so a row_id of "5" matches a selection of 5.
+    const numericRows = [
+        { row_id: "5", scene_id: 5, status: "pending", prompt: "p", reason: null, attempts: 0, progress: 0 },
+    ];
+    const fromNumbers = helpers.filterRowsBySelection(numericRows, [5]);
+    assert.deepStrictEqual(fromNumbers.map((r) => r.row_id), ["5"]);
+});
+
+test("PR-29: filterRowsBySelection — does not mutate inputs", () => {
+    const rows = pr27Rows();
+    const before = JSON.stringify(rows);
+    const selected = new Set(["1#0"]);
+    const beforeSel = new Set(selected);
+    helpers.filterRowsBySelection(rows, selected);
+    assert.strictEqual(JSON.stringify(rows), before);
+    assert.deepStrictEqual([...selected].sort(), [...beforeSel].sort());
+});
+
+test("PR-29: filterRowsBySelection — defends against null rows / missing row_id", () => {
+    assert.deepStrictEqual(helpers.filterRowsBySelection(null, ["x"]), []);
+    assert.deepStrictEqual(helpers.filterRowsBySelection(undefined, ["x"]), []);
+    assert.deepStrictEqual(
+        helpers.filterRowsBySelection([null, { row_id: null }, { row_id: "ok" }], ["ok"]),
+        [{ row_id: "ok" }],
+    );
+});
+
+test("PR-29: filterRowsBySelection composes with planImageGenerate (selection-aware Generate)", () => {
+    const rows = pr27Rows();
+    const selected = new Set(["1#0", "2#0"]);
+    const subset = helpers.filterRowsBySelection(rows, selected);
+    const plan = helpers.planImageGenerate(subset);
+    // Both selected rows have prompts, so both land in the plan.
+    assert.strictEqual(plan.prompts.length, 2);
+    assert.deepStrictEqual(plan.rowIds.sort(), ["1#0", "2#0"]);
+});
+
+test("PR-29: mapBatchResponse — image with no error gives an actionable hint instead of 'no usable image'", () => {
+    const resp = { success: true, results: [{ savedFiles: [], success: false, error: null }] };
+    const mapped = helpers.mapBatchResponse(resp, [42], "image", ["42#0"]);
+    assert.strictEqual(mapped.length, 1);
+    assert.strictEqual(mapped[0].status, "fallback");
+    assert.match(mapped[0].reason, /moderated|rate-limited|session/i,
+        "fallback reason must point the user at the likely cause");
+    assert.notStrictEqual(mapped[0].reason, "no usable image",
+        "the unhelpful default must not survive when the IPC didn't supply an error");
+});
+
+test("PR-29: mapBatchResponse — explicit error from the service still wins over the default hint", () => {
+    const resp = { success: true, results: [{ savedFiles: [], success: false, error: "403 Forbidden — re-login failed" }] };
+    const mapped = helpers.mapBatchResponse(resp, [1], "image", ["1#0"]);
+    assert.strictEqual(mapped[0].status, "fallback");
+    assert.strictEqual(mapped[0].reason, "403 Forbidden — re-login failed");
+});
+
+test("PR-29: mapBatchResponse — empty/whitespace error string falls back to the actionable hint", () => {
+    const resp = { success: true, results: [{ savedFiles: [], success: false, error: "   " }] };
+    const mapped = helpers.mapBatchResponse(resp, [1], "image", ["1#0"]);
+    assert.match(mapped[0].reason, /moderated|rate-limited|session/i);
+});
+
+test("PR-29: mapBatchResponse — video with no error gets its own actionable hint", () => {
+    const resp = { success: true, results: [{ success: false, error: null }] };
+    const mapped = helpers.mapBatchResponse(resp, [7], "video", ["7#0"]);
+    assert.strictEqual(mapped[0].status, "fallback");
+    assert.match(mapped[0].reason, /moderated|rate-limited|session|no output/i);
+    assert.notStrictEqual(mapped[0].reason, "video generation failed");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

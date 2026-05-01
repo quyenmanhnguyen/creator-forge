@@ -461,7 +461,15 @@
                 if (imagePath) {
                     out.push({ scene_id: sid, row_id: rid, status: "generated", image_path: imagePath, bytes });
                 } else {
-                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason: r.error || "no usable image" });
+                    // PR-29: when the IPC didn't surface a specific
+                    // `error` (common for moderated / blank Grok
+                    // responses where the chat stream just returns no
+                    // image bytes), give the user something concrete to
+                    // act on instead of the unhelpful "no usable image".
+                    const reason = (typeof r.error === "string" && r.error.trim())
+                        ? r.error
+                        : "Grok returned no images — possibly moderated, rate-limited, or session expired (check Login panel)";
+                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason });
                 }
             } else {
                 if (r.success && (r.videoPath || r.savedFile)) {
@@ -473,7 +481,15 @@
                         bytes: typeof r.bytes === "number" ? r.bytes : 0,
                     });
                 } else {
-                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason: r.error || "video generation failed" });
+                    // PR-29: same rationale as the image branch — surface
+                    // an actionable hint when the service didn't pass an
+                    // explicit error string. Most silent failures are
+                    // session / rate-limit / Veo-moderation, all of
+                    // which the user can recover from manually.
+                    const reason = (typeof r.error === "string" && r.error.trim())
+                        ? r.error
+                        : "Video generation produced no output — possibly moderated, rate-limited, or session expired (check Login panel)";
+                    out.push({ scene_id: sid, row_id: rid, status: "fallback", reason });
                 }
             }
         }
@@ -749,6 +765,25 @@
     }
 
     /**
+     * PR-29 — filter ``rows`` down to those whose ``row_id`` is in
+     * ``selected`` (Set<string> or any iterable). Order is preserved
+     * from the input. Used by ``sbbGenerateImages`` /
+     * ``sbbGenerateVideos`` to scope a Generate run to the user's
+     * checkbox selection (and by the per-row Retry handler with a
+     * synthetic single-id set). Pure — never mutates inputs.
+     */
+    function filterRowsBySelection(rows, selected) {
+        if (!Array.isArray(rows)) return [];
+        const sel = new Set();
+        for (const k of (selected || [])) sel.add(String(k));
+        if (!sel.size) return [];
+        return rows.filter((r) => {
+            if (!r || r.row_id == null) return false;
+            return sel.has(String(r.row_id));
+        });
+    }
+
+    /**
      * Summary of a selection — used by the bulk-action toolbar to
      * decide which buttons to enable. ``editable`` / ``deletable`` are
      * counts of rows in the selection that pass canEditRow /
@@ -825,6 +860,8 @@
         updatePromptForRow,
         applyVariantPrompts,
         summarizeSelection,
+        // PR-29 — selection-aware Generate + per-row Retry.
+        filterRowsBySelection,
         // PR-28 — reference image upload (global + per-row override).
         resolveRefsForRow,
         partitionRowsByRefs,
