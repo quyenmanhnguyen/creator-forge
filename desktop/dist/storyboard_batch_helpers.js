@@ -857,6 +857,37 @@
         return `${sceneLabel} · variant ${idx + 1}/${total}`;
     }
 
+    /**
+     * PR-B — count image rows that have settled with a usable
+     * ``image_path`` on disk. Used by ``sbbUpdateGenerateButton`` to
+     * gate the Video panel's I2V Generate button: I2V mode requires
+     * at least one settled image to use as the reference frame, so
+     * the button stays disabled until ``countSettledImageRows > 0``.
+     *
+     * "Settled with a usable path" matches the existing renderer
+     * logic in ``pairImagePathsForI2V``: ``status`` must be
+     * ``generated`` or ``retried`` (the retry-success terminal),
+     * AND ``image_path`` must be a non-empty string. Any other
+     * status (``pending``, ``generating``, ``fallback``, ``skipped``)
+     * counts as 0 — even if a stale ``image_path`` is hanging around
+     * from a previous attempt.
+     *
+     * Pure / null-safe — returns 0 for any non-array input rather
+     * than throwing, so the gate logic can call it on every repaint
+     * including before the table is initialized.
+     */
+    function countSettledImageRows(rows) {
+        if (!Array.isArray(rows)) return 0;
+        let n = 0;
+        for (const r of rows) {
+            if (!r || typeof r !== "object") continue;
+            if (r.status !== "generated" && r.status !== "retried") continue;
+            if (typeof r.image_path !== "string" || !r.image_path) continue;
+            n += 1;
+        }
+        return n;
+    }
+
     const api = {
         initImageRowsFromScenes,
         initVideoRowsFromScenes,
@@ -889,6 +920,9 @@
         resolveRefsForRow,
         partitionRowsByRefs,
         planRefImageGenerate,
+        // PR-B — Image→Video gate: count of settled image rows with
+        // a usable image_path on disk.
+        countSettledImageRows,
     };
 
     if (typeof module === "object" && module.exports) module.exports = api;
