@@ -555,6 +555,151 @@ function makeFakeChild() {
         }
     });
 
+    await test('restart: spawned-mode (wasExternal=false) but child kill leaves port bound → killByPort still fires (PR-67 windows)', async () => {
+        // The bug we're fixing in PR-67: on Windows, after Electron
+        // spawns its own uvicorn child and the user clicks Save, the
+        // child.kill('SIGTERM') in stop() sometimes leaves the listening
+        // socket bound to the dying python interpreter for >5s — the
+        // observed user case had `wasExternal=false` (full app restart
+        // with all stale processes pre-killed by the user). PR-66's
+        // killByPort fallback was gated on wasExternal so it never
+        // fired for this case. PR-67 removes the gate.
+
+        // Track the "zombie listener" that survives stop() and the new
+        // spawn target; the fake healthz server we open in spawnStub.
+        const servers = [];
+        const spawnCalls = [];
+        const spawnStub = (cmd, args, opts) => {
+            spawnCalls.push({ cmd, args, env: opts && opts.env });
+            const portIdx = args.indexOf('--port');
+            const port = portIdx >= 0 ? Number(args[portIdx + 1]) : null;
+            if (port) {
+                const s = http.createServer((req, res) => {
+                    if (req.url === '/healthz') {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(SERVICE_TAG_BODY);
+                    } else {
+                        res.writeHead(404).end();
+                    }
+                });
+                s.listen(port, '127.0.0.1');
+                servers.push(s);
+            }
+            return makeFakeChild();
+        };
+
+        // Find a free port up front so we can stand up the "zombie"
+        // listener at the same port after our fake child exits.
+        const freePort = await new Promise((resolve) => {
+            const s = http.createServer();
+            s.listen(0, '127.0.0.1', () => {
+                const p = s.address().port;
+                s.close(() => resolve(p));
+            });
+        });
+
+        // killByPort stub: returns a fake pid; process.kill stub closes
+        // the zombie listener so the second waitForPortFree sees an
+        // empty port (mimicking a real SIGKILL releasing the socket).
+        let zombieListener = null;
+        const spawnSyncStub = (cmd, args) => {
+            if (cmd === 'lsof' || cmd === 'netstat') {
+                return cmd === 'lsof'
+                    ? { stdout: '88888\n', stderr: '', status: 0 }
+                    : {
+                        stdout:
+                            '  TCP    127.0.0.1:' + freePort + '         0.0.0.0:0              LISTENING       88888\r\n',
+                        stderr: '', status: 0,
+                    };
+            }
+            if (cmd === 'taskkill') {
+                try { zombieListener && zombieListener.close(); } catch (_) {}
+                zombieListener = null;
+                return { stdout: 'SUCCESS', stderr: '', status: 0 };
+            }
+            return { stdout: '', stderr: '', status: 0 };
+        };
+        const origKill = process.kill;
+        process.kill = (pid, sig) => {
+            if (pid === 88888 && sig === 'SIGKILL') {
+                try { zombieListener && zombieListener.close(); } catch (_) {}
+                zombieListener = null;
+            }
+        };
+
+        const sidecar = freshSidecar({ spawnStub, spawnSyncStub });
+        // Test the windows code path explicitly — the PR-67 user is on
+        // Windows so we want netstat + taskkill verified end-to-end.
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+        const logs = [];
+        sidecar.setLogSink((...args) => logs.push(args.map(String).join(' ')));
+
+        try {
+            const fakeRoot = path.join(__dirname, '..', '..');
+
+            // 1. start() — port empty, spawn fires, fake healthz comes
+            //    up. externalReuse=false. wasExternal in restart() will
+            //    therefore be false (the case PR-66 missed).
+            await sidecar.start({
+                port: freePort, repoRoot: fakeRoot,
+                extraEnv: { DEEPSEEK_API_KEY: 'old' },
+            });
+            assert.strictEqual(spawnCalls.length, 1, 'start() spawned');
+
+            // 2. Simulate the Windows-specific bug: stop() runs (child
+            //    kill returns), but a "zombie listener" still answers
+            //    /healthz on the same port. waitForPortFree(3s) will
+            //    time out → killByPort fires → process.kill stub closes
+            //    the zombie → second waitForPortFree returns true →
+            //    fresh spawn applies the new extraEnv.
+            zombieListener = http.createServer((req, res) => {
+                if (req.url === '/healthz') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(SERVICE_TAG_BODY);
+                } else {
+                    res.writeHead(404).end();
+                }
+            });
+            await new Promise((resolve) => {
+                // The first server (from spawnStub) is still bound to
+                // freePort — close it before standing up the zombie so
+                // the zombie can take over without EADDRINUSE.
+                const first = servers.shift();
+                first.close(() => {
+                    zombieListener.listen(freePort, '127.0.0.1', resolve);
+                });
+            });
+
+            const newEnv = { DEEPSEEK_API_KEY: 'sk-windows-fix' };
+            await sidecar.restart({ port: freePort, repoRoot: fakeRoot, extraEnv: newEnv });
+
+            // No /admin/shutdown was POSTed — wasExternal was false.
+            // killByPort fired regardless thanks to PR-67.
+            const freedLog = logs.find((l) => l.includes('freed :' + freePort) &&
+                                              l.includes('stop() killed our child'));
+            assert.ok(
+                freedLog,
+                'expected log line crediting killByPort with freeing the spawned-mode port. logs=\n' + logs.join('\n'),
+            );
+
+            assert.strictEqual(spawnCalls.length, 2, 'restart() spawned a fresh child');
+            assert.strictEqual(
+                spawnCalls[1].env.DEEPSEEK_API_KEY,
+                'sk-windows-fix',
+                'fresh spawn applies new extraEnv',
+            );
+        } finally {
+            process.kill = origKill;
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+            try { zombieListener && zombieListener.close(); } catch (_) {}
+            for (const s of servers) {
+                try { s.close(); } catch (_) {}
+            }
+        }
+    });
+
     console.log(`\n  ${passed} passed, ${failed} failed`);
     if (failed > 0) process.exit(1);
 })();

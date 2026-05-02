@@ -513,18 +513,30 @@ async function restart(opts = {}) {
     // Whether we spawned or external-reused the previous instance, the
     // OS may need a beat to release the listening socket before our
     // fresh uvicorn can bind it. Block until /healthz stops responding.
-    let freed = await waitForPortFree(portToUse, 5000);
-    if (!freed && wasExternal) {
-        // Common cause: the externally-launched sidecar is a stale
-        // pre-PR-65 build, so /admin/shutdown 404'd above and the
-        // process is still alive. Fall back to OS-level kill so the
-        // user doesn't have to open a terminal and chase the PID.
+    let freed = await waitForPortFree(portToUse, 3000);
+    if (!freed) {
+        // Multiple causes possible:
+        //  • externalReuse + stale pre-PR-65 sidecar 404'd /admin/shutdown
+        //    above, so the process is still alive (PR-66 original case).
+        //  • Electron-spawned child where stop()'s SIGTERM/SIGKILL didn't
+        //    actually free the listening socket — observed on Windows
+        //    where TerminateProcess can leave the python interpreter's
+        //    socket bound for a beat, or where a uvicorn worker / asyncio
+        //    handle survives the parent kill (PR-67 user report).
+        //  • Some unrelated process took :PORT in the gap between our
+        //    kill and the probe (rare, but the kill-by-port surfaces
+        //    a clearer error than "port still busy").
+        // Either way the safe action is to ask the OS who owns the port
+        // and SIGKILL it — we'd rather kill an unrelated holder than
+        // leave the user stuck with "port busy" after every Save.
         const kill = killByPort(portToUse);
         if (kill.killed) {
             logSink(
-                'killed stale sidecar on :' + portToUse +
+                'freed :' + portToUse +
                 ' via OS-level kill (pids=' + kill.pids.join(',') + ') — ' +
-                '/admin/shutdown didn\'t apply (likely an older build).',
+                (wasExternal
+                    ? '/admin/shutdown didn\'t apply (likely an older build).'
+                    : 'stop() killed our child but the socket was still bound.'),
             );
         } else if (kill.error) {
             logSink(
