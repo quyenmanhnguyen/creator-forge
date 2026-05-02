@@ -12,6 +12,7 @@
 const { spawn: realSpawn, spawnSync: realSpawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const path = require('path');
 
 // Test hook — only the offline test suite calls __setSpawnImpl /
@@ -341,16 +342,71 @@ function killByPort(port) {
 }
 
 /**
- * Wait until `:port` no longer answers `/healthz`. Used after
- * `sendShutdown()` (or after stop()'s SIGINT) to give the OS a beat
- * to release the listening socket before a fresh spawn binds it.
- * Returns true if the port freed within `timeoutMs`, else false.
+ * Try to bind a temporary listener to `:port` on 127.0.0.1. Returns
+ * `{ free: true }` if the bind succeeds (port is actually free at the
+ * TCP layer), or `{ free: false, code }` with the OS-level error code
+ * (`EADDRINUSE` is the typical one) if the bind is rejected.
+ *
+ * Used by `waitForPortFree()` instead of an HTTP `/healthz` probe.
+ * The `/healthz` check answers a different question — "is anyone
+ * speaking HTTP on this port?" — and goes silent the instant the old
+ * sidecar process dies, even though the kernel can still hold the
+ * listening socket in TIME_WAIT for several more seconds on Windows.
+ * That gap was the root cause of `WinError 10048: error while attempting
+ * to bind on address ('127.0.0.1', 5050)` after a Save+restart cycle:
+ * `waitForPortFree` returned `true` prematurely, `start()` spawned a
+ * fresh uvicorn, uvicorn's `bind()` lost the race, and the user was
+ * stuck with the new 90s healthz timeout firing on a sidecar that
+ * could never actually come up.
+ *
+ * A real bind probe gives the kernel-truth answer: if uvicorn would
+ * fail to bind RIGHT NOW, our `net.createServer().listen(port)` will
+ * fail too. Once our probe binds successfully we close it immediately
+ * — the spawned uvicorn binds the same `(host, port)` tuple a few ms
+ * later. There's a tiny race where another process could grab the
+ * port in that gap; that's the same race uvicorn already lives with
+ * and `start()`'s timeout error surfaces it cleanly.
+ */
+function canBindPort(port) {
+    return new Promise((resolve) => {
+        const server = net.createServer();
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            try {
+                server.close(() => resolve(result));
+            } catch (_) {
+                resolve(result);
+            }
+        };
+        server.once('error', (err) => {
+            finish({ free: false, code: (err && err.code) || 'UNKNOWN' });
+        });
+        // Bind to 127.0.0.1 specifically (not 0.0.0.0) — uvicorn binds
+        // to 127.0.0.1 too, so this matches the same address space.
+        server.listen(port, '127.0.0.1', () => {
+            finish({ free: true });
+        });
+    });
+}
+
+/**
+ * Wait until `:port` is actually free at the TCP bind layer. Used
+ * after `sendShutdown()` (or after stop()'s tree-kill) to give the
+ * OS time to release the listening socket before a fresh spawn binds
+ * it. Returns true if the port freed within `timeoutMs`, else false.
+ *
+ * History: prior to PR-72 this used `probe()` (HTTP /healthz check),
+ * which returned `true` the moment the python process died — even
+ * while the kernel still held the TCP socket in TIME_WAIT, leading
+ * to `WinError 10048` on the subsequent uvicorn spawn.
  */
 async function waitForPortFree(port, timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-        const { ok } = await probe(port);
-        if (!ok) return true;
+        const { free } = await canBindPort(port);
+        if (free) return true;
         await new Promise((r) => setTimeout(r, 200));
     }
     return false;
@@ -677,6 +733,7 @@ module.exports = {
     isDevModeBundleSupported,
     pythonExecutable,
     sendShutdown,
+    canBindPort,
     waitForPortFree,
     waitForHealth,
     healthTimeoutMs,
