@@ -64,7 +64,7 @@ from research.core.pixelle.video_probe import (
     MIN_USABLE_VIDEO_BYTES,
     validate_video_output,
 )
-from research.core.pixelle.voices import VOICES, voice_short_names
+from research.core.pixelle.voices import VOICES, voice_short_names, voices_for_provider
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -671,7 +671,7 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     # it to Piper would emit a misleading "passing through to Edge-TTS"
     # warning on every Piper call.
     _provider_key = (req.tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
-    if _provider_key == "edge-tts" and req.voice not in voice_short_names():
+    if _provider_key == "edge-tts" and req.voice not in voice_short_names("edge-tts"):
         warnings.append(
             f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
         )
@@ -1022,7 +1022,7 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     warnings: list[str] = []
 
     _provider_key = (req.tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
-    if _provider_key == "edge-tts" and req.voice not in voice_short_names():
+    if _provider_key == "edge-tts" and req.voice not in voice_short_names("edge-tts"):
         warnings.append(
             f"Voice {req.voice!r} is not in the curated list — passing through to Edge-TTS as-is."
         )
@@ -1290,18 +1290,56 @@ class VoiceOut(BaseModel):
     label: str
     locale: str
     gender: str
+    # Provider tag — "edge-tts" or "piper-tts". Lets the renderer
+    # filter voices by the currently-selected TTS provider dropdown
+    # so a Piper voice id never gets fed into edge-tts (or vice
+    # versa). Default mirrors the legacy single-provider behaviour.
+    provider: str = "edge-tts"
 
 
 @router.get("/voices")
-def voices() -> dict:
+def voices(provider: str | None = None) -> dict:
+    """List curated TTS voices, optionally filtered by provider.
+
+    ``GET /producer/voices``
+        Returns every curated voice with its ``provider`` tag.
+        ``default`` is the curated edge-tts default so the legacy
+        renderer stays compatible.
+
+    ``GET /producer/voices?provider=piper-tts``
+        Filters down to Piper voices and returns the first Piper
+        voice as ``default``. An unknown / mistyped provider yields
+        an empty list with ``default=None`` and a warning so the UI
+        can render a friendly empty-state.
+    """
+    requested = (provider or "").strip().lower() or None
+    selection = voices_for_provider(requested)
+    warnings: list[str] = []
+    if requested and not selection:
+        warnings.append(
+            f"Unknown TTS provider '{requested}' — returning empty list."
+        )
+    default_short = (
+        _DEFAULT_VOICE if requested in (None, "edge-tts")
+        else (selection[0].short_name if selection else None)
+    )
     return {
         "voices": [
-            VoiceOut(short_name=v.short_name, label=v.label, locale=v.locale, gender=v.gender).model_dump()
-            for v in VOICES
+            VoiceOut(
+                short_name=v.short_name,
+                label=v.label,
+                locale=v.locale,
+                gender=v.gender,
+                provider=v.provider,
+            ).model_dump()
+            for v in selection
         ],
-        "default": _DEFAULT_VOICE,
+        "default": default_short,
+        "provider": requested,
+        "providers": sorted({v.provider for v in VOICES}),
         "ready": True,
-        "notes": "Curated Edge-TTS voice list from research.core.pixelle.voices.",
+        "warnings": warnings,
+        "notes": "Curated edge-tts + piper-tts voice list from research.core.pixelle.voices.",
     }
 
 

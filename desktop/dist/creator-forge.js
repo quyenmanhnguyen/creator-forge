@@ -881,6 +881,76 @@
     }
 
     // ─── Producer: compose short (TTS + captions + ffmpeg) ─────────────────
+    // Voice picker state. Cached across polls so flipping the TTS provider
+    // dropdown can re-filter without another /producer/voices round-trip.
+    // The sidecar returns provider-tagged voices so a single GET feeds
+    // both edge-tts + piper-tts segments of the dropdown.
+    const psVoiceState = {
+        // Full unfiltered list from /producer/voices (provider-tagged).
+        allVoices: [],
+        // Sidecar's preferred default (edge-tts default by design).
+        sidecarDefault: '',
+        // Set true once the first successful GET completes — until then
+        // the picker keeps its static HTML placeholder option.
+        loaded: false,
+    };
+
+    function _psVoicePickerHelpers() {
+        return (typeof window !== 'undefined' && window.ComposeVoicePickerHelpers) || null;
+    }
+
+    function _psCurrentProvider() {
+        const sel = $('ps-tts-provider');
+        return (sel && sel.value) ? sel.value : 'edge-tts';
+    }
+
+    /**
+     * Re-paint the voice <select> from the cache, filtered by the
+     * currently-selected provider. Pure-DOM — no IPC. Called by the
+     * 5-second poll, by the provider dropdown's ``change`` handler,
+     * and once on cold start by ``populateVoicePicker``.
+     */
+    function _psRepaintVoiceOptions() {
+        const sel = $('ps-voice');
+        if (!sel) return;
+        const helpers = _psVoicePickerHelpers();
+        const provider = _psCurrentProvider();
+        const all = psVoiceState.allVoices;
+        const current = sel.value;
+        const sidecarDefault = psVoiceState.sidecarDefault;
+        let filtered;
+        let selected;
+        if (helpers) {
+            const result = helpers.selectVoicesForProvider({
+                allVoices: all,
+                provider,
+                current,
+                sidecarDefault,
+            });
+            filtered = result.voices;
+            selected = result.selected;
+        } else {
+            // Helpers script missing (test harness / stripped HTML) —
+            // fall back to no-filter behaviour so the picker still works.
+            filtered = Array.isArray(all) ? all : [];
+            selected = current || sidecarDefault || (filtered[0] && filtered[0].short_name) || '';
+        }
+        if (!filtered.length) {
+            // Empty list (unknown provider). Render a friendly placeholder
+            // so the user sees why the dropdown is empty, instead of a
+            // mysterious silent select.
+            sel.innerHTML = `<option value="" disabled selected>no voices for ${escapeHtml(provider)}</option>`;
+            return;
+        }
+        sel.innerHTML = filtered
+            .map((v) => `<option value="${escapeHtml(v.short_name)}">${escapeHtml(v.label || v.short_name)}</option>`)
+            .join('');
+        if (selected) {
+            const found = Array.from(sel.options).find((o) => o.value === selected);
+            if (found) sel.value = selected;
+        }
+    }
+
     async function populateVoicePicker() {
         if (!api) return;
         const sel = $('ps-voice');
@@ -888,13 +958,10 @@
         try {
             const data = await api.producer.listVoices();
             if (!data || !Array.isArray(data.voices) || !data.voices.length) return;
-            const current = sel.value;
-            sel.innerHTML = data.voices
-                .map((v) => `<option value="${escapeHtml(v.short_name)}">${escapeHtml(v.label || v.short_name)}</option>`)
-                .join('');
-            const desired = current || data.default || data.voices[0].short_name;
-            const found = Array.from(sel.options).find((o) => o.value === desired);
-            if (found) sel.value = desired;
+            psVoiceState.allVoices = data.voices.slice();
+            psVoiceState.sidecarDefault = data.default || '';
+            psVoiceState.loaded = true;
+            _psRepaintVoiceOptions();
         } catch (err) {
             // Sidecar not ready yet — listVoices returns the soft sentinel.
             // Leave the static placeholder option alone; refresh on next call.
@@ -3217,6 +3284,14 @@
         psApplyComposeMode();
         const psModeSel = $('ps-mode');
         if (psModeSel) psModeSel.addEventListener('change', psApplyComposeMode);
+        // P2 — TTS provider × Voice picker coupling. When the user
+        // flips the provider dropdown, repaint the voice <select>
+        // from the cached /producer/voices payload, filtered to
+        // that provider's voices. Avoids the pre-PR foot-gun where
+        // ``provider=piper-tts`` + ``voice=en-US-AriaNeural`` (an
+        // edge-tts id) would silently mis-route on the sidecar.
+        const psProviderSel = $('ps-tts-provider');
+        if (psProviderSel) psProviderSel.addEventListener('change', _psRepaintVoiceOptions);
         // PR-20D — paint the empty-state for the batch panel and
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.
