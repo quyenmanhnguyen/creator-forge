@@ -11,6 +11,7 @@ const AutoUpdaterService = require('./autoUpdater');
 // keeps working without it; only the Research/Studio/Producer tabs go dark.
 const researchSidecar = require('./researchSidecar');
 const researchIPC = require('./researchIPC');
+const keysStore = require('./keysStore');
 
 const runtimeLogDir = (() => {
     try {
@@ -267,8 +268,52 @@ app.whenReady().then(async () => {
     // starts returning a port and the same handlers proxy through normally.
     researchSidecar.setLogSink((level, ...args) => writeRuntimeLog(level || 'info', '[research]', ...args));
     researchIPC.register({ ipcMain, sidecar: researchSidecar });
+
+    // creator-forge: persistent API-keys store. The renderer's Settings ⚙
+    // dialog reads / writes this file via the keys:get / keys:save IPC
+    // channels below; the sidecar inherits the saved values via spawn env
+    // on every start() / restart() call.
+    const keysStoreDir = (() => {
+        try {
+            return app.getPath('userData');
+        } catch (_) {
+            // Tests / pre-ready edge cases — fall back to the runtime log
+            // dir so we never throw when computing the path.
+            return runtimeLogDir;
+        }
+    })();
+    ipcMain.handle('keys:get', () => {
+        try {
+            return { ok: true, keys: keysStore.loadKeys({ storeDir: keysStoreDir }) };
+        } catch (err) {
+            return { ok: false, error: err && err.message ? err.message : String(err) };
+        }
+    });
+    ipcMain.handle('keys:save', async (_event, payload) => {
+        try {
+            const written = keysStore.saveKeys(payload || {}, { storeDir: keysStoreDir });
+            // Restart the sidecar so the freshly-saved keys are picked up
+            // by uvicorn's env. Best-effort — surface failures back to the
+            // renderer but still report the file write as successful so
+            // the user knows their keys are persisted even if the restart
+            // bounces (the next manual launch will pick them up).
+            let restarted = false;
+            let restartError = null;
+            try {
+                await researchSidecar.restart({ extraEnv: keysStore.getKeyEnv({ storeDir: keysStoreDir }) });
+                restarted = true;
+            } catch (err) {
+                restartError = err && err.message ? err.message : String(err);
+                console.error('[keys:save] sidecar restart failed:', restartError);
+            }
+            return { ok: true, keys: written, restarted, restartError };
+        } catch (err) {
+            return { ok: false, error: err && err.message ? err.message : String(err) };
+        }
+    });
+
     researchSidecar
-        .start()
+        .start({ extraEnv: keysStore.getKeyEnv({ storeDir: keysStoreDir }) })
         .then(({ port }) => {
             console.log(`[research] sidecar ready on :${port}`);
         })
