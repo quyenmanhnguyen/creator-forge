@@ -50,20 +50,30 @@ function loadConfig(configPath = CONFIG_PATH, fsImpl = fs) {
 
 /**
  * Map a Node `process.platform` + `process.arch` pair to the bundle key
- * used in `python-runtime.config.json` (e.g. "win32-x64", "linux-x64").
+ * used in `python-runtime.config.json`. Supported values:
+ *   - "win32-x64", "linux-x64" — pinned since PR-19.
+ *   - "darwin-x64", "darwin-arm64" — pinned in PR-62 (installer parity).
  *
- * `darwin-*` deliberately throws — PR-19 is Windows-only, mac/linux are
- * follow-ups. Linux is allowed because the Devin VM smoke-tests against
- * it.
+ * Other platform/arch combinations throw — bump the config + this
+ * mapping in lockstep when adding support.
  */
 function platformKey(platform, arch) {
-    if (arch !== 'x64') {
-        throw new Error(`unsupported arch: ${arch} (PR-19 only supports x64)`);
+    if (platform === 'win32') {
+        if (arch !== 'x64') {
+            throw new Error(`unsupported arch for win32: ${arch} (only x64 is pinned)`);
+        }
+        return 'win32-x64';
     }
-    if (platform === 'win32') return 'win32-x64';
-    if (platform === 'linux') return 'linux-x64';
+    if (platform === 'linux') {
+        if (arch !== 'x64') {
+            throw new Error(`unsupported arch for linux: ${arch} (only x64 is pinned)`);
+        }
+        return 'linux-x64';
+    }
     if (platform === 'darwin') {
-        throw new Error('darwin (macOS) bundled Python is a follow-up PR — out of scope for PR-19.');
+        if (arch === 'x64') return 'darwin-x64';
+        if (arch === 'arm64') return 'darwin-arm64';
+        throw new Error(`unsupported arch for darwin: ${arch} (only x64 and arm64 are pinned)`);
     }
     throw new Error(`unsupported platform: ${platform}`);
 }

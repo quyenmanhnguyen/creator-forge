@@ -20,9 +20,12 @@
     "dist": "electron-builder",
     "prefetch:python:win": "node ../scripts/fetch-python-runtime.js --platform win32 --arch x64",
     "prefetch:python:linux": "node ../scripts/fetch-python-runtime.js --platform linux --arch x64",
+    "prefetch:python:mac:x64": "node ../scripts/fetch-python-runtime.js --platform darwin --arch x64",
+    "prefetch:python:mac:arm64": "node ../scripts/fetch-python-runtime.js --platform darwin --arch arm64",
+    "prefetch:python:mac": "npm run prefetch:python:mac:x64 && npm run prefetch:python:mac:arm64",
     "dist:win": "npm run prefetch:python:win && electron-builder --win --x64",
-    "dist:mac": "electron-builder --mac --x64 --arm64",
-    "dist:linux": "electron-builder --linux --x64"
+    "dist:mac": "npm run prefetch:python:mac && electron-builder --mac --x64 --arm64",
+    "dist:linux": "npm run prefetch:python:linux && electron-builder --linux --x64"
   },
   "dependencies": {
     "axios": "^1.13.5",
