@@ -122,6 +122,8 @@ jobs:
           # path-mismatch fix.
           node desktop/tests/test_account_service_path.js
           node desktop/tests/test_auth_service_relogin_path.js
+          # PR-47: work-stealing multi-account fan-out scheduler.
+          node desktop/tests/test_multi_account_fan_out.js
 
       - name: Syntax check standalone E2E scripts
         run: |
