@@ -529,7 +529,32 @@
         .sbb-section-actions {
             display: flex;
             gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
         }
+        /* HF-5: small status pill that lives in the section header next to the
+           Generate / Retry / Open-folder buttons. Empty by default; populated
+           by sbbUpdateProgressBadge('image' | 'video') as rows settle. */
+        .sbb-progress-badge {
+            font-size: 12px;
+            color: var(--text-dim);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+        .sbb-progress-badge:empty { display: none; }
+        /* HF-5 #1: icon-only output-folder picker. Compact replacement for the
+           full label + textbox + Browse button combo. */
+        button.icon-btn {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            line-height: 1;
+        }
+        button.icon-btn:hover { background: var(--panel2); }
         /* PR-27 — bulk-action toolbar + checkbox column + inline-edit
            textarea. The toolbar floats above each table; buttons share
            the same .secondary look as the rest of the panel so the new
@@ -1467,52 +1492,62 @@
                             <option value="16:9">16:9</option>
                         </select>
                     </label>
-                    <label title="Where to save mp4 / png assets. Leave blank to auto-create ~/.creator-forge/output/batch-<timestamp>/ on your machine.">Output folder (optional)
-                        <span class="dir-picker-row">
-                            <input id="sbb-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/batch-<timestamp>/" />
-                            <button type="button" class="secondary" data-run="storyboard-batch-pick-output">Browse…</button>
-                        </span>
-                    </label>
-                    <label>Video mode
+                    <!-- HF-5 #1: Output folder collapsed to icon-only 📁 button in actions row.
+                         Hidden <input> preserves the path for sbbPickOutputDir + downstream reads. -->
+                    <input id="sbb-output-dir" type="hidden" />
+                    <!-- HF-5 #2: Video mode hidden — defaults to i2v, Pro mode is always on. -->
+                    <label style="display:none">Video mode
                         <select id="sbb-video-mode">
-                            <option value="i2v">I2V (image-to-video; needs hero image)</option>
+                            <option value="i2v" selected>I2V (image-to-video; needs hero image)</option>
                             <option value="t2v">T2V (text-to-video; prompt-only)</option>
                         </select>
                     </label>
-                    <label title="Number of image variants to generate per scene. Defaults to 4 — pick the best afterwards. Forced to 1 when Pro mode is on.">Images per scene
+                    <!-- HF-5 #3: Images per scene hidden — Pro mode forces it to 1. -->
+                    <label style="display:none" title="Number of image variants to generate per scene. Forced to 1 when Pro mode is on (always-on).">Images per scene
                         <select id="sbb-images-per-scene">
-                            <option value="1">1</option>
+                            <option value="1" selected>1</option>
                             <option value="2">2</option>
                             <option value="3">3</option>
-                            <option value="4" selected>4 (default)</option>
+                            <option value="4">4</option>
                             <option value="6">6</option>
                             <option value="8">8</option>
                         </select>
                     </label>
-                    <label title="Number of video variants to generate per scene. Auto-syncs to Images per scene so each video flows from its matching image variant.">Videos per scene
+                    <!-- HF-5 #4: Videos per scene hidden — hardcoded to 1 in JS.
+                         Element preserved so existing code paths still resolve a count. -->
+                    <label style="display:none">Videos per scene
                         <select id="sbb-videos-per-scene">
-                            <option value="1">1</option>
-                            <option value="2">2</option>
-                            <option value="3">3</option>
-                            <option value="4" selected>4 (auto-sync)</option>
-                            <option value="6">6</option>
-                            <option value="8">8</option>
+                            <option value="1" selected>1</option>
                         </select>
                     </label>
-                    <label class="sbb-pro-label" title="Use Grok's Pro / Quality mode (1 high-quality image per variant). Off = Speed mode (returns 2-4 quick images side-by-side).">
-                        <input type="checkbox" id="sbb-pro-mode" />
+                    <!-- HF-5 #4 (replacement): Duration picker maps to config.videoLength downstream. -->
+                    <label title="Length of each generated video. 6s = standard short clip; 10s = longer i2v / t2v shot.">Duration
+                        <select id="sbb-duration">
+                            <option value="6" selected>6s</option>
+                            <option value="10">10s</option>
+                        </select>
+                    </label>
+                    <!-- HF-5 #5: Pro mode hidden — programmatically checked = true on init. -->
+                    <label class="sbb-pro-label" style="display:none">
+                        <input type="checkbox" id="sbb-pro-mode" checked />
                         <span>Chất lượng cao (Pro mode — 1 ảnh chất lượng / variant)</span>
                     </label>
                 </div>
                 <div class="actions">
                     <button class="primary" data-run="storyboard-batch-fill">Auto-fill from scenes</button>
                     <button class="secondary" data-run="storyboard-batch-clear">Clear</button>
+                    <!-- HF-5 #1: icon-only output-folder picker. Title is updated dynamically with current path. -->
+                    <button type="button" class="icon-btn" data-run="storyboard-batch-pick-output" id="sbb-output-dir-picker" aria-label="Choose output folder" title="Choose output folder (auto-create ~/.creator-forge/output/batch-<timestamp>/ if blank)">📁</button>
                 </div>
                 <div class="sbb-section">
                     <div class="sbb-section-head">
                         <h3>Image batch</h3>
                         <div class="sbb-section-actions">
+                            <!-- HF-5 #6: progress badge + retry-failed + open-folder live in the section header. -->
+                            <span class="sbb-progress-badge" id="sbb-image-progress-badge" aria-live="polite"></span>
                             <button class="primary" data-run="storyboard-batch-image">Generate images</button>
+                            <button type="button" class="secondary" data-run="storyboard-batch-retry-failed-image" title="Re-run only the rows that landed in the fallback bucket on the last batch.">🔄 Retry failed</button>
+                            <button type="button" class="secondary" data-run="storyboard-batch-open-output-image" title="Open the output folder for this batch in the OS file browser.">📂 Open folder</button>
                         </div>
                     </div>
                     <div class="result" id="sbb-image-result"></div>
@@ -1521,7 +1556,10 @@
                     <div class="sbb-section-head">
                         <h3>Video batch</h3>
                         <div class="sbb-section-actions">
+                            <span class="sbb-progress-badge" id="sbb-video-progress-badge" aria-live="polite"></span>
                             <button class="primary" data-run="storyboard-batch-video">Generate videos</button>
+                            <button type="button" class="secondary" data-run="storyboard-batch-retry-failed-video" title="Re-run only the rows that landed in the fallback bucket on the last batch.">🔄 Retry failed</button>
+                            <button type="button" class="secondary" data-run="storyboard-batch-open-output-video" title="Open the output folder for this batch in the OS file browser.">📂 Open folder</button>
                         </div>
                     </div>
                     <div class="result" id="sbb-video-result"></div>
