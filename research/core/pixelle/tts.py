@@ -115,10 +115,13 @@ class EdgeTTSAdapter:
         import edge_tts
 
         communicate = edge_tts.Communicate(
-            text=text,
-            voice=voice,
-            rate=self.rate,
-            volume=self.volume,
+            **_communicate_kwargs(
+                edge_tts.Communicate,
+                text=text,
+                voice=voice,
+                rate=self.rate,
+                volume=self.volume,
+            )
         )
         boundaries: list[WordBoundary] = []
         with output_path.open("wb") as fh:
@@ -129,6 +132,32 @@ class EdgeTTSAdapter:
                 elif kind == "WordBoundary":
                     boundaries.append(WordBoundary.from_edge_tts(chunk))
         return boundaries
+
+
+def _communicate_kwargs(
+    communicate_cls: type, *, text: str, voice: str, rate: str, volume: str
+) -> dict:
+    """Build kwargs for ``edge_tts.Communicate`` requesting WordBoundary timing.
+
+    edge-tts v7.0+ added a ``boundary`` parameter to ``Communicate`` that
+    defaults to ``"SentenceBoundary"`` — meaning the WebSocket service
+    only emits sentence-level chunks and our ``async for`` loop sees no
+    ``WordBoundary`` events. v6.x emitted WordBoundary by default and
+    has no ``boundary`` keyword.
+
+    We reflect on the constructor signature so the same code path works
+    on either major version.
+    """
+    import inspect
+
+    kwargs: dict = {"text": text, "voice": voice, "rate": rate, "volume": volume}
+    try:
+        params = inspect.signature(communicate_cls).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "boundary" in params:
+        kwargs["boundary"] = "WordBoundary"
+    return kwargs
 
 
 def _probe_mp3_duration(path: Path) -> float:
