@@ -23,6 +23,10 @@ let child = null;
 let actualPort = null;
 let externalReuse = false;
 let logSink = (...args) => console.log('[research-sidecar]', ...args);
+// Cached args from the most recent successful start({...}) so restart()
+// can re-use the same port + extraEnv without forcing every caller to
+// re-supply them. Reset by stop().
+let lastStartOpts = null;
 
 function setLogSink(fn) {
     if (typeof fn === 'function') logSink = fn;
@@ -171,8 +175,15 @@ async function waitForHealth(port) {
  * with the creator-forge.research service tag, we reuse that external sidecar
  * instead of spawning another uvicorn (which would race-fail on the busy port
  * and leave actualPort=null after the spawned child exits).
+ *
+ * `extraEnv` is merged into the spawned child's `env` after `process.env` and
+ * before `PYTHONUNBUFFERED`, so callers can inject API keys (DEEPSEEK_API_KEY,
+ * YOUTUBE_API_KEY, etc.) loaded from `keysStore.js` without polluting the
+ * desktop process's own env. Pass an empty object / undefined when there is
+ * nothing extra to inject.
  */
-async function start({ port = DEFAULT_PORT, repoRoot } = {}) {
+async function start({ port = DEFAULT_PORT, repoRoot, extraEnv } = {}) {
+    lastStartOpts = { port, repoRoot, extraEnv };
     if (actualPort) return { port: actualPort };
 
     const pre = await probe(port);
@@ -215,9 +226,21 @@ async function start({ port = DEFAULT_PORT, repoRoot } = {}) {
     const args = ['-m', 'uvicorn', 'research.api.main:app', '--host', '127.0.0.1', '--port', String(port)];
     logSink('spawn', python, args.join(' '), 'cwd=', root);
 
+    const spawnEnv = { ...process.env };
+    if (extraEnv && typeof extraEnv === 'object') {
+        for (const [k, v] of Object.entries(extraEnv)) {
+            // Skip undefined / non-string values so we never write
+            // "undefined" into the env (Python would see the literal
+            // string and the friendly "key not set" warnings would
+            // never fire).
+            if (typeof v === 'string' && v.length > 0) spawnEnv[k] = v;
+        }
+    }
+    spawnEnv.PYTHONUNBUFFERED = '1';
+
     child = spawn(python, args, {
         cwd: root,
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        env: spawnEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -243,10 +266,12 @@ async function stop() {
     if (externalReuse) {
         externalReuse = false;
         actualPort = null;
+        lastStartOpts = null;
         return;
     }
     if (!child) {
         actualPort = null;
+        lastStartOpts = null;
         return;
     }
     const proc = child;
@@ -273,9 +298,24 @@ function getPort() {
     return actualPort;
 }
 
+/**
+ * Restart the sidecar with a fresh `extraEnv`. Used by the API-keys
+ * Settings dialog so saved keys take effect without forcing the user
+ * to relaunch the app. Falls back to the cached startup options when
+ * the caller does not pass new ones, so a bare `restart()` rebounces
+ * the existing process with whatever env it had on the previous
+ * successful boot.
+ */
+async function restart(opts = {}) {
+    const merged = Object.assign({}, lastStartOpts || {}, opts || {});
+    await stop();
+    return start(merged);
+}
+
 module.exports = {
     start,
     stop,
+    restart,
     getPort,
     setLogSink,
     // Exported for offline tests (test_research_sidecar_lookup.js):

@@ -65,6 +65,133 @@
     // "still booting" (cold start, first ~5–30s) from "went down later".
     let sidecarHasBeenReady = false;
 
+    // ─── API keys modal ────────────────────────────────────────────────
+    // Persistent store at app.getPath('userData')/api-keys.json driven by
+    // the keys:get / keys:save IPC channels (preload.js → main.js →
+    // electron/keysStore.js). The renderer treats the stored values as
+    // opaque — it never logs them and never echoes them back over IPC
+    // unless the user explicitly hits Save.
+    //
+    // UX:
+    //   - ⚙ button in the header opens the modal at any time.
+    //   - Closing via × / backdrop / Cancel / Esc discards edits.
+    //   - On first launch with no keys saved, the modal auto-opens so
+    //     end-users running a packaged build don't need a .env file.
+    //   - Save persists, kicks the sidecar, and refreshes the pill so
+    //     the user sees `sidecar ready` come back within a few seconds.
+    const KEY_INPUT_IDS = {
+        DEEPSEEK_API_KEY: 'key-deepseek',
+        YOUTUBE_API_KEY: 'key-youtube',
+        GOOGLE_API_KEY: 'key-google',
+        RUNNINGHUB_API_KEY: 'key-runninghub',
+    };
+
+    function setKeysStatus(text, level) {
+        const el = $('cf-keys-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.classList.remove('ok', 'err');
+        if (level) el.classList.add(level);
+    }
+
+    function openApiKeysModal() {
+        const modal = $('api-keys-modal');
+        if (!modal) return;
+        modal.hidden = false;
+        // Focus the first empty input so keyboard users can start typing
+        // straight away (helpful on first launch when all fields blank).
+        const firstEmpty = Object.values(KEY_INPUT_IDS)
+            .map((id) => $(id))
+            .find((el) => el && !el.value);
+        if (firstEmpty && typeof firstEmpty.focus === 'function') {
+            try { firstEmpty.focus(); } catch (_) { /* jsdom safety */ }
+        }
+    }
+
+    function closeApiKeysModal() {
+        const modal = $('api-keys-modal');
+        if (modal) modal.hidden = true;
+    }
+
+    async function loadApiKeysIntoForm() {
+        if (!api || !api.keys || typeof api.keys.get !== 'function') return { keys: {} };
+        try {
+            const resp = await api.keys.get();
+            const keys = (resp && resp.keys && typeof resp.keys === 'object') ? resp.keys : {};
+            for (const [envName, inputId] of Object.entries(KEY_INPUT_IDS)) {
+                const el = $(inputId);
+                if (!el) continue;
+                el.value = typeof keys[envName] === 'string' ? keys[envName] : '';
+            }
+            return { keys };
+        } catch (_) {
+            return { keys: {} };
+        }
+    }
+
+    async function saveApiKeysFromForm() {
+        if (!api || !api.keys || typeof api.keys.save !== 'function') {
+            setKeysStatus('electronAPI.keys not available', 'err');
+            return;
+        }
+        const payload = {};
+        for (const [envName, inputId] of Object.entries(KEY_INPUT_IDS)) {
+            const el = $(inputId);
+            if (!el) continue;
+            const v = (el.value || '').trim();
+            if (v) payload[envName] = v;
+        }
+        const saveBtn = $('cf-keys-save');
+        if (saveBtn) saveBtn.disabled = true;
+        setKeysStatus('Saving + restarting sidecar...');
+        try {
+            const resp = await api.keys.save(payload);
+            if (!resp || resp.ok !== true) {
+                setKeysStatus('Save failed: ' + ((resp && resp.error) || 'unknown'), 'err');
+                return;
+            }
+            if (resp.restarted === false) {
+                setKeysStatus(
+                    'Keys saved, sidecar restart failed: ' + (resp.restartError || 'unknown'),
+                    'err',
+                );
+            } else {
+                setKeysStatus('Saved. Sidecar restarted.', 'ok');
+            }
+            // Bounce the pill so the user sees the "starting sidecar..."
+            // → "sidecar ready" transition matching the actual restart.
+            refreshSidecarStatus();
+            // Auto-close after a short pause so users can read the status.
+            setTimeout(() => {
+                if ($('cf-keys-status')?.classList.contains('ok')) closeApiKeysModal();
+            }, 900);
+        } catch (err) {
+            setKeysStatus('Save error: ' + (err && err.message ? err.message : String(err)), 'err');
+        } finally {
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    }
+
+    function setupApiKeysModal() {
+        const modal = $('api-keys-modal');
+        if (!modal) return;
+        const openBtn = $('api-keys-btn');
+        if (openBtn) openBtn.addEventListener('click', openApiKeysModal);
+        // Delegated close handlers — × button, backdrop, Cancel button.
+        modal.addEventListener('click', (e) => {
+            const target = e.target;
+            if (target && target.dataset && target.dataset.closeModal === 'api-keys-modal') {
+                closeApiKeysModal();
+            }
+        });
+        // Esc key closes the modal when it's open.
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !modal.hidden) closeApiKeysModal();
+        });
+        const saveBtn = $('cf-keys-save');
+        if (saveBtn) saveBtn.addEventListener('click', saveApiKeysFromForm);
+    }
+
     async function refreshSidecarStatus() {
         const dot = $('sidecar-dot');
         const label = $('sidecar-label');
@@ -3205,6 +3332,19 @@
     document.addEventListener('DOMContentLoaded', () => {
         setupTabs();
         setupRunButtons();
+        setupApiKeysModal();
+        // On first launch (no keys saved yet) auto-open the modal so the
+        // user is prompted to enter keys instead of silently hitting
+        // "DEEPSEEK_API_KEY not set" warnings on every Studio call.
+        loadApiKeysIntoForm()
+            .then((result) => {
+                const keys = result && result.keys ? result.keys : {};
+                const hasAnyKey = Object.values(keys).some(
+                    (v) => typeof v === 'string' && v.length > 0,
+                );
+                if (!hasAnyKey) openApiKeysModal();
+            })
+            .catch(() => { /* non-fatal — pill / status will surface errors */ });
         refreshSidecarStatus();
         // Populate the voice picker once the sidecar is reachable. The first
         // attempt may hit the soft sentinel; retry alongside the status poll

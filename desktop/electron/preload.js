@@ -31,6 +31,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
         openManualLogin: (params) => ipcRenderer.invoke('auth:openManualLogin', params),
     },
 
+    // creator-forge: persistent API-keys store. Reads / writes a JSON file
+    // under app.getPath('userData')/api-keys.json (see keysStore.js).
+    // Saving triggers a sidecar restart so newly-set keys take effect
+    // without an app relaunch — the renderer should refresh the sidecar
+    // pill afterwards.
+    keys: {
+        get: () => ipcRenderer.invoke('keys:get'),
+        save: (payload) => ipcRenderer.invoke('keys:save', payload),
+    },
+
     license: {
         check: () => ipcRenderer.invoke('license:check'),
         validate: (key) => ipcRenderer.invoke('license:validate', key),
