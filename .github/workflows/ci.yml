@@ -119,6 +119,10 @@ jobs:
           # PR-64: /admin/shutdown + restart() flow that fixes
           # DEEPSEEK_API_KEY-not-set-after-Save bug (externalReuse path).
           node desktop/tests/test_research_sidecar_restart.js
+          # 90s default healthz timeout + env override + stderr-tail
+          # surfacing — covers the "did not become healthy in 30000ms"
+          # report from the API-keys Save flow on slow Windows boxes.
+          node desktop/tests/test_research_sidecar_health_timeout.js
           node desktop/tests/test_fetch_python_runtime.js
           node desktop/tests/test_video_validation_helpers.js
           node desktop/tests/test_auth_session_status.js
