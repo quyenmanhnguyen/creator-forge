@@ -21,6 +21,10 @@ const Module = require('module');
 // the service does not pull in puppeteer / electron paths.
 const origResolve = Module._resolveFilename;
 const origLoad = Module._load;
+// CI does not run ``npm install`` for the offline test job, so we
+// short-circuit module loads for every package that the service
+// transitively pulls in at require time but that this test never
+// touches.
 const stubs = new Map();
 Module._resolveFilename = function (request, parent) {
     if (stubs.has(request)) return request;
@@ -28,6 +32,22 @@ Module._resolveFilename = function (request, parent) {
 };
 Module._load = function (request, parent, ...rest) {
     if (stubs.has(request)) return stubs.get(request);
+    if (request === 'puppeteer-extra') {
+        return { use: () => {}, launch: async () => null };
+    }
+    if (request === 'puppeteer-extra-plugin-stealth') {
+        return () => ({});
+    }
+    if (request === 'electron') {
+        return { app: { getPath: () => '/tmp/creator-forge-test' } };
+    }
+    if (request === 'axios') {
+        const stub = () => {};
+        stub.get = stub.post = stub.put = stub.delete = stub.request = async () => ({ status: 0, data: '' });
+        stub.create = () => stub;
+        stub.defaults = { headers: {} };
+        return stub;
+    }
     return origLoad.apply(this, [request, parent, ...rest]);
 };
 
