@@ -982,7 +982,13 @@ ipcMain.handle('image:cancel', async () => {
     return { success: true };
 });
 
-// IPC Handlers - Video generation (parallel multi-account)
+// IPC Handlers - Video generation (work-stealing multi-account fan-out)
+//
+// Phase 2 of PR-47: extends the shared work queue from image
+// generation to video generation. Replaces the old static-slice
+// fan-out with the same scheduler image:generate already uses
+// (``multi_account_fan_out.js``). See the image:generate handler
+// above for the rationale; semantics here are identical.
 ipcMain.handle('video:generate', async (_, params) => {
     try {
         const { prompts, config, startIdx: baseIdx = 0 } = params;
@@ -993,8 +999,11 @@ ipcMain.handle('video:generate', async (_, params) => {
         }
 
         console.log('[Main] Video config received:', JSON.stringify(config, null, 2));
-        const perAcc = Math.ceil(prompts.length / sessions.length);
-        sendLog('info', `Generating ${prompts.length} videos across ${sessions.length} account(s) (${perAcc} per acc)...`);
+        const perSessionConcurrency = Math.max(1, Math.min(
+            Number(config?.batchSize) || PROCESSING_CONFIG.BATCH_SIZE || 5,
+            5,
+        ));
+        sendLog('info', `Generating ${prompts.length} videos across ${sessions.length} account(s) — work-stealing queue, up to ${perSessionConcurrency}/account = up to ${sessions.length * perSessionConcurrency} parallel...`);
 
         // Refresh cookies from live browser sessions before generating
         await AuthService.refreshAllCookies();
@@ -1002,33 +1011,74 @@ ipcMain.handle('video:generate', async (_, params) => {
         // Reset re-login counters for fresh batch
         AuthService.resetAllReloginCounts();
 
-        const allResults = await Promise.all(
-            sessions.map(async (session, ai) => {
-                const sliceStart = ai * perAcc;
-                const sliceEnd = Math.min((ai + 1) * perAcc, prompts.length);
-                const myPrompts = prompts.slice(sliceStart, sliceEnd);
-                if (myPrompts.length === 0) return [];
-                const nameStart = baseIdx + sliceStart;
-                sendLog('info', `[Acc${session.accIdx + 1}] 📋 Assigned prompts #${nameStart + 1}→#${nameStart + myPrompts.length} (${myPrompts.length} items)`);
-                console.log(`[Main] [Acc${session.accIdx + 1}] Processing ${myPrompts.length} videos...`);
-                return VideoService.generateBatch(myPrompts, session, config, (prompt, progress, result, localIdx) => {
-                    const globalIdx = nameStart + (localIdx != null ? localIdx : 0);
-                    sendProgress('video', { prompt, progress, result, globalIdx });
-                    if (result) {
-                        const status = result.success ? 'success' : 'error';
-                        const label = result.title || prompt.substring(0, 50);
-                        const errorMsg = result.error ? ` | Error: ${result.error}` : '';
-                        sendLog(status, `[Acc${session.accIdx + 1}] Video ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
-                    }
-                }, nameStart).then(batchResults => batchResults.map(r => ({ ...r, globalIdx: nameStart + (r.localIdx != null ? r.localIdx : 0) })));
-            })
-        );
+        const fanOut = await runFanOut({
+            sessions,
+            items: prompts,
+            perSessionConcurrency,
+            workerStaggerMs: 75,
+            onProgress: ({ idx, result, session }) => {
+                if (!result) return;
+                const globalIdx = baseIdx + idx;
+                sendProgress('video', {
+                    prompt: result.prompt,
+                    progress: 100,
+                    result,
+                    globalIdx,
+                });
+                const status = result.success ? 'success' : 'error';
+                const label = result.title || (result.prompt || '').substring(0, 50);
+                const errorMsg = result.error ? ` | Error: ${result.error}` : '';
+                sendLog(status, `[Acc${session.accIdx + 1}] Video ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
+            },
+            processOne: async (prompt, session, idx) => {
+                const globalNum = baseIdx + idx + 1;
+                const onItemProgress = (p, progress, result, _localIdx) => {
+                    // Per-item live progress (0..99). Final 100% +
+                    // result are emitted from the fan-out's onProgress
+                    // hook above so we don't double-fire.
+                    if (result) return;
+                    sendProgress('video', {
+                        prompt: p,
+                        progress,
+                        result: null,
+                        globalIdx: baseIdx + idx,
+                    });
+                };
+                return VideoService._processOneBatchItem(
+                    prompt,
+                    session,
+                    config || {},
+                    onItemProgress,
+                    idx,
+                    globalNum,
+                    prompts.length,
+                );
+            },
+        });
 
-        const results = allResults.flat();
+        const results = fanOut.results.map((r, idx) => {
+            const globalIdx = baseIdx + idx;
+            if (!r) {
+                return {
+                    prompt: prompts[idx],
+                    localIdx: idx,
+                    globalIdx,
+                    success: false,
+                    error: 'no session available',
+                    savedFile: null,
+                    outputPath: null,
+                };
+            }
+            return { ...r, globalIdx };
+        });
+
         const successCount = results.filter(r => r.success).length;
-        sendLog('info', `Video generation complete: ${successCount}/${results.length} successful`);
+        const perSessionLog = fanOut.stats.perSession
+            .map(s => `Acc${(s.accIdx ?? -1) + 1}=${s.ok}/${s.taken}${s.quarantined ? '⛔' : ''}`)
+            .join(' ');
+        sendLog('info', `Video generation complete: ${successCount}/${results.length} successful | ${perSessionLog}`);
 
-        return { success: true, results };
+        return { success: true, results, stats: fanOut.stats };
     } catch (error) {
         sendLog('error', `Video generation error: ${error.message}`);
         return { success: false, error: error.message };
@@ -1182,7 +1232,13 @@ ipcMain.handle('video:merge', async (_, params) => {
     }
 });
 
-// IPC Handlers - I2V generation (parallel multi-account)
+// IPC Handlers - I2V generation (work-stealing multi-account fan-out)
+//
+// Phase 2 of PR-47: extends the shared work queue from image
+// generation to image-to-video. Replaces the old static-slice
+// fan-out with the same scheduler image:generate already uses
+// (``multi_account_fan_out.js``). See the image:generate handler
+// above for the rationale; semantics here are identical.
 ipcMain.handle('i2v:generate', async (_, params) => {
     try {
         const { items, config, startIdx: baseIdx = 0 } = params;
@@ -1192,10 +1248,11 @@ ipcMain.handle('i2v:generate', async (_, params) => {
             return { success: false, error: 'No active sessions. Please setup accounts first.' };
         }
 
-        const perAcc = Math.ceil(items.length / sessions.length);
-        sendLog('info', `Generating ${items.length} I2V videos across ${sessions.length} account(s) (${perAcc} per acc)...`);
-        const perAccountConcurrency = Math.max(1, Math.min(Number(config?.batchSize || 10), 30));
-        sendLog('info', `I2V concurrency: ${sessions.length} account(s) x up to ${perAccountConcurrency}/account = up to ${sessions.length * perAccountConcurrency} parallel job(s)`);
+        const perSessionConcurrency = Math.max(1, Math.min(
+            Number(config?.batchSize) || 5,
+            5,
+        ));
+        sendLog('info', `Generating ${items.length} I2V videos across ${sessions.length} account(s) — work-stealing queue, up to ${perSessionConcurrency}/account = up to ${sessions.length * perSessionConcurrency} parallel...`);
 
         // Refresh cookies from live browser sessions before generating
         await AuthService.refreshAllCookies();
@@ -1203,42 +1260,86 @@ ipcMain.handle('i2v:generate', async (_, params) => {
         // Reset re-login counters for fresh batch
         AuthService.resetAllReloginCounts();
 
-        const allResults = await Promise.all(
-            sessions.map(async (session, ai) => {
-                const sliceStart = ai * perAcc;
-                const sliceEnd = Math.min((ai + 1) * perAcc, items.length);
-                const myItems = items.slice(sliceStart, sliceEnd);
-                if (myItems.length === 0) return [];
-                const nameStart = baseIdx + sliceStart;
-                const imgNames = myItems.map(it => path.basename(it.imagePath)).join(', ');
-                sendLog('info', `[Acc${session.accIdx + 1}] 📋 Assigned items #${nameStart + 1}→#${nameStart + myItems.length} (${myItems.length} items): ${imgNames}`);
-                console.log(`[Main] [Acc${session.accIdx + 1}] Processing ${myItems.length} I2V items...`);
-                return I2VService.generateBatch(myItems, session, config, (item, progress, result, localIdx) => {
-                    const globalIdx = nameStart + (localIdx != null ? localIdx : 0);
-                    sendProgress('i2v', { item, progress, result, globalIdx });
-                    if (result) {
-                        const status = result.success ? 'success' : 'error';
-                        const imgName = item.imagePath ? path.basename(item.imagePath) : '';
-                        const label = result.title || item.prompt.substring(0, 50);
-                        const errorMsg = result.error ? ` | Error: ${result.error}` : '';
-                        sendLog(status, `[Acc${session.accIdx + 1}] I2V ${result.success ? '✅' : '❌'}: ${label} [${imgName}]${errorMsg}`);
-                    }
-                }, nameStart).then(batchResults => batchResults.map(r => ({ ...r, globalIdx: nameStart + (r.localIdx != null ? r.localIdx : 0) })));
-            })
-        );
+        const fanOut = await runFanOut({
+            sessions,
+            items,
+            perSessionConcurrency,
+            workerStaggerMs: 200,
+            onProgress: ({ idx, result, session }) => {
+                if (!result) return;
+                const globalIdx = baseIdx + idx;
+                sendProgress('i2v', {
+                    item: items[idx],
+                    progress: 100,
+                    result,
+                    globalIdx,
+                });
+                const status = result.success ? 'success' : 'error';
+                const imgName = result.imagePath ? path.basename(result.imagePath) : '';
+                const label = result.title || (result.prompt || '').substring(0, 50);
+                const errorMsg = result.error ? ` | Error: ${result.error}` : '';
+                sendLog(status, `[Acc${session.accIdx + 1}] I2V ${result.success ? '✅' : '❌'}: ${label} [${imgName}]${errorMsg}`);
+            },
+            processOne: async (item, session, idx) => {
+                const globalNum = baseIdx + idx + 1;
+                const onItemProgress = (it, progress, result, _localIdx) => {
+                    if (result) return;
+                    sendProgress('i2v', {
+                        item: it,
+                        progress,
+                        result: null,
+                        globalIdx: baseIdx + idx,
+                    });
+                };
+                return I2VService._processOneBatchItem(
+                    item,
+                    session,
+                    config || {},
+                    onItemProgress,
+                    idx,
+                    globalNum,
+                    items.length,
+                );
+            },
+        });
 
-        const results = allResults.flat();
+        const results = fanOut.results.map((r, idx) => {
+            const globalIdx = baseIdx + idx;
+            if (!r) {
+                return {
+                    imagePath: items[idx]?.imagePath,
+                    prompt: items[idx]?.prompt,
+                    localIdx: idx,
+                    globalIdx,
+                    success: false,
+                    error: 'no session available',
+                    savedFile: null,
+                    outputPath: null,
+                };
+            }
+            return { ...r, globalIdx };
+        });
+
         const successCount = results.filter(r => r.success).length;
-        sendLog('info', `I2V generation complete: ${successCount}/${results.length} successful`);
+        const perSessionLog = fanOut.stats.perSession
+            .map(s => `Acc${(s.accIdx ?? -1) + 1}=${s.ok}/${s.taken}${s.quarantined ? '⛔' : ''}`)
+            .join(' ');
+        sendLog('info', `I2V generation complete: ${successCount}/${results.length} successful | ${perSessionLog}`);
 
-        return { success: true, results };
+        return { success: true, results, stats: fanOut.stats };
     } catch (error) {
         sendLog('error', `I2V generation error: ${error.message}`);
         return { success: false, error: error.message };
     }
 });
 
-// IPC Handlers - Ref Image generation (parallel multi-account)
+// IPC Handlers - Ref Image generation (work-stealing multi-account fan-out)
+//
+// Phase 2 of PR-47: extends the shared work queue from image
+// generation to ref-image generation. Replaces the old static-slice
+// fan-out with the same scheduler image:generate already uses
+// (``multi_account_fan_out.js``). See the image:generate handler
+// above for the rationale; semantics here are identical.
 ipcMain.handle('refimg:generate', async (_, params) => {
     try {
         const { items, config, startIdx: baseIdx = 0 } = params;
@@ -1248,8 +1349,11 @@ ipcMain.handle('refimg:generate', async (_, params) => {
             return { success: false, error: 'No active sessions. Please setup accounts first.' };
         }
 
-        const perAcc = Math.ceil(items.length / sessions.length);
-        sendLog('info', `Generating ${items.length} ref-image items across ${sessions.length} account(s) (${perAcc} per acc)...`);
+        const perSessionConcurrency = Math.max(1, Math.min(
+            Number(config?.batchSize) || 5,
+            5,
+        ));
+        sendLog('info', `Generating ${items.length} ref-image items across ${sessions.length} account(s) — work-stealing queue, up to ${perSessionConcurrency}/account = up to ${sessions.length * perSessionConcurrency} parallel...`);
 
         // Refresh cookies from live browser sessions before generating
         await AuthService.refreshAllCookies();
@@ -1257,33 +1361,71 @@ ipcMain.handle('refimg:generate', async (_, params) => {
         // Reset re-login counters for fresh batch
         AuthService.resetAllReloginCounts();
 
-        const allResults = await Promise.all(
-            sessions.map(async (session, ai) => {
-                const sliceStart = ai * perAcc;
-                const sliceEnd = Math.min((ai + 1) * perAcc, items.length);
-                const myItems = items.slice(sliceStart, sliceEnd);
-                if (myItems.length === 0) return [];
-                const nameStart = baseIdx + sliceStart;
-                sendLog('info', `[Acc${session.accIdx + 1}] 📋 Assigned ref-image items #${nameStart + 1}→#${nameStart + myItems.length} (${myItems.length} items)`);
-                console.log(`[Main] [Acc${session.accIdx + 1}] Processing ${myItems.length} ref-image items...`);
-                return RefImageService.generateBatch(myItems, session, config || {}, (prompt, progress, result, localIdx) => {
-                    const globalIdx = nameStart + (localIdx != null ? localIdx : 0);
-                    sendProgress('refimg', { prompt, progress, result, globalIdx });
-                    if (result) {
-                        const status = result.success ? 'success' : 'error';
-                        const label = result.title || prompt.substring(0, 50);
-                        const errorMsg = result.error ? ` | Error: ${result.error}` : '';
-                        sendLog(status, `[Acc${session.accIdx + 1}] RefImage ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
-                    }
-                }, nameStart).then(batchResults => batchResults.map(r => ({ ...r, globalIdx: nameStart + (r.localIdx != null ? r.localIdx : 0) })));
-            })
-        );
+        const fanOut = await runFanOut({
+            sessions,
+            items,
+            perSessionConcurrency,
+            workerStaggerMs: 200,
+            onProgress: ({ idx, result, session }) => {
+                if (!result) return;
+                const globalIdx = baseIdx + idx;
+                sendProgress('refimg', {
+                    prompt: result.prompt,
+                    progress: 100,
+                    result,
+                    globalIdx,
+                });
+                const status = result.success ? 'success' : 'error';
+                const label = result.title || (result.prompt || '').substring(0, 50);
+                const errorMsg = result.error ? ` | Error: ${result.error}` : '';
+                sendLog(status, `[Acc${session.accIdx + 1}] RefImage ${result.success ? '✅' : '❌'}: ${label}${errorMsg}`);
+            },
+            processOne: async (item, session, idx) => {
+                const globalNum = baseIdx + idx + 1;
+                const onItemProgress = (prompt, progress, result, _localIdx) => {
+                    if (result) return;
+                    sendProgress('refimg', {
+                        prompt,
+                        progress,
+                        result: null,
+                        globalIdx: baseIdx + idx,
+                    });
+                };
+                return RefImageService._processOneBatchItem(
+                    item,
+                    session,
+                    config || {},
+                    onItemProgress,
+                    idx,
+                    globalNum,
+                    items.length,
+                );
+            },
+        });
 
-        const results = allResults.flat();
+        const results = fanOut.results.map((r, idx) => {
+            const globalIdx = baseIdx + idx;
+            if (!r) {
+                return {
+                    prompt: items[idx]?.prompt,
+                    localIdx: idx,
+                    globalIdx,
+                    success: false,
+                    error: 'no session available',
+                    savedFiles: [],
+                    outputPath: null,
+                };
+            }
+            return { ...r, globalIdx };
+        });
+
         const successCount = results.filter(r => r.success).length;
-        sendLog('info', `Ref-image generation complete: ${successCount}/${results.length} successful`);
+        const perSessionLog = fanOut.stats.perSession
+            .map(s => `Acc${(s.accIdx ?? -1) + 1}=${s.ok}/${s.taken}${s.quarantined ? '⛔' : ''}`)
+            .join(' ');
+        sendLog('info', `Ref-image generation complete: ${successCount}/${results.length} successful | ${perSessionLog}`);
 
-        return { success: true, results };
+        return { success: true, results, stats: fanOut.stats };
     } catch (error) {
         sendLog('error', `Ref-image generation error: ${error.message}`);
         return { success: false, error: error.message };

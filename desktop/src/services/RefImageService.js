@@ -727,12 +727,134 @@ class RefImageService {
     }
 
     /**
+     * Process a single ref-image item — generate via Grok, save
+     * base64 + URL fallback, and return a ``jobResult`` with the
+     * same shape ``generateBatch`` produces.
+     *
+     * Extracted from the inner worker function of ``generateBatch``
+     * so the cross-session work-stealing fan-out scheduler in
+     * ``electron/main.js`` can dispatch single items directly to a
+     * pool of sessions without going through ``generateBatch``'s
+     * static-slice contract.
+     *
+     * Behaviour, file-naming convention, base64-vs-URL precedence,
+     * and progress reporting are unchanged from the previous
+     * worker; any deviation is a regression.
+     *
+     * @param {{prompt: string, refImagePaths: string[]}} item
+     * @param {object} session
+     * @param {object} [config={}]
+     * @param {Function|null} [onProgress=null]
+     * @param {number} myIdx
+     * @param {number} globalNum
+     * @param {number} totalForLog
+     * @param {string} [outputFolder]
+     * @returns {Promise<object>} jobResult
+     */
+    async _processOneBatchItem(
+        item,
+        session,
+        config = {},
+        onProgress = null,
+        myIdx = 0,
+        globalNum = 1,
+        totalForLog = 1,
+        outputFolder = null,
+    ) {
+        const folder = outputFolder || config.outputFolder || PATHS.IMAGE_DIR;
+        const label = `Acc${session.accIdx + 1}`;
+
+        console.log(`[RefImageService] [${label}] 🖼️✨ #${myIdx + 1}/${totalForLog} (shot${String(globalNum).padStart(4, '0')}) refs=${item.refImagePaths.length} | ${item.prompt.substring(0, 50)}...`);
+
+        const result = await this.generateOne(item, session, config, (prog) => {
+            if (onProgress) onProgress(item.prompt, prog.progress, null, myIdx);
+        });
+
+        const savedFiles = [];
+        const shotNum = String(globalNum).padStart(4, '0');
+        const batchTs = Date.now().toString(36);
+        const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
+
+        if (result.imageBase64 && result.imageBase64.length > 0) {
+            const usedNames = new Set();
+            for (let imgIdx = 0; imgIdx < result.imageBase64.length; imgIdx++) {
+                const img = result.imageBase64[imgIdx];
+                try {
+                    let base64Data = img.data;
+                    let ext = 'png';
+                    if (base64Data.startsWith('data:image/')) {
+                        const match = base64Data.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
+                        if (match) { ext = match[1] === 'jpeg' ? 'jpg' : match[1]; base64Data = base64Data.substring(match[0].length); }
+                    }
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    const imgNum = img.imageIndex != null ? img.imageIndex : imgIdx;
+                    let filename = titleSlug
+                        ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_i${imgNum}.${ext}`
+                        : `ref_shot${shotNum}_${batchTs}_i${imgNum}.${ext}`;
+                    if (usedNames.has(filename)) {
+                        filename = titleSlug
+                            ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_i${imgIdx}.${ext}`
+                            : `ref_shot${shotNum}_${batchTs}_i${imgIdx}.${ext}`;
+                    }
+                    usedNames.add(filename);
+                    const filePath = FileService.saveFile(buffer, filename, folder);
+                    savedFiles.push(filePath);
+                    img.size = buffer.length;
+                    console.log(`[RefImageService] [${label}] 💾 Saved: ${filename} (${buffer.length} bytes)`);
+                } catch (error) {
+                    console.error(`[RefImageService] [${label}] Base64 save error:`, error.message);
+                }
+            }
+        }
+
+        const bestBase64Size = savedFiles.length > 0 ? Math.max(...(result.imageBase64 || []).map(i => i.size || 0), 0) : 0;
+        if ((result.imageUrls || []).length > 0 && bestBase64Size < 50000) {
+            for (const img of result.imageUrls) {
+                try {
+                    let dl = await this.downloadImage(img.imageUrl, session);
+                    if (dl && dl.size < 50000 && session._page) {
+                        const browserDl = await this.downloadViaBrowser(img.imageUrl, session);
+                        if (browserDl && browserDl.size > dl.size) dl = browserDl;
+                    }
+                    if (!dl && session._page) dl = await this.downloadViaBrowser(img.imageUrl, session);
+                    if (dl && dl.size > bestBase64Size) {
+                        const ext = dl.contentType?.includes('png') ? 'png' : 'jpg';
+                        const cdnIdx = img.imageIndex || 0;
+                        const filename = titleSlug
+                            ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_cdn_i${cdnIdx}.${ext}`
+                            : `ref_shot${shotNum}_${batchTs}_cdn_i${cdnIdx}.${ext}`;
+                        const filePath = FileService.saveFile(dl.data, filename, folder);
+                        savedFiles.push(filePath);
+                        console.log(`[RefImageService] [${label}] 💾 Saved URL: ${filename} (${dl.size} bytes)`);
+                    }
+                } catch (error) {
+                    console.error(`[RefImageService] [${label}] Download error:`, error.message);
+                }
+            }
+        } else if (bestBase64Size >= 50000) {
+            console.log(`[RefImageService] [${label}] Skipping URL downloads — good base64 (${bestBase64Size}b)`);
+        }
+
+        const jobResult = {
+            prompt: item.prompt,
+            localIdx: myIdx,
+            title: result.title,
+            savedFiles,
+            outputPath: savedFiles.length > 0 ? savedFiles[0] : null,
+            success: savedFiles.length > 0,
+            error: result.error,
+        };
+        if (onProgress) onProgress(item.prompt, 100, jobResult, myIdx);
+        console.log(`[RefImageService] [${label}] #${myIdx + 1}/${totalForLog} ${savedFiles.length > 0 ? '✅' : '❌'} ${result.title || item.prompt.substring(0, 50)}`);
+        return jobResult;
+    }
+
+    /**
      * Generate batch — collision-safe file naming + smart download (ported from ImageService)
      */
     async generateBatch(items, session, config = {}, onProgress = null, startIdx = 0) {
         const N = items.length;
         const CONCURRENCY = Math.min(config.batchSize || PROCESSING_CONFIG.CONCURRENCY.I2V || 5, N);
-        const outputFolder = config.outputFolder || PATHS.IMAGE_DIR;
         const label = `Acc${session.accIdx + 1}`;
 
         console.log(`[RefImageService] [${label}] ${N} ref-image items | ${CONCURRENCY} concurrent | startIdx=${startIdx}`);
@@ -746,95 +868,19 @@ class RefImageService {
                 const myIdx = nextIdx++;
                 const item = items[myIdx];
                 const globalNum = startIdx + myIdx + 1;
-
-                console.log(`[RefImageService] [${label}] 🖼️✨ #${myIdx + 1}/${N} (shot${String(globalNum).padStart(4, '0')}) refs=${item.refImagePaths.length} | ${item.prompt.substring(0, 50)}...`);
-
-                const result = await self.generateOne(item, session, config, (prog) => {
-                    if (onProgress) onProgress(item.prompt, prog.progress, null, myIdx);
-                });
-
-                const savedFiles = [];
-                const shotNum = String(globalNum).padStart(4, '0');
-                const batchTs = Date.now().toString(36);
-                const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
-
-                // Save base64 images (collision-safe)
-                if (result.imageBase64 && result.imageBase64.length > 0) {
-                    const usedNames = new Set();
-                    for (let imgIdx = 0; imgIdx < result.imageBase64.length; imgIdx++) {
-                        const img = result.imageBase64[imgIdx];
-                        try {
-                            let base64Data = img.data;
-                            let ext = 'png';
-                            if (base64Data.startsWith('data:image/')) {
-                                const match = base64Data.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
-                                if (match) { ext = match[1] === 'jpeg' ? 'jpg' : match[1]; base64Data = base64Data.substring(match[0].length); }
-                            }
-                            const buffer = Buffer.from(base64Data, 'base64');
-                            const imgNum = img.imageIndex != null ? img.imageIndex : imgIdx;
-                            let filename = titleSlug
-                                ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_i${imgNum}.${ext}`
-                                : `ref_shot${shotNum}_${batchTs}_i${imgNum}.${ext}`;
-                            if (usedNames.has(filename)) {
-                                filename = titleSlug
-                                    ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_i${imgIdx}.${ext}`
-                                    : `ref_shot${shotNum}_${batchTs}_i${imgIdx}.${ext}`;
-                            }
-                            usedNames.add(filename);
-                            const filePath = FileService.saveFile(buffer, filename, outputFolder);
-                            savedFiles.push(filePath);
-                            img.size = buffer.length;
-                            console.log(`[RefImageService] [${label}] 💾 Saved: ${filename} (${buffer.length} bytes)`);
-                        } catch (error) {
-                            console.error(`[RefImageService] [${label}] Base64 save error:`, error.message);
-                        }
-                    }
-                }
-
-                // Download URLs — only if base64 quality is insufficient
-                const bestBase64Size = savedFiles.length > 0 ? Math.max(...(result.imageBase64 || []).map(i => i.size || 0), 0) : 0;
-                if ((result.imageUrls || []).length > 0 && bestBase64Size < 50000) {
-                    for (const img of result.imageUrls) {
-                        try {
-                            let dl = await self.downloadImage(img.imageUrl, session);
-                            // Browser fallback for small/blurred downloads
-                            if (dl && dl.size < 50000 && session._page) {
-                                const browserDl = await self.downloadViaBrowser(img.imageUrl, session);
-                                if (browserDl && browserDl.size > dl.size) dl = browserDl;
-                            }
-                            if (!dl && session._page) dl = await self.downloadViaBrowser(img.imageUrl, session);
-                            if (dl && dl.size > bestBase64Size) {
-                                const ext = dl.contentType?.includes('png') ? 'png' : 'jpg';
-                                const cdnIdx = img.imageIndex || 0;
-                                const filename = titleSlug
-                                    ? `ref_shot${shotNum}_${batchTs}_${titleSlug}_cdn_i${cdnIdx}.${ext}`
-                                    : `ref_shot${shotNum}_${batchTs}_cdn_i${cdnIdx}.${ext}`;
-                                const filePath = FileService.saveFile(dl.data, filename, outputFolder);
-                                savedFiles.push(filePath);
-                                console.log(`[RefImageService] [${label}] 💾 Saved URL: ${filename} (${dl.size} bytes)`);
-                            }
-                        } catch (error) {
-                            console.error(`[RefImageService] [${label}] Download error:`, error.message);
-                        }
-                    }
-                } else if (bestBase64Size >= 50000) {
-                    console.log(`[RefImageService] [${label}] Skipping URL downloads — good base64 (${bestBase64Size}b)`);
-                }
-
-                const jobResult = {
-                    prompt: item.prompt,
-                    localIdx: myIdx,
-                    title: result.title,
-                    savedFiles,
-                    outputPath: savedFiles.length > 0 ? savedFiles[0] : null,
-                    success: savedFiles.length > 0,
-                    error: result.error,
-                };
+                const jobResult = await self._processOneBatchItem(
+                    item,
+                    session,
+                    config,
+                    onProgress,
+                    myIdx,
+                    globalNum,
+                    N,
+                );
                 results.push(jobResult);
-                if (onProgress) onProgress(item.prompt, 100, jobResult, myIdx);
-                console.log(`[RefImageService] [${label}] #${myIdx + 1}/${N} ${savedFiles.length > 0 ? '✅' : '❌'} ${result.title || item.prompt.substring(0, 50)}`);
             }
         }
+
 
         const workers = [];
         for (let i = 0; i < Math.min(CONCURRENCY, N); i++) {

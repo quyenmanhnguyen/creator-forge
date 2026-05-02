@@ -428,18 +428,89 @@ class VideoService {
   }
 
   /**
-   * Generate videos with multiple prompts
-   * @param {Array<string>} prompts - Array of prompts
-   * @param {Object} session - Session data
-   * @param {Object} config - Video configuration
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<Array<Object>>} Results array
+   * Process a single prompt — generate the video via Grok, download
+   * it to disk, and return a ``jobResult`` with the same shape
+   * ``generateBatch`` produces.
+   *
+   * Extracted from the inner worker function of ``generateBatch`` so
+   * the cross-session work-stealing fan-out scheduler in
+   * ``electron/main.js`` (PR for video / i2v / refimg) can dispatch
+   * single items directly to a pool of sessions without going
+   * through ``generateBatch``'s static-slice contract.
+   *
+   * Behaviour, file-naming convention, and progress reporting are
+   * unchanged from the previous worker; any deviation is a
+   * regression.
+   *
+   * @param {string} prompt
+   * @param {object} session
+   * @param {object} [config={}]
+   * @param {Function|null} [onProgress=null] - (prompt, progress, result|null, localIdx) => void
+   * @param {number} myIdx - 0-based per-session index reported back via onProgress.
+   * @param {number} globalNum - 1-based global shot number used for ``shot####`` naming.
+   * @param {number} totalForLog - "N" used in the "#i/N" log decoration.
+   * @param {string} [outputFolder] - Where to write videos. Defaults to ``config.outputFolder`` / ``PATHS.VIDEO_DIR``.
+   * @returns {Promise<object>} jobResult: { prompt, localIdx, title, videoId, savedFile, outputPath, success, error }
    */
+  async _processOneBatchItem(
+    prompt,
+    session,
+    config = {},
+    onProgress = null,
+    myIdx = 0,
+    globalNum = 1,
+    totalForLog = 1,
+    outputFolder = null,
+  ) {
+    const folder = outputFolder || config.outputFolder || PATHS.VIDEO_DIR;
+    const label = `Acc${session.accIdx + 1}`;
+
+    console.log(`[VideoService] [${label}] 🎬 #${myIdx + 1}/${totalForLog} (shot${String(globalNum).padStart(4, '0')}) starting: ${prompt.substring(0, 50)}...`);
+
+    const result = await this.generateOne(prompt, session, config, (prog) => {
+      if (onProgress) onProgress(prompt, prog.progress, null, myIdx);
+    });
+
+    let savedFile = null;
+    if (result.videoUrl) {
+      console.log(`[VideoService] [${label}] 📥 #${myIdx + 1} downloading...`);
+      try {
+        const shotNum = String(globalNum).padStart(4, '0');
+        const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
+        const filename = titleSlug ? `shot${shotNum}_${titleSlug}.mp4` : `shot${shotNum}.mp4`;
+        const filePath = path.join(folder, filename);
+        const dl = await this.downloadVideoToFile(result.videoUrl, session, filePath);
+        if (dl) {
+          savedFile = dl.path;
+        }
+      } catch (error) {
+        console.error(`[VideoService] [${label}] Download error:`, error.message);
+      }
+    }
+
+    const jobResult = {
+      prompt,
+      localIdx: myIdx,
+      title: result.title,
+      videoId: result.videoId,
+      savedFile,
+      outputPath: savedFile || null,
+      success: !!savedFile,
+      error: result.error,
+    };
+
+    if (onProgress) {
+      onProgress(prompt, 100, jobResult, myIdx);
+    }
+
+    console.log(`[VideoService] [${label}] #${myIdx + 1}/${totalForLog} ${savedFile ? '✅' : '❌'} ${result.title || prompt.substring(0, 50)}`);
+    return jobResult;
+  }
+
   async generateBatch(prompts, session, config = VIDEO_CONFIG, onProgress = null, startIdx = 0) {
     const N = prompts.length;
     const requestedConcurrency = Number(config.batchSize || PROCESSING_CONFIG.BATCH_SIZE || 10);
     const CONCURRENCY = Math.max(1, Math.min(requestedConcurrency, 5));
-    const outputFolder = config.outputFolder || PATHS.VIDEO_DIR;
     const label = `Acc${session.accIdx + 1}`;
 
     console.log(`[VideoService] [${label}] ${N} videos | ${CONCURRENCY} concurrent | startIdx=${startIdx}`);
@@ -453,49 +524,16 @@ class VideoService {
         const myIdx = nextIdx++;
         const prompt = prompts[myIdx];
         const globalNum = startIdx + myIdx + 1; // 1-based global number
-
-        console.log(`[VideoService] [${label}] 🎬 #${myIdx + 1}/${N} (shot${String(globalNum).padStart(4, '0')}) starting: ${prompt.substring(0, 50)}...`);
-
-        const result = await self.generateOne(prompt, session, config, (prog) => {
-          if (onProgress) onProgress(prompt, prog.progress, null, myIdx);
-        });
-
-        // Download video
-        let savedFile = null;
-        if (result.videoUrl) {
-          console.log(`[VideoService] [${label}] 📥 #${myIdx + 1} downloading...`);
-          try {
-            const shotNum = String(globalNum).padStart(4, '0');
-            const titleSlug = (result.title || '').replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF ]/g, '').trim().replace(/\s+/g, '_').substring(0, 60);
-            const filename = titleSlug ? `shot${shotNum}_${titleSlug}.mp4` : `shot${shotNum}.mp4`;
-            const filePath = path.join(outputFolder, filename);
-            const dl = await self.downloadVideoToFile(result.videoUrl, session, filePath);
-            if (dl) {
-              savedFile = dl.path;
-            }
-          } catch (error) {
-            console.error(`[VideoService] [${label}] Download error:`, error.message);
-          }
-        }
-
-        const jobResult = {
+        const jobResult = await self._processOneBatchItem(
           prompt,
-          localIdx: myIdx,
-          title: result.title,
-          videoId: result.videoId,
-          savedFile,
-          outputPath: savedFile || null,
-          success: !!savedFile,
-          error: result.error,
-        };
-
+          session,
+          config,
+          onProgress,
+          myIdx,
+          globalNum,
+          N,
+        );
         results.push(jobResult);
-
-        if (onProgress) {
-          onProgress(prompt, 100, jobResult, myIdx);
-        }
-
-        console.log(`[VideoService] [${label}] #${myIdx + 1}/${N} ${savedFile ? '✅' : '❌'} ${result.title || prompt.substring(0, 50)}`);
       }
     }
 
