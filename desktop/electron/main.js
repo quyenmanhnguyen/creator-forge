@@ -965,7 +965,10 @@ ipcMain.handle('image:generate', async (_, params) => {
             .join(' ');
         sendLog('info', `Image generation complete: ${successCount}/${results.length} successful | ${perSessionLog}`);
 
-        return { success: true, results };
+        // Surface per-session work-stealing stats to the renderer so
+        // callers can render an account-health badge / debug panel
+        // without re-deriving them from the per-row results array.
+        return { success: true, results, stats: fanOut.stats };
     } catch (error) {
         sendLog('error', `Image generation error: ${error.message}`);
         return { success: false, error: error.message };
@@ -1364,9 +1367,21 @@ function sendProgress(jobId, progress) {
     }
 }
 
+// Mirror IPC log events to the main-process console so they show up
+// in the terminal that launched Electron (and in CI/headless logs).
+// Without this, only the renderer's "Logs" panel sees these messages,
+// which makes debugging without the UI open painful — especially for
+// background work-stealing fan-outs that print per-account stats.
 function sendLog(level, message) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] [${level}] ${message}`;
+    if (level === 'error' || level === 'warn') {
+        console.error(line);
+    } else {
+        console.log(line);
+    }
     if (mainWindow) {
-        mainWindow.webContents.send('log', { level, message, timestamp: new Date().toISOString() });
+        mainWindow.webContents.send('log', { level, message, timestamp });
     }
 }
 
