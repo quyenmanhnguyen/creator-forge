@@ -11,13 +11,25 @@ from core.pixelle import tts as pixelle_tts
 
 
 class _FakeCommunicate:
-    """Mimics ``edge_tts.Communicate`` with a ``stream()`` async generator."""
+    """Mimics ``edge_tts.Communicate`` with a ``stream()`` async generator.
+
+    Accepts the v7.0+ ``boundary`` keyword so signature inspection in the
+    adapter detects it and passes ``boundary="WordBoundary"`` through.
+    """
 
     last_kwargs: dict | None = None
     next_events: list[dict] = []
 
-    def __init__(self, *, text, voice, rate, volume) -> None:
-        type(self).last_kwargs = {"text": text, "voice": voice, "rate": rate, "volume": volume}
+    def __init__(
+        self, *, text, voice, rate, volume, boundary="SentenceBoundary"
+    ) -> None:
+        type(self).last_kwargs = {
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "volume": volume,
+            "boundary": boundary,
+        }
 
     async def stream(self):
         for event in type(self).next_events:
@@ -27,12 +39,45 @@ class _FakeCommunicate:
         Path(path).write_bytes(b"fake")
 
 
+class _FakeCommunicateV6:
+    """Mimics edge-tts v6.x ``Communicate`` — no ``boundary`` keyword.
+
+    On v6.x the service emitted WordBoundary chunks by default, so the
+    adapter must NOT pass ``boundary="WordBoundary"`` (it would raise
+    ``TypeError``). This fake's constructor signature reflects v6.x so
+    we can assert the adapter omits the kwarg.
+    """
+
+    last_kwargs: dict | None = None
+    next_events: list[dict] = []
+
+    def __init__(self, *, text, voice, rate, volume) -> None:
+        type(self).last_kwargs = {
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "volume": volume,
+        }
+
+    async def stream(self):
+        for event in type(self).next_events:
+            yield event
+
+
 @pytest.fixture
 def fake_edge_tts(monkeypatch):
     fake_module = types.ModuleType("edge_tts")
     fake_module.Communicate = _FakeCommunicate  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
     return _FakeCommunicate
+
+
+@pytest.fixture
+def fake_edge_tts_v6(monkeypatch):
+    fake_module = types.ModuleType("edge_tts")
+    fake_module.Communicate = _FakeCommunicateV6  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+    return _FakeCommunicateV6
 
 
 def test_synthesize_with_timing_writes_audio_and_collects_boundaries(tmp_path, fake_edge_tts):
@@ -97,3 +142,61 @@ def test_synthesize_with_timing_creates_parent_dir(tmp_path, fake_edge_tts):
     adapter.synthesize_with_timing("hello", output_path=nested, voice="en-US-AriaNeural")
 
     assert nested.exists()
+
+
+def test_synthesize_with_timing_passes_boundary_word_on_v7(tmp_path, fake_edge_tts):
+    """On edge-tts v7.0+ the adapter must explicitly request WordBoundary.
+
+    v7.0 changed the default of ``Communicate.boundary`` from WordBoundary
+    to SentenceBoundary; without the explicit override the WebSocket
+    service emits no per-word events and the adapter falls back to
+    sentence-distributed captions.
+    """
+    fake_edge_tts.next_events = [{"type": "audio", "data": b"x"}]
+
+    adapter = pixelle_tts.EdgeTTSAdapter()
+    adapter.synthesize_with_timing(
+        "hello", output_path=tmp_path / "v.mp3", voice="en-US-AriaNeural"
+    )
+
+    assert fake_edge_tts.last_kwargs is not None
+    assert fake_edge_tts.last_kwargs.get("boundary") == "WordBoundary"
+
+
+def test_synthesize_with_timing_omits_boundary_on_v6(tmp_path, fake_edge_tts_v6):
+    """On edge-tts v6.x the adapter must NOT pass ``boundary``.
+
+    v6.x has no ``boundary`` keyword and would raise ``TypeError``.
+    Detection is by ``inspect.signature`` on the live ``Communicate``.
+    """
+    fake_edge_tts_v6.next_events = [{"type": "audio", "data": b"x"}]
+
+    adapter = pixelle_tts.EdgeTTSAdapter()
+    adapter.synthesize_with_timing(
+        "hello", output_path=tmp_path / "v.mp3", voice="en-US-AriaNeural"
+    )
+
+    assert fake_edge_tts_v6.last_kwargs is not None
+    assert "boundary" not in fake_edge_tts_v6.last_kwargs
+
+
+def test_communicate_kwargs_helper_detects_boundary_param():
+    """Direct unit test for ``_communicate_kwargs`` signature reflection."""
+
+    class WithBoundary:
+        def __init__(self, *, text, voice, rate, volume, boundary="SentenceBoundary"):
+            pass
+
+    class WithoutBoundary:
+        def __init__(self, *, text, voice, rate, volume):
+            pass
+
+    with_kwargs = pixelle_tts._communicate_kwargs(
+        WithBoundary, text="t", voice="v", rate="+0%", volume="+0%"
+    )
+    without_kwargs = pixelle_tts._communicate_kwargs(
+        WithoutBoundary, text="t", voice="v", rate="+0%", volume="+0%"
+    )
+
+    assert with_kwargs.get("boundary") == "WordBoundary"
+    assert "boundary" not in without_kwargs
