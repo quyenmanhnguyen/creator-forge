@@ -1,0 +1,97 @@
+# Post-merge sentinel — surfaces main-branch regressions automatically.
+#
+# Background (see docs/CHECKPOINT.md "Lessons learned" — PR-48 × PR-49):
+#   GitHub's per-PR CI tests each branch against origin/main *at push time*.
+#   When two PRs each pass CI on their own branches but together break a
+#   shared invariant, neither pre-merge run sees the collision. The
+#   regression only appears on `main` after both land.
+#
+# This sentinel watches the CI workflow on `main` and, when it concludes
+# `failure` or `timed_out`, opens (or updates) a GitHub issue tagged
+# `sentinel-failure`. That way the regression surfaces in the issue tracker
+# instead of being buried in the Actions tab.
+name: Sentinel
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  actions: read
+  contents: read
+
+jobs:
+  notify-on-main-ci-failure:
+    name: Open issue when CI on main goes red
+    runs-on: ubuntu-latest
+    # Only react to runs that:
+    #   - originated on main (not feature branches)
+    #   - concluded failure / timed_out / cancelled
+    # Manual dispatch always runs (so a maintainer can dry-run the script).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.head_branch == 'main' &&
+       contains(fromJSON('["failure","timed_out","cancelled"]'),
+                github.event.workflow_run.conclusion))
+    steps:
+      - name: Open or update sentinel issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const conclusion = run ? run.conclusion : 'manual-dispatch';
+            const sha = run ? run.head_sha : context.sha;
+            const runUrl = run ? run.html_url : '';
+            const shortSha = sha.slice(0, 7);
+            const title = `🚨 Sentinel: CI on \`main\` concluded ${conclusion}`;
+
+            const body = [
+              `The CI workflow on \`main\` finished with conclusion **${conclusion}**.`,
+              ``,
+              `- Commit: \`${shortSha}\``,
+              runUrl ? `- Run: ${runUrl}` : `- Manual dispatch (no failing run linked)`,
+              ``,
+              `This issue is opened automatically by \`.github/workflows/sentinel.yml\` ` +
+              `to surface post-merge regressions that pre-merge per-PR CI cannot catch ` +
+              `(e.g. two PRs that each pass on their own branch but break a shared ` +
+              `invariant once both land — see PR-48 × PR-49 in \`docs/CHECKPOINT.md\`).`,
+              ``,
+              `**Suggested next steps:**`,
+              `1. Open the failing run above, identify the failing job/test.`,
+              `2. If the most recent merge is the obvious culprit, revert it.`,
+              `3. Otherwise, push a hotfix branch and open a PR.`,
+              `4. Close this issue once \`main\` is green again.`,
+            ].join('\n');
+
+            // De-duplicate: if there's already an open sentinel issue, post a
+            // comment instead of spamming a fresh one for every red push.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'sentinel-failure',
+              state: 'open',
+              per_page: 50,
+            });
+            const found = existing.data.find(i => i.title.startsWith('🚨 Sentinel: CI'));
+
+            if (found) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: found.number,
+                body,
+              });
+              core.notice(`Updated sentinel issue #${found.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['sentinel-failure', 'ci'],
+              });
+              core.notice(`Opened sentinel issue #${created.data.number}`);
+            }
