@@ -128,6 +128,11 @@ jobs:
           node desktop/tests/test_auth_service_relogin_path.js
           # PR-47: work-stealing multi-account fan-out scheduler.
           node desktop/tests/test_multi_account_fan_out.js
+          # Phase 2 of PR-47: per-item helpers for video / i2v / refimg
+          # services, called by the fan-out scheduler in main.js.
+          node desktop/tests/test_video_service_process_one.js
+          node desktop/tests/test_i2v_service_process_one.js
+          node desktop/tests/test_refimg_service_process_one.js
 
       - name: Syntax check standalone E2E scripts
         run: |
