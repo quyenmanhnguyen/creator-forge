@@ -173,6 +173,56 @@
             animation: spin 0.7s linear infinite;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        /* PR-A — long-running progress block (scene_breakdown etc).
+           A determinate-looking indeterminate bar: a thin sliver
+           slides left-to-right on a darker track so the user has
+           visual proof the call is still alive. The phase line +
+           elapsed counter under it carry the actual signal. */
+        .progress-block {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            color: var(--text-dim);
+            font-size: 12px;
+        }
+        .progress-head {
+            display: flex; align-items: center; gap: 8px;
+        }
+        .progress-label { font-weight: 500; color: var(--text); }
+        .progress-elapsed {
+            margin-left: auto;
+            font-variant-numeric: tabular-nums;
+            color: var(--text-dim);
+        }
+        .progress-bar {
+            position: relative;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            position: absolute;
+            top: 0; left: 0;
+            height: 100%; width: 30%;
+            background: var(--accent);
+            border-radius: 2px;
+            animation: progress-slide 1.4s ease-in-out infinite;
+        }
+        @keyframes progress-slide {
+            0%   { left: -30%; }
+            100% { left: 100%; }
+        }
+        .progress-phase {
+            color: var(--text-dim);
+            font-size: 12px;
+        }
+        .progress-hint {
+            color: var(--text-dim);
+            font-size: 11px;
+            font-style: italic;
+            opacity: 0.8;
+        }
         .warning-list {
             background: rgba(255, 215, 64, 0.08);
             border-left: 3px solid var(--warn);
@@ -1414,6 +1464,8 @@
     <script src="storyboard_account_manager_helpers.js"></script>
     <!-- PR-31: Video Assembly form-payload + scene-paths helpers. -->
     <script src="storyboard_assemble_helpers.js"></script>
+    <!-- PR-A: long-running progress UI helpers (scene_breakdown). -->
+    <script src="storyboard_progress_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>

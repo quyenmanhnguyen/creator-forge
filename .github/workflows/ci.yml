@@ -91,6 +91,8 @@ jobs:
           node --check desktop/dist/storyboard_batch_helpers.js
           # PR-31: Video Assembly form-payload helpers.
           node --check desktop/dist/storyboard_assemble_helpers.js
+          # PR-A: long-running progress UI helpers (scene_breakdown).
+          node --check desktop/dist/storyboard_progress_helpers.js
           # PR-21: always-on 3-state login banner state mapper.
           node --check desktop/dist/storyboard_login_banner_helpers.js
           # PR-22: Account Manager helpers (validation + secret-leak guard).
@@ -111,6 +113,8 @@ jobs:
           node desktop/tests/test_storyboard_compose_table_helpers.js
           node desktop/tests/test_storyboard_batch_helpers.js
           node desktop/tests/test_storyboard_assemble_helpers.js
+          # PR-A: long-running progress UI helpers (scene_breakdown).
+          node desktop/tests/test_storyboard_progress_helpers.js
           node desktop/tests/test_research_sidecar_lookup.js
           node desktop/tests/test_fetch_python_runtime.js
           node desktop/tests/test_video_validation_helpers.js

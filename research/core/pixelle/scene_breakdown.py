@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -527,6 +528,14 @@ def serialize_breakdown_json(scenes: list[LongFormScene]) -> list[dict]:
 MAX_VARIANTS_PER_SCENE = 8
 VISUAL_DNA_MAX_CHARS = 1200
 
+# Variant LLM calls are independent per scene, so we fan them out across a
+# thread pool. The cap here is a balance: too high and we risk hitting the
+# DeepSeek per-minute rate limit on a long script (60 scenes × 8 variants =
+# theoretically 60 parallel calls); 8 keeps us comfortably under typical
+# free-tier ceilings while still cutting a 5–15-scene breakdown's variant
+# phase by ~5–8×.
+VARIANT_EXPANSION_MAX_WORKERS = 8
+
 
 def _default_chat_fn() -> Callable[[str, str], str]:
     """Bind ``research.core.llm.chat`` as the default chat function.
@@ -929,14 +938,32 @@ def generate_scene_breakdown(
         except Exception:  # noqa: BLE001 — best-effort, the caller may not have a DEEPSEEK key
             dna = ""
 
-    expanded: list[LongFormScene] = []
-    for s in scenes:
+    # Fan the per-scene variant calls out across a thread pool. Each
+    # call is an independent LLM round-trip, so a sequential loop on a
+    # 10-scene breakdown was previously the long pole — ~10× slower
+    # than necessary. ``ThreadPoolExecutor.map`` preserves submission
+    # order, so the resulting ``image_prompts`` lists line up 1:1 with
+    # ``scenes``. We still wrap each call in a try/except so a single
+    # scene's exception (LLM rate-limit, transient network) only
+    # downgrades that scene to repeated-base-prompt — never aborts the
+    # whole batch.
+    def _expand_one(s: LongFormScene) -> list[str]:
         try:
-            prompts = expand_image_variants(
+            return expand_image_variants(
                 s, count=n_variants, visual_dna=dna, chat_fn=chat_fn
             )
-        except Exception:  # noqa: BLE001
-            prompts = [s.image_prompt] * n_variants
+        except Exception:  # noqa: BLE001 — defensive; expand_image_variants already swallows.
+            return [s.image_prompt] * n_variants
+
+    workers = max(1, min(VARIANT_EXPANSION_MAX_WORKERS, len(scenes)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            prompts_lists = list(pool.map(_expand_one, scenes))
+    else:
+        prompts_lists = [_expand_one(s) for s in scenes]
+
+    expanded: list[LongFormScene] = []
+    for s, prompts in zip(scenes, prompts_lists, strict=True):
         # Re-emit the singular ``image_prompt`` as the first variant so
         # downstream code that ignores ``image_prompts`` is unaffected.
         head = prompts[0] if prompts else s.image_prompt

@@ -24,6 +24,7 @@ import pytest
 from core.pixelle.scene_breakdown import (
     MAX_VARIANTS_PER_SCENE,
     SCENE_TEMPLATES,
+    VARIANT_EXPANSION_MAX_WORKERS,
     VISUAL_DNA_MAX_CHARS,
     LongFormScene,
     build_variant_system_prompt,
@@ -424,3 +425,187 @@ def test_generate_with_dna_empty_script_returns_empty() -> None:
     assert scenes == []
     assert dna == ""
     assert called["hit"] is False
+
+
+# ─── Parallel variant expansion (PR-A: speed-up + progress UI) ──────────────
+
+
+def test_variant_expansion_runs_in_parallel_across_scenes() -> None:
+    """Per-scene variant LLM calls fan out across a thread pool.
+
+    A ``threading.Barrier`` of size ``min(n_scenes, MAX_WORKERS)``
+    deadlocks unless that many ``chat_fn`` invocations are alive at
+    the same time. The breakdown call (1) and any DNA call don't
+    touch the barrier — only variant calls do, gated by the system
+    prompt's signature substring (``EXACTLY N paste-ready``, emitted
+    by :func:`build_variant_system_prompt`).
+    """
+    import threading
+    from core.pixelle.scene_breakdown import generate_scene_breakdown
+
+    n_scenes = 4
+    barrier = threading.Barrier(n_scenes, timeout=5.0)
+    breakdown_reply = "\n\n".join(
+        f"Scene {i}: Title {i}\n"
+        "NARRATION:\n"
+        f"Body for scene {i}.\n"
+        "IMAGE PROMPT:\n"
+        f"Wide shot for scene {i}, environment.\n"
+        "FLOW VIDEO PROMPT:\n"
+        "Slow push-in. Steady cam. Ambient sound."
+        for i in range(1, n_scenes + 1)
+    )
+
+    def fake_chat(user: str, system: str) -> str:
+        if "scene-breakdown specialist" in system:
+            return breakdown_reply
+        if "EXACTLY" in system and "paste-ready" in system:
+            # Variant call — block until ALL n_scenes variant calls
+            # arrive concurrently. If the orchestrator runs them
+            # sequentially we time out here.
+            barrier.wait()
+            return (
+                "Variant 1, low key.\n"
+                "<<<VARIANT>>>\n"
+                "Variant 2, mid key."
+            )
+        return ""
+
+    scenes = generate_scene_breakdown(
+        "Long enough script body to drive the n-scene estimator.",
+        template=SCENE_TEMPLATES["cinematic"],
+        n_scenes=n_scenes,
+        chat_fn=fake_chat,
+        images_per_scene=2,
+        visual_dna_override="pinned dna",
+    )
+    assert len(scenes) == n_scenes
+    for s in scenes:
+        assert len(s.image_prompts) == 2
+
+
+def test_variant_expansion_preserves_scene_order_under_concurrency() -> None:
+    """Out-of-order completion must NOT scramble per-scene prompts.
+
+    Scene 1 finishes last (slowest), scene N first (fastest). The
+    resulting ``image_prompts`` for scene K must still be the prompts
+    we minted *for scene K*, identified by the scene title we echo
+    back in the variant body.
+    """
+    import time
+    from core.pixelle.scene_breakdown import generate_scene_breakdown
+
+    n_scenes = 3
+    breakdown_reply = "\n\n".join(
+        f"Scene {i}: Title{i}\n"
+        "NARRATION:\n"
+        f"Body{i}.\n"
+        "IMAGE PROMPT:\n"
+        f"Image-prompt-for-scene-{i}, wide shot.\n"
+        "FLOW VIDEO PROMPT:\n"
+        "Pan."
+        for i in range(1, n_scenes + 1)
+    )
+
+    def fake_chat(user: str, system: str) -> str:
+        if "scene-breakdown specialist" in system:
+            return breakdown_reply
+        if "EXACTLY" in system and "paste-ready" in system:
+            # The variant USER prompt embeds the scene's image_prompt
+            # so we can identify which scene this call is for and
+            # return a uniquely-tagged reply. Sleep inversely with
+            # the scene id so scene 1 returns last.
+            for i in range(1, n_scenes + 1):
+                if f"Image-prompt-for-scene-{i}" in user:
+                    time.sleep(0.05 * (n_scenes - i + 1))
+                    return (
+                        f"PROMPT-FOR-{i}-A, low key.\n"
+                        "<<<VARIANT>>>\n"
+                        f"PROMPT-FOR-{i}-B, mid key."
+                    )
+            return ""
+        return ""
+
+    scenes = generate_scene_breakdown(
+        "Long enough script body to drive the n-scene estimator.",
+        template=SCENE_TEMPLATES["cinematic"],
+        n_scenes=n_scenes,
+        chat_fn=fake_chat,
+        images_per_scene=2,
+        visual_dna_override="pinned",
+    )
+    assert len(scenes) == n_scenes
+    for i, s in enumerate(scenes, start=1):
+        assert s.scene_id == i
+        # Both variants for scene i must carry the i-tagged marker —
+        # confirms we re-zipped results with the right scene.
+        for p in s.image_prompts:
+            assert f"PROMPT-FOR-{i}-" in p, (
+                f"scene {i} got prompts from a different scene: {p!r}"
+            )
+
+
+def test_variant_expansion_one_scene_failure_does_not_abort_batch() -> None:
+    """A chat_fn exception on one scene only downgrades that scene
+    to the base prompt repeated N times — the other scenes still
+    get their LLM-expanded variants.
+    """
+    from core.pixelle.scene_breakdown import generate_scene_breakdown
+
+    breakdown_reply = (
+        "Scene 1: Good\n"
+        "NARRATION:\nBody1.\n"
+        "IMAGE PROMPT:\nGood-image-prompt, wide shot.\n"
+        "FLOW VIDEO PROMPT:\nPan.\n\n"
+        "Scene 2: Bad\n"
+        "NARRATION:\nBody2.\n"
+        "IMAGE PROMPT:\nBad-image-prompt, wide shot.\n"
+        "FLOW VIDEO PROMPT:\nPan.\n\n"
+        "Scene 3: Good\n"
+        "NARRATION:\nBody3.\n"
+        "IMAGE PROMPT:\nGood-image-prompt-3, wide shot.\n"
+        "FLOW VIDEO PROMPT:\nPan."
+    )
+
+    def fake_chat(user: str, system: str) -> str:
+        if "scene-breakdown specialist" in system:
+            return breakdown_reply
+        if "EXACTLY" in system and "paste-ready" in system:
+            if "Bad-image-prompt" in user:
+                raise RuntimeError("simulated rate-limit on scene 2")
+            return (
+                "OK-VARIANT-A.\n"
+                "<<<VARIANT>>>\n"
+                "OK-VARIANT-B."
+            )
+        return ""
+
+    scenes = generate_scene_breakdown(
+        "Long enough script body.",
+        template=SCENE_TEMPLATES["cinematic"],
+        n_scenes=3,
+        chat_fn=fake_chat,
+        images_per_scene=2,
+        visual_dna_override="pinned",
+    )
+    assert len(scenes) == 3
+    # Scenes 1 + 3 got the LLM-expanded variants.
+    assert all("OK-VARIANT-" in p for p in scenes[0].image_prompts)
+    assert all("OK-VARIANT-" in p for p in scenes[2].image_prompts)
+    # Scene 2 fell back to the base prompt × 2 (no exception leaked).
+    assert scenes[1].image_prompts == (
+        scenes[1].image_prompt,
+        scenes[1].image_prompt,
+    )
+
+
+def test_variant_expansion_max_workers_is_a_module_const() -> None:
+    """Pin the cap so a future bump is an explicit, reviewed change —
+    the comment in the source explains the rate-limit trade-off.
+    """
+    assert isinstance(VARIANT_EXPANSION_MAX_WORKERS, int)
+    assert VARIANT_EXPANSION_MAX_WORKERS >= 1
+    # Sanity: never silently exceed the per-scene variant cap so a
+    # 1-scene 8-variant breakdown still benefits from the pool's
+    # bounded queue without spawning idle threads we'll never use.
+    assert VARIANT_EXPANSION_MAX_WORKERS <= 32
