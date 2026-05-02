@@ -285,44 +285,73 @@ function makeFakeChild(pid) {
 
         const fakeRoot = path.join(__dirname, '..', '..');
 
-        // Stand up a fake healthz responder so waitForHealth resolves.
-        let respondToHealthz = false;
-        const healthServer = http.createServer((req, res) => {
-            if (respondToHealthz && req.url === '/healthz') {
+        // PR-72 note: waitForPortFree now does a real TCP bind probe
+        // (`net.createServer().listen(port)`) rather than an HTTP
+        // /healthz check. So to simulate "port frees up between stop()
+        // and start()" we have to actually close the listener; just
+        // toggling a `respondToHealthz` flag while keeping the socket
+        // bound (the old approach) is now correctly detected as busy.
+        //
+        // The flow we set up here:
+        //   t=0    port unbound → start() probe returns ECONNREFUSED
+        //                       → start() falls through to spawn (stub)
+        //   t=100  open healthServer #1 → waitForHealth in start() succeeds
+        //   t=...  start() returns; close healthServer #1
+        //   ...    test calls restart() → stop() → waitForPortFree (port
+        //                                         genuinely free → true)
+        //                                       → start() pre-probes
+        //                                         (refused) → spawn stub
+        //   t=...  open healthServer #2 → second waitForHealth succeeds
+        let shutdownAttempts = 0;
+        const buildHealthServer = () => http.createServer((req, res) => {
+            if (req.url === '/admin/shutdown') {
+                shutdownAttempts += 1;
+                res.writeHead(404).end();
+                return;
+            }
+            if (req.url === '/healthz') {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(SERVICE_TAG_BODY);
-            } else {
-                res.writeHead(404).end();
+                return;
             }
+            res.writeHead(404).end();
+        });
+        const openOn = (server) => new Promise((resolve, reject) => {
+            server.on('error', reject);
+            server.listen(free, '127.0.0.1', resolve);
+        });
+        const closeServer = (s) => new Promise((r) => {
+            try { s.close(() => r()); } catch (_) { r(); }
         });
 
-        await new Promise((resolve, reject) => {
-            healthServer.on('error', reject);
-            healthServer.listen(free, '127.0.0.1', resolve);
-        });
-
+        let healthServer = null;
+        const openTimers = [];
         try {
-            // Open the healthz responder as soon as start() spawns.
-            setTimeout(() => { respondToHealthz = true; }, 100);
+            // Schedule healthServer #1 to come up shortly after spawn.
+            const t1 = setTimeout(async () => {
+                const s = buildHealthServer();
+                await openOn(s);
+                healthServer = s;
+            }, 100);
+            openTimers.push(t1);
+
             await sidecar.start({ port: free, repoRoot: fakeRoot, extraEnv: { DEEPSEEK_API_KEY: 'first' } });
             assert.strictEqual(spawnCalls.length, 1, 'start() should spawn when port empty');
 
-            // Capture shutdown POST attempts (there should be none).
-            let shutdownAttempts = 0;
-            const origRoute = healthServer.listeners('request')[0];
-            healthServer.removeAllListeners('request');
-            healthServer.on('request', (req, res) => {
-                if (req.url === '/admin/shutdown') {
-                    shutdownAttempts += 1;
-                }
-                origRoute(req, res);
-            });
+            // Close healthServer #1 so the port is genuinely free for
+            // waitForPortFree's bind probe to succeed.
+            if (healthServer) {
+                await closeServer(healthServer);
+                healthServer = null;
+            }
 
-            // restart() — wasExternal=false, so should NOT call sendShutdown.
-            // To let waitForPortFree return true, close the responder briefly.
-            respondToHealthz = false;
-            // Then bring it back up so the post-spawn waitForHealth resolves.
-            setTimeout(() => { respondToHealthz = true; }, 600);
+            // Schedule healthServer #2 so the second start()'s
+            // waitForHealth can resolve.
+            const t2 = setTimeout(async () => {
+                const s = buildHealthServer();
+                try { await openOn(s); healthServer = s; } catch (_) {}
+            }, 600);
+            openTimers.push(t2);
 
             await sidecar.restart({ port: free, repoRoot: fakeRoot, extraEnv: { DEEPSEEK_API_KEY: 'second' } });
 
@@ -331,7 +360,8 @@ function makeFakeChild(pid) {
             assert.strictEqual(spawnCalls[1].env.DEEPSEEK_API_KEY, 'second',
                 'second spawn must apply new extraEnv');
         } finally {
-            try { healthServer.close(); } catch (_) {}
+            for (const t of openTimers) clearTimeout(t);
+            if (healthServer) { try { healthServer.close(); } catch (_) {} }
         }
     });
 
