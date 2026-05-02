@@ -531,12 +531,75 @@ def test_voices_returns_curated_list():
     body = r.json()
     assert body["ready"] is True
     assert len(body["voices"]) >= 8
-    # Schema spot-check.
+    # Schema spot-check — every voice now carries a ``provider`` tag
+    # so the renderer can filter by the TTS provider dropdown.
     first = body["voices"][0]
-    assert {"short_name", "label", "locale", "gender"} <= set(first)
+    assert {"short_name", "label", "locale", "gender", "provider"} <= set(first)
     short_names = {v["short_name"] for v in body["voices"]}
     assert "en-US-AriaNeural" in short_names
     assert body["default"] in short_names
+    # Top-level shape: ``providers`` lists every distinct provider tag,
+    # so the UI can render the TTS provider dropdown without hard-coding
+    # the list. The default filter (no query param) returns ``provider=None``.
+    assert set(body["providers"]) == {"edge-tts", "piper-tts"}
+    assert body["provider"] is None
+    assert body.get("warnings", []) == []
+
+
+def test_voices_filtered_by_edge_tts_provider():
+    r = client.get("/producer/voices?provider=edge-tts")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ready"] is True
+    assert body["provider"] == "edge-tts"
+    # All returned voices must be edge-tts; default still in the list.
+    assert all(v["provider"] == "edge-tts" for v in body["voices"])
+    short_names = {v["short_name"] for v in body["voices"]}
+    assert "en-US-AriaNeural" in short_names
+    # Piper voices are excluded.
+    assert "vi_VN-vais1000-medium" not in short_names
+    assert body["default"] in short_names
+
+
+def test_voices_filtered_by_piper_tts_provider():
+    r = client.get("/producer/voices?provider=piper-tts")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ready"] is True
+    assert body["provider"] == "piper-tts"
+    assert body["voices"], "piper-tts curated list must not be empty"
+    assert all(v["provider"] == "piper-tts" for v in body["voices"])
+    short_names = {v["short_name"] for v in body["voices"]}
+    # Piper voices land in the filtered set.
+    assert "vi_VN-vais1000-medium" in short_names
+    # Edge-tts voices do not.
+    assert "en-US-AriaNeural" not in short_names
+    # Default is the first piper voice (renderer uses this as the
+    # initial selection when the user flips the provider dropdown).
+    assert body["default"] == body["voices"][0]["short_name"]
+    assert body.get("warnings", []) == []
+
+
+def test_voices_unknown_provider_returns_empty_with_warning():
+    r = client.get("/producer/voices?provider=bogus-engine")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ready"] is True
+    assert body["provider"] == "bogus-engine"
+    assert body["voices"] == []
+    assert body["default"] is None
+    assert any("bogus-engine" in w for w in body.get("warnings", []))
+
+
+def test_voices_provider_query_is_case_insensitive_and_trimmed():
+    r = client.get("/producer/voices?provider=  Piper-TTS  ")
+    assert r.status_code == 200
+    body = r.json()
+    # Trim + lowercase so ``  Piper-TTS  `` is handled the same as
+    # ``piper-tts``. This matches the route's existing _provider_key
+    # normalisation pattern in /producer/short + /producer/audio.
+    assert body["provider"] == "piper-tts"
+    assert all(v["provider"] == "piper-tts" for v in body["voices"])
 
 
 # ─── /producer/providers ────────────────────────────────────────────────────
