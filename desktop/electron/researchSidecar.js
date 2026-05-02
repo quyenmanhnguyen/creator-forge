@@ -9,10 +9,15 @@
  * `http://127.0.0.1:<port>/...` and return parsed JSON to the renderer.
  */
 
-const { spawn } = require('child_process');
+const { spawn: realSpawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+
+// Test hook — only the offline test suite calls __setSpawnImpl to swap
+// in a stub so it can assert spawn args without launching real Python.
+// Runtime callers always go through the real `child_process.spawn`.
+let spawnImpl = realSpawn;
 
 const DEFAULT_PORT = Number(process.env.CREATOR_FORGE_RESEARCH_PORT || 5050);
 const HEALTH_TIMEOUT_MS = 30_000;
@@ -184,6 +189,61 @@ async function waitForHealth(port) {
 }
 
 /**
+ * POST /admin/shutdown to a creator-forge sidecar listening on `port`.
+ * Used by `restart()` to terminate an externally-launched uvicorn (one
+ * we did not spawn, so we don't have its PID) before re-spawning a
+ * fresh process with the new `extraEnv`. Best-effort: returns
+ * `{ ok, status }` rather than throwing, so the caller can fall back
+ * to a port-busy error with a useful hint.
+ */
+function sendShutdown(port) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+        const req = http.request(
+            {
+                host: '127.0.0.1',
+                port,
+                path: '/admin/shutdown',
+                method: 'POST',
+                timeout: 2000,
+                headers: { 'Content-Length': '0' },
+            },
+            (res) => {
+                res.resume();
+                finish({ ok: res.statusCode === 200, status: res.statusCode || -1 });
+            },
+        );
+        req.on('error', () => finish({ ok: false, status: -1 }));
+        req.on('timeout', () => {
+            req.destroy();
+            finish({ ok: false, status: -1 });
+        });
+        req.end();
+    });
+}
+
+/**
+ * Wait until `:port` no longer answers `/healthz`. Used after
+ * `sendShutdown()` (or after stop()'s SIGINT) to give the OS a beat
+ * to release the listening socket before a fresh spawn binds it.
+ * Returns true if the port freed within `timeoutMs`, else false.
+ */
+async function waitForPortFree(port, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const { ok } = await probe(port);
+        if (!ok) return true;
+        await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+}
+
+/**
  * Start the sidecar. Returns { port } when /healthz is green.
  *
  * Idempotent — calling twice returns the existing handle.
@@ -207,7 +267,26 @@ async function start({ port = DEFAULT_PORT, repoRoot, extraEnv } = {}) {
     if (pre.ours) {
         actualPort = port;
         externalReuse = true;
-        logSink('reusing external sidecar on :' + port);
+        // If the caller asked us to inject env vars (e.g. API keys from
+        // keysStore.js) but we're reusing an externally-launched uvicorn,
+        // those vars never reach the running process. Log loudly so the
+        // user notices when their saved keys aren't taking effect — they
+        // can resolve via the Settings ⚙ Save button which calls
+        // restart() (which DOES force a fresh spawn).
+        const hasExtraEnv =
+            extraEnv && typeof extraEnv === 'object' &&
+            Object.keys(extraEnv).some(
+                (k) => typeof extraEnv[k] === 'string' && extraEnv[k].length > 0,
+            );
+        if (hasExtraEnv) {
+            logSink(
+                'WARN reusing external sidecar on :' + port +
+                ' — saved API keys NOT applied to this process. ' +
+                'Open Settings ⚙ and click Save to force a fresh spawn.',
+            );
+        } else {
+            logSink('reusing external sidecar on :' + port);
+        }
         return { port };
     }
     if (pre.ok && !pre.ours) {
@@ -255,7 +334,7 @@ async function start({ port = DEFAULT_PORT, repoRoot, extraEnv } = {}) {
     }
     spawnEnv.PYTHONUNBUFFERED = '1';
 
-    child = spawn(python, args, {
+    child = spawnImpl(python, args, {
         cwd: root,
         env: spawnEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -318,14 +397,71 @@ function getPort() {
 /**
  * Restart the sidecar with a fresh `extraEnv`. Used by the API-keys
  * Settings dialog so saved keys take effect without forcing the user
- * to relaunch the app. Falls back to the cached startup options when
- * the caller does not pass new ones, so a bare `restart()` rebounces
- * the existing process with whatever env it had on the previous
- * successful boot.
+ * to relaunch the app.
+ *
+ * Unlike `start()`, this **always forces a fresh spawn** — that's the
+ * whole point of restart, and the only way the new `extraEnv` reaches
+ * the running uvicorn process. The flow:
+ *
+ *   1. `stop()` — kills the child if we own it (spawned by us). When
+ *      we're in `externalReuse` mode (`start()` reused an externally-
+ *      launched uvicorn) `stop()` only clears local state because we
+ *      don't have the PID; the external process is still alive.
+ *
+ *   2. If we were in externalReuse mode, POST `/admin/shutdown` to the
+ *      sidecar so it exits cleanly. Without this step `start()` below
+ *      would just probe-and-reuse the same external process again, and
+ *      the new `extraEnv` would be silently dropped (this was the root
+ *      cause of "DEEPSEEK_API_KEY not set" warnings persisting after
+ *      Save in the API-keys dialog).
+ *
+ *   3. Wait for `:port` to actually free up before spawning, otherwise
+ *      uvicorn's bind would race against the dying external process.
+ *
+ *   4. `start()` — probes a now-empty port and spawns a fresh uvicorn
+ *      with the merged `extraEnv` applied to its env block.
+ *
+ * Falls back to the cached startup options when the caller does not
+ * pass new ones, so a bare `restart()` rebounces the existing process
+ * with whatever env it had on the previous successful boot.
  */
 async function restart(opts = {}) {
     const merged = Object.assign({}, lastStartOpts || {}, opts || {});
+    const portToUse = merged.port || DEFAULT_PORT;
+    const wasExternal = externalReuse;
     await stop();
+
+    if (wasExternal) {
+        // We didn't kill anything in stop() — the external sidecar is
+        // still alive. Ask it to exit so the port frees up for our
+        // fresh spawn with the new extraEnv.
+        const sd = await sendShutdown(portToUse);
+        if (!sd.ok) {
+            logSink(
+                'WARN /admin/shutdown to external sidecar returned ' + sd.status +
+                ' — the sidecar may be running an older build without the ' +
+                'shutdown endpoint. Continuing to wait for the port to free up.',
+            );
+        }
+    }
+
+    // Whether we spawned or external-reused the previous instance, the
+    // OS may need a beat to release the listening socket before our
+    // fresh uvicorn can bind it. Block until /healthz stops responding
+    // (or until the timeout — at which point we surface a clear error
+    // so the user knows what to do).
+    const freed = await waitForPortFree(portToUse, 5000);
+    if (!freed) {
+        throw new Error(
+            `research sidecar restart: port :${portToUse} still busy after shutdown attempt. ` +
+            'Close any external uvicorn process holding the port (e.g. a stale daemon ' +
+            'from a previous app run, or `uvicorn ... --reload` in a separate terminal) ' +
+            'and try Save again. Hint: ' +
+            `\`lsof -i :${portToUse}\` (mac/linux) or ` +
+            `\`netstat -ano | findstr :${portToUse}\` (windows) to find the holder PID.`,
+        );
+    }
+
     return start(merged);
 }
 
@@ -335,10 +471,17 @@ module.exports = {
     restart,
     getPort,
     setLogSink,
-    // Exported for offline tests (test_research_sidecar_lookup.js):
+    // Exported for offline tests (test_research_sidecar_lookup.js,
+    // test_research_sidecar_restart.js):
     findRepoRoot,
     locatePackagedSidecarRoot,
     resolvePythonExecutable,
     isDevModeBundleSupported,
     pythonExecutable,
+    sendShutdown,
+    waitForPortFree,
+    // Test-only hooks — used by test_research_sidecar_restart.js to
+    // stub out child_process.spawn without touching require.cache for
+    // a builtin module. NEVER call from runtime code.
+    __setSpawnImpl(impl) { spawnImpl = impl || realSpawn; },
 };

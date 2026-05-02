@@ -116,6 +116,9 @@ jobs:
           # PR-A: long-running progress UI helpers (scene_breakdown).
           node desktop/tests/test_storyboard_progress_helpers.js
           node desktop/tests/test_research_sidecar_lookup.js
+          # PR-64: /admin/shutdown + restart() flow that fixes
+          # DEEPSEEK_API_KEY-not-set-after-Save bug (externalReuse path).
+          node desktop/tests/test_research_sidecar_restart.js
           node desktop/tests/test_fetch_python_runtime.js
           node desktop/tests/test_video_validation_helpers.js
           node desktop/tests/test_auth_session_status.js

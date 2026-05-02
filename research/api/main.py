@@ -10,11 +10,13 @@ and only talks to ``http://127.0.0.1:<port>`` from the main process.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from research.api.routes import cloner, keywords, outlier, producer, research as niche, studio
 
@@ -62,6 +64,41 @@ def create_app() -> FastAPI:
     @app.get("/")
     def root() -> dict:
         return {"status": "ok", "see": "/docs"}
+
+    @app.post("/admin/shutdown")
+    async def admin_shutdown(request: Request) -> JSONResponse:
+        """Force the sidecar process to exit.
+
+        Used by ``desktop/electron/researchSidecar.js`` so a Settings ⚙
+        Save (which calls ``restart({ extraEnv })`` to apply the freshly
+        saved API keys) can swap out an externally-launched uvicorn —
+        e.g. one orphaned from a previous Electron run that crashed
+        before its ``before-quit`` handler killed the child, or a dev's
+        long-running ``uvicorn ... --reload`` in a separate terminal.
+        Without this endpoint the desktop's ``restart()`` would re-take
+        the probe-and-reuse path and silently drop the new ``extraEnv``,
+        leaving requests to fail with ``DEEPSEEK_API_KEY not set``.
+
+        Restricted to localhost — uvicorn already only binds 127.0.0.1
+        but we re-check ``request.client.host`` as belt-and-braces in
+        case a future deployment loosens the host config.
+        """
+        client = request.client
+        host = client.host if client is not None else None
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "error": "shutdown only allowed from localhost"},
+            )
+
+        # Schedule the exit ~200ms in the future so the response actually
+        # flushes back to the caller before the event loop goes away.
+        async def _delayed_exit() -> None:
+            await asyncio.sleep(0.2)
+            os._exit(0)
+
+        asyncio.create_task(_delayed_exit())
+        return JSONResponse(content={"ok": True, "shutting_down": True})
 
     return app
 
