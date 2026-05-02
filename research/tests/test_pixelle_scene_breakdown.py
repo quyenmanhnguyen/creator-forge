@@ -407,5 +407,244 @@ def test_long_form_scene_to_json_keys() -> None:
         # PR-26: paste-ready variant list (empty when only one prompt
         # was requested; legacy ``image_prompt`` keeps the first variant).
         "image_prompts",
+        # PR-48: paste-ready video variant list paired 1:1 with
+        # ``image_prompts``; empty for legacy single-image path.
+        "flow_video_prompts",
         "extra",
     }
+
+
+# ─── PR-48: video variant expansion ──────────────────────────────────────────
+
+
+def test_expand_video_variants_returns_one_per_image_variant() -> None:
+    """LLM emits N delimited prompts; one per image variant in order."""
+    from research.core.pixelle.scene_breakdown import (
+        _VARIANT_DELIMITER,
+        expand_video_variants_for_images,
+    )
+
+    scene = LongFormScene(
+        scene_id=1,
+        title="Coffee shop",
+        narration="A barista pulls a shot.",
+        image_prompt="wide shot",
+        flow_video_prompt="Slow camera push toward the bar.",
+    )
+    image_prompts = [
+        "wide shot of the bar",
+        "low-angle on espresso machine",
+        "over-the-shoulder of barista",
+    ]
+    raw = (
+        "Camera dollies forward from the wide framing of the bar, settling on the barista. "
+        "Steam curls upward as he tamps the puck. Low ambient hum.\n"
+        f"{_VARIANT_DELIMITER}\n"
+        "Tilt up from the low-angle of the espresso machine as crema flows. "
+        "Hand reaches into frame to pull the cup. Warm glow from the side lamp.\n"
+        f"{_VARIANT_DELIMITER}\n"
+        "Following the over-the-shoulder framing, the camera glides past his hand "
+        "toward the cup as it lands on the saucer. Soft chatter fills the room.\n"
+    )
+
+    captured: dict[str, str] = {}
+
+    def fake_chat(user: str, system: str) -> str:
+        captured["user"] = user
+        captured["system"] = system
+        return raw
+
+    out = expand_video_variants_for_images(
+        scene, image_prompts, chat_fn=fake_chat
+    )
+    assert len(out) == 3
+    assert "wide framing of the bar" in out[0]
+    assert "low-angle of the espresso" in out[1]
+    assert "over-the-shoulder framing" in out[2]
+    # System prompt must request the right count.
+    assert "EXACTLY 3 flow video prompts" in captured["system"]
+    # User prompt must list all 3 variants in order.
+    assert "IMAGE VARIANT 1:" in captured["user"]
+    assert "IMAGE VARIANT 3:" in captured["user"]
+    assert "low-angle on espresso machine" in captured["user"]
+
+
+def test_expand_video_variants_falls_back_when_llm_returns_nothing() -> None:
+    """LLM returns garbage / empty string → repeat the base flow video prompt."""
+    from research.core.pixelle.scene_breakdown import (
+        expand_video_variants_for_images,
+    )
+
+    scene = LongFormScene(
+        scene_id=1,
+        title="t",
+        narration="n",
+        image_prompt="i",
+        flow_video_prompt="Base motion seed.",
+    )
+
+    def empty_chat(user: str, system: str) -> str:
+        return ""
+
+    out = expand_video_variants_for_images(
+        scene, ["a", "b", "c"], chat_fn=empty_chat
+    )
+    assert out == ["Base motion seed.", "Base motion seed.", "Base motion seed."]
+
+
+def test_expand_video_variants_short_circuits_on_single_variant() -> None:
+    """count==1 — no LLM call needed; just repeat the base prompt."""
+    from research.core.pixelle.scene_breakdown import (
+        expand_video_variants_for_images,
+    )
+
+    scene = LongFormScene(
+        scene_id=1,
+        title="t",
+        narration="n",
+        image_prompt="i",
+        flow_video_prompt="Base motion.",
+    )
+    called: dict[str, bool] = {"hit": False}
+
+    def chat(user: str, system: str) -> str:
+        called["hit"] = True
+        return ""
+
+    out = expand_video_variants_for_images(scene, ["only"], chat_fn=chat)
+    assert out == ["Base motion."]
+    assert called["hit"] is False
+
+
+def test_expand_video_variants_empty_image_prompts_returns_empty() -> None:
+    """No image prompts → no video prompts (don't call the LLM)."""
+    from research.core.pixelle.scene_breakdown import (
+        expand_video_variants_for_images,
+    )
+
+    scene = LongFormScene(
+        scene_id=1,
+        title="t",
+        narration="n",
+        image_prompt="i",
+        flow_video_prompt="vp",
+    )
+    called: dict[str, bool] = {"hit": False}
+
+    def chat(user: str, system: str) -> str:
+        called["hit"] = True
+        return ""
+
+    assert expand_video_variants_for_images(scene, [], chat_fn=chat) == []
+    assert called["hit"] is False
+
+
+def test_expand_video_variants_empty_seed_repeats_empty() -> None:
+    """No flow_video_prompt → degrade to repeating the empty base."""
+    from research.core.pixelle.scene_breakdown import (
+        expand_video_variants_for_images,
+    )
+
+    scene = LongFormScene(
+        scene_id=1,
+        title="t",
+        narration="n",
+        image_prompt="i",
+        flow_video_prompt="",
+    )
+    called: dict[str, bool] = {"hit": False}
+
+    def chat(user: str, system: str) -> str:
+        called["hit"] = True
+        return ""
+
+    out = expand_video_variants_for_images(scene, ["a", "b"], chat_fn=chat)
+    # No seed → no LLM call; we get exactly len(image_prompts) empties.
+    assert out == ["", ""]
+    assert called["hit"] is False
+
+
+def test_generate_scene_breakdown_populates_flow_video_prompts_with_variants() -> None:
+    """When images_per_scene > 1, each scene also carries flow_video_prompts."""
+    from research.core.pixelle.scene_breakdown import (
+        _VARIANT_DELIMITER,
+        generate_scene_breakdown,
+    )
+
+    sample = """Scene 1: Coffee shop
+NARRATION:
+A barista pulls a shot.
+IMAGE PROMPT:
+A bustling coffee shop interior, warm light, ultra-detailed.
+FLOW VIDEO PROMPT:
+Camera glides through the room. Steam rises. Soft jazz hum.
+"""
+
+    image_variants_raw = (
+        f"variant1 image{_VARIANT_DELIMITER}variant2 image{_VARIANT_DELIMITER}variant3 image"
+    )
+    video_variants_raw = (
+        f"variant1 video{_VARIANT_DELIMITER}variant2 video{_VARIANT_DELIMITER}variant3 video"
+    )
+    calls: list[str] = []
+
+    def fake_chat(user: str, system: str) -> str:
+        # Order: breakdown → image variants → video variants
+        if "scene-breakdown specialist" in system:
+            calls.append("breakdown")
+            return sample
+        if "EXACTLY 3 paste-ready image prompts" in system:
+            calls.append("image_variants")
+            return image_variants_raw
+        if "EXACTLY 3 flow video prompts" in system:
+            calls.append("video_variants")
+            return video_variants_raw
+        return ""
+
+    scenes = generate_scene_breakdown(
+        "A coffee shop wakes up.",
+        template=SCENE_TEMPLATES["cinematic"],
+        n_scenes=1,
+        chat_fn=fake_chat,
+        images_per_scene=3,
+    )
+    assert calls == ["breakdown", "image_variants", "video_variants"]
+    assert len(scenes) == 1
+    assert len(scenes[0].image_prompts) == 3
+    assert len(scenes[0].flow_video_prompts) == 3
+    assert "variant1 video" in scenes[0].flow_video_prompts[0]
+    assert "variant3 video" in scenes[0].flow_video_prompts[2]
+
+
+def test_generate_scene_breakdown_no_video_variants_when_single_image() -> None:
+    """images_per_scene <= 1 → no extra LLM call; flow_video_prompts stays ()."""
+    from research.core.pixelle.scene_breakdown import generate_scene_breakdown
+
+    sample = """Scene 1: t
+NARRATION:
+n.
+IMAGE PROMPT:
+i.
+FLOW VIDEO PROMPT:
+v.
+"""
+    calls: list[str] = []
+
+    def fake_chat(user: str, system: str) -> str:
+        if "scene-breakdown specialist" in system:
+            calls.append("breakdown")
+            return sample
+        calls.append("unexpected:" + system[:30])
+        return ""
+
+    scenes = generate_scene_breakdown(
+        "A short script body.",
+        template=SCENE_TEMPLATES["cinematic"],
+        n_scenes=1,
+        chat_fn=fake_chat,
+        images_per_scene=1,
+    )
+    assert calls == ["breakdown"]
+    assert len(scenes) == 1
+    assert scenes[0].image_prompts == ()
+    assert scenes[0].flow_video_prompts == ()

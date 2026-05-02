@@ -204,6 +204,13 @@ class LongFormScene:
     the user requested ``images_per_scene > 1``. ``image_prompt`` (the
     legacy singular field) always carries the canonical first prompt
     so callers that don't know about variants keep working unchanged.
+
+    PR-48 adds ``flow_video_prompts`` — a parallel array of variant
+    video prompts where ``flow_video_prompts[i]`` describes the
+    camera motion that begins from the framing of
+    ``image_prompts[i]``. This is what gives the Storyboard Video
+    batch its 1:1 visual continuity with the Image batch above.
+    Empty when ``images_per_scene <= 1`` (legacy single-image path).
     """
 
     scene_id: int
@@ -213,6 +220,7 @@ class LongFormScene:
     flow_video_prompt: str
     duration_s: float = 0.0
     image_prompts: tuple[str, ...] = ()
+    flow_video_prompts: tuple[str, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict:
@@ -737,6 +745,113 @@ def expand_image_variants(
     return parsed
 
 
+# ─── Video variant expansion (PR-48) ─────────────────────────────────────────
+
+
+def build_video_variant_system_prompt(*, count: int) -> str:
+    """System prompt for :func:`expand_video_variants_for_images`.
+
+    Asks the LLM to emit ``count`` flow video prompts that each
+    *continue* the corresponding image variant — i.e. start the
+    camera/subject motion from that variant's exact framing /
+    composition / lighting so the resulting video reads as a smooth
+    extension of the still it was paired with.
+    """
+    return (
+        f"You expand a base scene into EXACTLY {count} flow video "
+        "prompts. Each output prompt corresponds 1:1 to an image "
+        "variant the user already approved (provided below in order). "
+        "The video prompt must describe continuous camera + subject "
+        "motion that BEGINS from that exact image variant's framing, "
+        "composition, lighting, and camera angle so the video reads "
+        "as a smooth extension of the still.\n\n"
+        "Hard rules per prompt:\n"
+        "  • 3–4 sentences.\n"
+        "  • First sentence must reference the image variant's "
+        "starting framing (composition / camera angle / subject "
+        "placement) so the cut from still→video is invisible.\n"
+        "  • Then describe continuous motion: camera move, subject "
+        "action, environmental cue. Mix in cinematic camera language.\n"
+        "  • No brand names, logos, or on-screen text.\n"
+        "  • No line breaks — emit as one paragraph per variant.\n\n"
+        f"Output format — emit each variant separated by a single "
+        f"line containing exactly ``{_VARIANT_DELIMITER}`` (and "
+        "nothing else). Do not number, label, or quote the variants. "
+        "No commentary before, between, or after."
+    )
+
+
+def build_video_variant_user_prompt(
+    scene: LongFormScene, image_prompts: list[str]
+) -> str:
+    """The ``user`` half of :func:`expand_video_variants_for_images`.
+
+    Lists each image variant in order so the LLM can match each video
+    prompt 1:1 to the corresponding image. Includes the scene's
+    ``flow_video_prompt`` (when present) as a motion seed the LLM can
+    weave across all variants for tonal consistency.
+    """
+    seed = (scene.flow_video_prompt or "").strip()
+    seed_block = (
+        f"BASE FLOW VIDEO PROMPT (motion seed — weave the camera/subject "
+        f"feel into every variant, but adapt it to each starting framing):\n"
+        f"{seed}\n\n"
+        if seed
+        else ""
+    )
+    variants_block = "\n\n".join(
+        f"IMAGE VARIANT {i + 1}:\n{p.strip()}"
+        for i, p in enumerate(image_prompts)
+    )
+    return (
+        f"BASE SCENE TITLE: {scene.title}\n\n"
+        f"NARRATION (verbatim source paragraph):\n{scene.narration}\n\n"
+        f"{seed_block}"
+        f"IMAGE VARIANTS (one video prompt required per variant, in order):\n\n"
+        f"{variants_block}\n"
+    )
+
+
+def expand_video_variants_for_images(
+    scene: LongFormScene,
+    image_prompts: list[str],
+    *,
+    chat_fn: Callable[[str, str], str] | None = None,
+) -> list[str]:
+    """Expand ``scene.flow_video_prompt`` into per-image-variant
+    flow video prompts.
+
+    ``image_prompts`` should be the same list/tuple that was just
+    written to ``scene.image_prompts`` (length = ``images_per_scene``).
+    Each returned prompt corresponds 1:1 to an entry in that list and
+    starts from that variant's exact framing.
+
+    Returns ``[scene.flow_video_prompt] * len(image_prompts)`` when
+    the LLM call fails or returns nothing parseable, so callers
+    always get exactly ``len(image_prompts)`` entries (matches the
+    legacy "repeat the base prompt" behaviour for image variants).
+    """
+    n = len(image_prompts or [])
+    base = (scene.flow_video_prompt or "").strip()
+    if n <= 0:
+        return []
+    if n == 1 or not base:
+        return [base] * n
+
+    if chat_fn is None:
+        chat_fn = _default_chat_fn()
+    system = build_video_variant_system_prompt(count=n)
+    user = build_video_variant_user_prompt(scene, list(image_prompts))
+    try:
+        raw = chat_fn(user, system)
+    except Exception:  # pragma: no cover — handled by callers
+        raw = ""
+    parsed = parse_variant_response(raw, count=n)
+    if not parsed:
+        return [base] * n
+    return parsed
+
+
 # ─── Orchestrator ────────────────────────────────────────────────────────────
 
 
@@ -825,6 +940,16 @@ def generate_scene_breakdown(
         # Re-emit the singular ``image_prompt`` as the first variant so
         # downstream code that ignores ``image_prompts`` is unaffected.
         head = prompts[0] if prompts else s.image_prompt
+        # PR-48 — also expand variant flow video prompts so each video
+        # row in the Storyboard maps 1:1 to its image variant. We pair
+        # against the *expanded* image_prompts list so the LLM gets
+        # exactly the framings the user is about to render.
+        try:
+            video_prompts = expand_video_variants_for_images(
+                s, list(prompts), chat_fn=chat_fn
+            )
+        except Exception:  # noqa: BLE001
+            video_prompts = [s.flow_video_prompt] * len(prompts)
         expanded.append(
             LongFormScene(
                 scene_id=s.scene_id,
@@ -834,6 +959,7 @@ def generate_scene_breakdown(
                 flow_video_prompt=s.flow_video_prompt,
                 duration_s=s.duration_s,
                 image_prompts=tuple(prompts),
+                flow_video_prompts=tuple(video_prompts),
                 extra=s.extra,
             )
         )

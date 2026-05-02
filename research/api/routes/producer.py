@@ -50,6 +50,7 @@ from research.core.pixelle import (
     estimate_scene_count,
     estimate_total_duration_s,
     expand_image_variants,
+    expand_video_variants_for_images,
     extract_visual_dna,
     fallback_captions_from_text,
     generate_scene_breakdown,
@@ -165,6 +166,19 @@ class SceneOut(BaseModel):
             "that don't know about variants keep working."
         ),
     )
+    flow_video_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PR-48 — paste-ready video prompts paired 1:1 with "
+            "``image_prompts``. ``flow_video_prompts[i]`` describes "
+            "camera/subject motion that begins from the framing of "
+            "``image_prompts[i]`` so the Storyboard Video batch reads "
+            "as a smooth continuation of the Image batch above. Empty "
+            "when ``images_per_scene <= 1`` (legacy single-image path); "
+            "the singular ``flow_video_prompt`` carries the scene-level "
+            "prompt for back-compat."
+        ),
+    )
 
 
 class SceneBreakdownResponse(BaseModel):
@@ -260,6 +274,7 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
                     flow_video_prompt=str(s.flow_video_prompt),
                     duration_s=float(s.duration_s or 0.0),
                     image_prompts=list(s.image_prompts or ()),
+                    flow_video_prompts=list(s.flow_video_prompts or ()),
                 )
             )
         md_blob = serialize_breakdown_md(scenes_raw, template=template)
@@ -368,6 +383,18 @@ class VariantPromptsRequest(BaseModel):
 
 class VariantPromptsResponse(BaseModel):
     prompts: list[str] = []
+    video_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PR-48 — flow video prompts paired 1:1 with ``prompts``. "
+            "Each entry describes camera/subject motion that begins "
+            "from the framing of the corresponding image variant so "
+            "the Storyboard Video batch carries continuity from the "
+            "Image batch. Empty when the LLM call fell back to "
+            "repeating the base flow video prompt (still safe to "
+            "consume — caller can clamp to ``len(prompts)``)."
+        ),
+    )
     warnings: list[str] = []
 
 
@@ -379,6 +406,13 @@ def variant_prompts(req: VariantPromptsRequest) -> VariantPromptsResponse:
     Used by the renderer when the user re-rolls variants without
     re-running scene_breakdown (e.g. after editing the Visual DNA
     override or bumping ``images_per_scene``).
+
+    PR-48 — also expands ``count`` matching flow video prompts (each
+    1:1 with the image variants) so the renderer can re-roll image
+    + video variants in a single call. Returns an empty
+    ``video_prompts`` list when the scene has no
+    ``flow_video_prompt`` to seed the variant call from — callers
+    should fall back to the scene-level prompt in that case.
     """
     warnings: list[str] = []
     scene = LongFormScene(
@@ -388,12 +422,13 @@ def variant_prompts(req: VariantPromptsRequest) -> VariantPromptsResponse:
         image_prompt=req.scene.image_prompt,
         flow_video_prompt=req.scene.flow_video_prompt or "",
     )
+    chat_fn = _make_chat_fn()
     try:
         prompts = expand_image_variants(
             scene,
             count=req.count,
             visual_dna=req.visual_dna or "",
-            chat_fn=_make_chat_fn(),
+            chat_fn=chat_fn,
         )
     except Exception as exc:  # noqa: BLE001
         msg = _llm_warning("Variant prompts", exc)
@@ -403,7 +438,29 @@ def variant_prompts(req: VariantPromptsRequest) -> VariantPromptsResponse:
         # exactly ``count`` entries (mirrors expand_image_variants's
         # in-process fallback path).
         prompts = [req.scene.image_prompt] * req.count
-    return VariantPromptsResponse(prompts=prompts, warnings=warnings)
+
+    video_prompts: list[str] = []
+    # Only attempt the video-variant LLM call when the scene actually
+    # carries a base ``flow_video_prompt`` AND the user wants more
+    # than one variant. With count==1 there's nothing to vary, and
+    # without a seed we'd just emit empties.
+    if req.count > 1 and (req.scene.flow_video_prompt or "").strip():
+        try:
+            video_prompts = expand_video_variants_for_images(
+                scene,
+                list(prompts),
+                chat_fn=chat_fn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = _llm_warning("Variant video prompts", exc)
+            logger.warning(msg)
+            warnings.append(msg)
+            video_prompts = [scene.flow_video_prompt] * len(prompts)
+    return VariantPromptsResponse(
+        prompts=prompts,
+        video_prompts=video_prompts,
+        warnings=warnings,
+    )
 
 
 # ─── Remaining shells (wired in later PRs) ──────────────────────────────────

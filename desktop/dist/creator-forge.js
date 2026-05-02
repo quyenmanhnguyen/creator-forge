@@ -1287,6 +1287,19 @@
         // the one the user just opened. Cleared per-kind when the
         // table is rebuilt from a fresh scene_breakdown.
         promptExpanded: new Set(),
+        // PR-48 — true once the user has explicitly changed the
+        // ``Videos per scene`` select. Until then, videosPerScene
+        // auto-syncs to imagesPerScene so each video variant pairs
+        // 1:1 with its image variant (matches the new
+        // flow_video_prompts continuity from /producer/scene_breakdown).
+        userOverroteVideosPerScene: false,
+        // PR-48 — Pro mode (Grok's Quality model). When true the
+        // Storyboard sends ``enablePro: true`` to image:generate and
+        // forces ``Images per scene`` to 1 (Pro returns 1 ảnh chất
+        // lượng / variant, no side-by-side preview). Stored so the
+        // checkbox state survives re-renders without re-reading the
+        // DOM on every image dispatch.
+        proMode: false,
     };
 
     /** Repaint both image and video tables. */
@@ -2242,6 +2255,58 @@
         return fallback;
     }
 
+    /**
+     * PR-48 — apply Pro mode UI rules. When the checkbox is on, force
+     * ``Images per scene`` to 1 (Grok's Quality model returns 1 high-
+     * quality image per request — no side-by-side preview), disable
+     * the select to make the rule visible, and remember the previous
+     * value so toggling Pro back off restores the user's pick. When
+     * off, re-enable the select and restore the value.
+     */
+    function sbbApplyProMode() {
+        const cb = $('sbb-pro-mode');
+        const sel = $('sbb-images-per-scene');
+        sbbState.proMode = !!(cb && cb.checked);
+        if (!sel) return;
+        if (sbbState.proMode) {
+            if (sel.value !== '1') {
+                sbbState.savedImagesPerScene = sel.value;
+            }
+            sel.value = '1';
+            sel.disabled = true;
+        } else {
+            sel.disabled = false;
+            if (sbbState.savedImagesPerScene && sel.value === '1') {
+                sel.value = sbbState.savedImagesPerScene;
+            }
+        }
+        sbbSyncVideosFromImages();
+    }
+
+    /**
+     * PR-48 — keep ``Videos per scene`` in sync with ``Images per
+     * scene`` so each video variant pairs 1:1 with its image variant.
+     * Only fires until the user explicitly touches the videos select
+     * (tracked in ``sbbState.userOverroteVideosPerScene``); after that
+     * the user's pick wins until the next session.
+     */
+    function sbbSyncVideosFromImages() {
+        if (sbbState.userOverroteVideosPerScene) return;
+        const imgSel = $('sbb-images-per-scene');
+        const vidSel = $('sbb-videos-per-scene');
+        if (!imgSel || !vidSel) return;
+        const target = String(imgSel.value || '');
+        // Only set if the videos dropdown actually offers that value;
+        // otherwise leave the dropdown alone (avoid inserting bogus
+        // options at runtime).
+        for (const opt of vidSel.options) {
+            if (String(opt.value) === target) {
+                vidSel.value = target;
+                return;
+            }
+        }
+    }
+
     function sbbClear() {
         sbbState.imageRows = [];
         sbbState.videoRows = [];
@@ -2668,6 +2733,12 @@
         const config = { imageGenerationCount: 1 };
         const aspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
         if (aspect) config.aspectRatio = aspect;
+        // PR-48 — Pro mode flips Grok's Quality model on; ImageService
+        // already accepts ``enablePro`` and translates it to the
+        // imagine-image-pro side of the API. We forward the cached
+        // sbbState.proMode (set by sbbApplyProMode) so the user's
+        // checkbox state survives a re-render.
+        if (sbbState.proMode) config.enablePro = true;
 
         const tasks = [];
         if (plainPlan.prompts.length) {
@@ -2985,6 +3056,21 @@
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.
         sbbRepaintAll();
+        // PR-48 — wire Pro mode + image/video count auto-sync.
+        // Order matters: apply Pro mode FIRST so a stale checkbox
+        // from a previous session restore is reflected in the images
+        // select state before the videos select reads its value.
+        sbbApplyProMode();
+        const proModeCb = $('sbb-pro-mode');
+        if (proModeCb) proModeCb.addEventListener('change', sbbApplyProMode);
+        const imgsPerSceneSel = $('sbb-images-per-scene');
+        if (imgsPerSceneSel) imgsPerSceneSel.addEventListener('change', sbbSyncVideosFromImages);
+        const vidsPerSceneSel = $('sbb-videos-per-scene');
+        if (vidsPerSceneSel) vidsPerSceneSel.addEventListener('change', () => {
+            // Once the user explicitly picks a videos count we stop
+            // auto-syncing — their intent wins until they reload.
+            sbbState.userOverroteVideosPerScene = true;
+        });
         // PR-28 — paint the global ref list so the empty-state is
         // visible from cold start.
         sbbRenderGlobalRefs();

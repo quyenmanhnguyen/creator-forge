@@ -1239,7 +1239,7 @@
                             <option value="t2v">T2V (text-to-video; prompt-only)</option>
                         </select>
                     </label>
-                    <label title="Number of image variants to generate per scene. Defaults to 4 — pick the best afterwards.">Images per scene
+                    <label title="Number of image variants to generate per scene. Defaults to 4 — pick the best afterwards. Forced to 1 when Pro mode is on.">Images per scene
                         <select id="sbb-images-per-scene">
                             <option value="1">1</option>
                             <option value="2">2</option>
@@ -1249,13 +1249,19 @@
                             <option value="8">8</option>
                         </select>
                     </label>
-                    <label title="Number of video variants to generate per scene. Defaults to 2.">Videos per scene
+                    <label title="Number of video variants to generate per scene. Auto-syncs to Images per scene so each video flows from its matching image variant.">Videos per scene
                         <select id="sbb-videos-per-scene">
                             <option value="1">1</option>
-                            <option value="2" selected>2 (default)</option>
+                            <option value="2">2</option>
                             <option value="3">3</option>
-                            <option value="4">4</option>
+                            <option value="4" selected>4 (auto-sync)</option>
+                            <option value="6">6</option>
+                            <option value="8">8</option>
                         </select>
+                    </label>
+                    <label class="sbb-pro-label" title="Use Grok's Pro / Quality mode (1 high-quality image per variant). Off = Speed mode (returns 2-4 quick images side-by-side).">
+                        <input type="checkbox" id="sbb-pro-mode" />
+                        <span>Chất lượng cao (Pro mode — 1 ảnh chất lượng / variant)</span>
                     </label>
                 </div>
                 <div class="actions">
