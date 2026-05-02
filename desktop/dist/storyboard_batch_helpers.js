@@ -230,17 +230,25 @@
         // or a specific variant failed). The fallback preserves
         // PR-23's hero-image behaviour for legacy 1-row-per-scene
         // tables and for partial failures.
-        const exactByPair = new Map(); // "<scene>#<variant>" → image_path
-        const bestByScene = new Map(); // <scene> → {v, image_path}
+        //
+        // Also propagates the matched image's renderer-side ``url``
+        // (a ``file://`` URL produced by ``electronAPI.getFileUrl``) into
+        // a new ``source_image_url`` field on the video row so the
+        // Storyboard's Video table can render a hero-image thumbnail
+        // *before* the video itself is generated. Only the URL is
+        // copied — never mutates the source image row.
+        const exactByPair = new Map(); // "<scene>#<variant>" → {image_path, url}
+        const bestByScene = new Map(); // <scene> → {v, image_path, url}
         for (const ir of imageRows) {
             if (!ir.image_path) continue;
             if (ir.status !== "generated" && ir.status !== "retried") continue;
             const sceneKey = String(ir.scene_id);
             const v = (typeof ir.variant_idx === "number") ? ir.variant_idx : 0;
-            exactByPair.set(`${sceneKey}#${v}`, ir.image_path);
+            const url = (typeof ir.url === "string" && ir.url) ? ir.url : null;
+            exactByPair.set(`${sceneKey}#${v}`, { image_path: ir.image_path, url });
             const cur = bestByScene.get(sceneKey);
             if (!cur || v < cur.v) {
-                bestByScene.set(sceneKey, { v, image_path: ir.image_path });
+                bestByScene.set(sceneKey, { v, image_path: ir.image_path, url });
             }
         }
         return videoRows.map((row) => {
@@ -248,9 +256,17 @@
             const variant = (typeof row.variant_idx === "number") ? row.variant_idx : 0;
             const exact = exactByPair.get(`${sceneKey}#${variant}`);
             const fallback = bestByScene.get(sceneKey);
-            const ip = exact || (fallback ? fallback.image_path : null);
-            if (ip === row.image_path) return row;
-            return Object.assign({}, row, { image_path: ip });
+            const match = exact || fallback || null;
+            const ip = match ? match.image_path : null;
+            const url = match ? match.url : null;
+            if (ip === row.image_path && url === (row.source_image_url || null)) return row;
+            const next = Object.assign({}, row, { image_path: ip });
+            // Only set source_image_url when we have a value or the
+            // existing row already had one — so passing rows with no
+            // matched image stays clean (no stale URL field).
+            if (url) next.source_image_url = url;
+            else if (row.source_image_url && !ip) next.source_image_url = null;
+            return next;
         });
     }
 
