@@ -123,6 +123,59 @@
     }
 
     /**
+     * PR-A — richer loading variant for long-running LLM endpoints.
+     * Returns a controller with ``stop()`` so the caller can tear the
+     * timer down once the IPC settles (success or error). The caller
+     * is responsible for replacing the panel's innerHTML afterwards;
+     * stopping just halts the interval.
+     *
+     *   const ctl = showProgress('sb-result', 'Breaking script...', PHASES,
+     *                            { hint: 'usually 30-90s' });
+     *   try { ... } finally { ctl.stop(); }
+     *
+     * If the progress helpers module isn't loaded (renderer running
+     * outside the bundled HTML, e.g. a stripped-down test harness)
+     * we transparently fall back to ``showLoading`` so callers don't
+     * have to feature-detect.
+     */
+    function showProgress(targetId, label, phases, opts = {}) {
+        const target = $(targetId);
+        if (!target) return { stop: function () {} };
+        const helpers = (typeof window !== 'undefined' && window.StoryboardProgressHelpers) || null;
+        if (!helpers) {
+            showLoading(targetId, label || 'Working...');
+            return { stop: function () {} };
+        }
+        const phaseList = Array.isArray(phases) && phases.length
+            ? phases
+            : helpers.DEFAULT_SCENE_BREAKDOWN_PHASES;
+        const startedAt = Date.now();
+        const hint = (opts && typeof opts.hint === 'string') ? opts.hint : '';
+
+        const repaint = () => {
+            const elapsed = Date.now() - startedAt;
+            target.innerHTML = helpers.buildProgressHtml({
+                label: label || 'Working...',
+                phaseText: helpers.selectPhaseLabel(phaseList, elapsed),
+                elapsedText: helpers.formatElapsed(elapsed),
+                // The hint only kicks in once the user has been
+                // staring at the spinner for >3s — this avoids
+                // flashing it on snappy responses (sub-second).
+                hint: elapsed >= 3000 ? hint : '',
+            });
+        };
+
+        repaint();
+        scrollResultIntoView(target);
+        const intervalId = setInterval(repaint, 1000);
+        return {
+            stop: function () {
+                clearInterval(intervalId);
+            },
+        };
+    }
+
+    /**
      * PR-46 — scroll a freshly painted result panel into view if
      * it isn't already visible. Smooth-scrolls to the start of the
      * panel so the user sees the spinner / first lines of output
@@ -737,11 +790,23 @@
         if (nField && nField.trim().length) {
             params.n_scenes = asInt(nField, 12);
         }
-        showLoading('sb-result', 'Breaking script into scenes (DeepSeek)...');
+        // PR-A — long-running endpoint (30–120s typical), so use
+        // the progress UI instead of the static loading spinner.
+        // Phases are timed approximations of the backend's pipeline
+        // (script split → Visual DNA → variant prompt fan-out); the
+        // elapsed counter is the real signal that the call is alive.
+        const progressCtl = showProgress(
+            'sb-result',
+            'Đang chia kịch bản thành scenes (DeepSeek)…',
+            null,  // null → use DEFAULT_SCENE_BREAKDOWN_PHASES
+            { hint: 'Thường mất 30–90s tuỳ độ dài script. Variants giờ chạy song song nên scripts dài cũng nhanh hơn rồi.' }
+        );
         try {
             const data = await api.storyboard.fromScript(params);
+            progressCtl.stop();
             renderSceneBreakdown(data);
         } catch (err) {
+            progressCtl.stop();
             showError('sb-result', err);
         }
     }
