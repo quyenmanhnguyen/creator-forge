@@ -68,12 +68,19 @@ test('platformKey: linux + x64 → linux-x64', () => {
     assert.strictEqual(helpers.platformKey('linux', 'x64'), 'linux-x64');
 });
 
-test('platformKey: darwin throws (PR-19 out of scope)', () => {
-    assert.throws(() => helpers.platformKey('darwin', 'x64'), /macOS.*follow-up|out of scope/);
-    assert.throws(() => helpers.platformKey('darwin', 'arm64'), /unsupported arch|macOS.*follow-up|out of scope/);
+test('platformKey: darwin + x64 → darwin-x64 (PR-62)', () => {
+    assert.strictEqual(helpers.platformKey('darwin', 'x64'), 'darwin-x64');
 });
 
-test('platformKey: arch != x64 throws', () => {
+test('platformKey: darwin + arm64 → darwin-arm64 (PR-62)', () => {
+    assert.strictEqual(helpers.platformKey('darwin', 'arm64'), 'darwin-arm64');
+});
+
+test('platformKey: darwin + unknown arch throws', () => {
+    assert.throws(() => helpers.platformKey('darwin', 'ia32'), /unsupported arch for darwin/);
+});
+
+test('platformKey: arch != x64 throws on win32 / linux', () => {
     assert.throws(() => helpers.platformKey('win32', 'arm64'), /unsupported arch/);
     assert.throws(() => helpers.platformKey('linux', 'ia32'), /unsupported arch/);
 });
@@ -160,6 +167,39 @@ test('loadConfig: linux-x64 entry exists for Devin smoke', () => {
     assert.strictEqual(lin.triple, 'x86_64-unknown-linux-gnu');
     assert.match(lin.sha256, /^[0-9a-f]{64}$/);
     assert.strictEqual(lin.interpreter_relpath, 'python/bin/python3');
+});
+
+test('loadConfig: darwin-x64 entry exists (PR-62)', () => {
+    const cfg = helpers.loadConfig();
+    const m = cfg.platforms['darwin-x64'];
+    assert.ok(m, 'darwin-x64 entry present');
+    assert.strictEqual(m.triple, 'x86_64-apple-darwin');
+    assert.strictEqual(m.asset_suffix, 'install_only.tar.gz');
+    assert.match(m.sha256, /^[0-9a-f]{64}$/);
+    assert.strictEqual(m.interpreter_relpath, 'python/bin/python3');
+});
+
+test('loadConfig: darwin-arm64 entry exists (PR-62)', () => {
+    const cfg = helpers.loadConfig();
+    const m = cfg.platforms['darwin-arm64'];
+    assert.ok(m, 'darwin-arm64 entry present');
+    assert.strictEqual(m.triple, 'aarch64-apple-darwin');
+    assert.strictEqual(m.asset_suffix, 'install_only.tar.gz');
+    assert.match(m.sha256, /^[0-9a-f]{64}$/);
+    assert.strictEqual(m.interpreter_relpath, 'python/bin/python3');
+});
+
+test('buildAssetUrl: composes a darwin URL (PR-62)', () => {
+    const u = helpers.buildAssetUrl({
+        releaseTag: '20250918',
+        pythonVersion: '3.12.11',
+        triple: 'aarch64-apple-darwin',
+        assetSuffix: 'install_only.tar.gz',
+    });
+    assert.strictEqual(
+        u,
+        'https://github.com/astral-sh/python-build-standalone/releases/download/20250918/cpython-3.12.11+20250918-aarch64-apple-darwin-install_only.tar.gz',
+    );
 });
 
 test('loadConfig: malformed JSON / missing keys throws', () => {

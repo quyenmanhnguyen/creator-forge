@@ -189,21 +189,75 @@ test('resolvePythonExecutable: PATH fallback (Linux/macOS)', () => {
     assert.strictEqual(got, 'python3');
 });
 
-test('resolvePythonExecutable: dev-mode skipped on darwin (PR-19 Windows-only)', () => {
+test('resolvePythonExecutable: dev-mode bundled (darwin-x64) (PR-62)', () => {
     const repoRoot = '/home/dev/creator-forge';
-    // Even if a darwin-shaped runtime tree exists locally, the lookup
-    // must not pick it up — we don't have a pinned darwin entry yet.
+    const expected = repoRoot + '/desktop/build/python-runtime/darwin-x64/python/bin/python3';
     const got = sidecar.resolvePythonExecutable({
         env: {},
         platform: 'darwin',
         arch: 'x64',
         resourcesPath: null,
         repoRoot,
+        fsImpl: makeFs([expected]),
+    });
+    assert.strictEqual(got, expected);
+});
+
+test('resolvePythonExecutable: dev-mode bundled (darwin-arm64) (PR-62)', () => {
+    const repoRoot = '/home/dev/creator-forge';
+    const expected = repoRoot + '/desktop/build/python-runtime/darwin-arm64/python/bin/python3';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'darwin',
+        arch: 'arm64',
+        resourcesPath: null,
+        repoRoot,
+        fsImpl: makeFs([expected]),
+    });
+    assert.strictEqual(got, expected);
+});
+
+test('resolvePythonExecutable: macOS packaged → resources/python/bin/python3 (PR-62)', () => {
+    const resources = '/Applications/Creator Forge.app/Contents/Resources';
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'darwin',
+        arch: 'arm64',
+        resourcesPath: resources,
+        repoRoot: null,
+        fsImpl: makeFs([resources + '/python/bin/python3']),
+    });
+    assert.strictEqual(got, resources + '/python/bin/python3');
+});
+
+test('resolvePythonExecutable: dev-mode skipped on unsupported platform/arch', () => {
+    const repoRoot = '/home/dev/creator-forge';
+    // freebsd is not in the bundle key list — must fall through to PATH
+    // even if a runtime tree happens to exist on disk.
+    const got = sidecar.resolvePythonExecutable({
+        env: {},
+        platform: 'freebsd',
+        arch: 'x64',
+        resourcesPath: null,
+        repoRoot,
         fsImpl: makeFs([
-            repoRoot + '/desktop/build/python-runtime/darwin-x64/python/bin/python3',
+            repoRoot + '/desktop/build/python-runtime/freebsd-x64/python/bin/python3',
         ]),
     });
     assert.strictEqual(got, 'python3');
+});
+
+test('isDevModeBundleSupported: covers exactly the pinned bundle keys', () => {
+    assert.strictEqual(sidecar.isDevModeBundleSupported('win32', 'x64'), true);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('linux', 'x64'), true);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('darwin', 'x64'), true);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('darwin', 'arm64'), true);
+    // Negative — combinations NOT pinned in scripts/python-runtime.config.json:
+    assert.strictEqual(sidecar.isDevModeBundleSupported('win32', 'arm64'), false);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('linux', 'arm64'), false);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('linux', 'ia32'), false);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('freebsd', 'x64'), false);
+    assert.strictEqual(sidecar.isDevModeBundleSupported('aix', 'x64'), false);
 });
 
 test('resolvePythonExecutable: packaged path present takes precedence over dev-mode', () => {
@@ -234,6 +288,7 @@ test('module exports public + private helpers expected by callers/tests', () => 
     assert.strictEqual(typeof sidecar.findRepoRoot, 'function');
     assert.strictEqual(typeof sidecar.locatePackagedSidecarRoot, 'function');
     assert.strictEqual(typeof sidecar.resolvePythonExecutable, 'function');
+    assert.strictEqual(typeof sidecar.isDevModeBundleSupported, 'function');
     assert.strictEqual(typeof sidecar.pythonExecutable, 'function');
 });
 

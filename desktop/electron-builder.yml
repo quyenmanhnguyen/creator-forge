@@ -1,15 +1,18 @@
 # electron-builder config for creator-forge.
 #
-# Priorities (PR-18):
+# Targets:
 #   - Windows .exe (NSIS installer, x64) is the primary target.
-#   - macOS DMG and Linux AppImage configs are present so the same
-#     `npm run dist:<target>` works on those hosts, but they are not
-#     code-signed in this PR.
-#   - Python research/ sidecar is shipped as `extraResources` so the
-#     packaged app can spawn `python3 -m uvicorn research.api.main:app`
-#     against the bundled source without re-cloning the repo. The user
-#     still needs Python 3.10+ + `pip install -r research/requirements.txt`
-#     on the host (we do NOT bundle the interpreter or its deps in PR-18).
+#   - macOS DMG (x64 + arm64) and Linux AppImage (x64) ship with the
+#     bundled python-build-standalone interpreter as of PR-62.
+#
+# Python sidecar bundling (PR-18 / PR-19 / PR-62):
+#   - `research/` source is shipped as `extraResources` on every
+#     platform.
+#   - The python-build-standalone interpreter (cpython 3.12.x) is
+#     bundled per platform from `build/python-runtime/<key>/python`.
+#     Run the matching `npm run prefetch:python:<target>` first to
+#     populate that directory; the `dist:<target>` scripts in
+#     `package.json` already chain it.
 #
 # This file is loaded automatically by electron-builder when run from
 # `desktop/` (CWD of `npm run dist`).
@@ -87,13 +90,6 @@ win:
         - x64
   artifactName: "${productName}-Setup-${version}-${arch}.${ext}"
   # icon: build/icon.ico   # add later; electron-builder uses Electron default if absent
-  # Windows-only: ship a bundled Python interpreter so users don't need
-  # to install Python 3.10+ themselves before launching. Sourced from
-  # python-build-standalone (astral-sh) — fetch via
-  # `npm run prefetch:python -- --platform win32 --arch x64` before
-  # `npm run dist:win`. See scripts/python-runtime.config.json for
-  # pinning. This path is platform-scoped on purpose: macOS and Linux
-  # bundled runtimes are deliberately a follow-up PR.
   #
   # IMPORTANT: electron-builder REPLACES the top-level `extraResources`
   # with this platform-specific one (no merge), so we must redeclare
@@ -144,9 +140,40 @@ mac:
         - x64
         - arm64
   artifactName: "${productName}-${version}-${arch}.${ext}"
-  # No code signing in PR-18 — user will see Gatekeeper warning. Future
-  # PR can wire `CSC_LINK` / `CSC_KEY_PASSWORD` env vars.
+  # No code signing — user will see Gatekeeper warning. Future PR can
+  # wire `CSC_LINK` / `CSC_KEY_PASSWORD` env vars.
   identity: null
+  # Same as `win:` — electron-builder REPLACES the top-level
+  # `extraResources` here, so the research/ sidecar must be redeclared
+  # alongside the bundled python interpreter. The interpreter is per-arch
+  # (Intel x64 vs. Apple Silicon arm64); electron-builder substitutes
+  # `${arch}` per build pass.
+  extraResources:
+    - from: "../research"
+      to: "research"
+      filter:
+        - "**/*"
+        - "!__pycache__/**"
+        - "!**/__pycache__/**"
+        - "!*.pyc"
+        - "!**/*.pyc"
+        - "!.pytest_cache/**"
+        - "!.ruff_cache/**"
+        - "!.venv/**"
+        - "!venv/**"
+        - "!tests/**"
+        - "!**/*.egg-info/**"
+    - from: "build/python-runtime/darwin-${arch}/python"
+      to: "python"
+      filter:
+        - "**/*"
+        - "!**/__pycache__/**"
+        - "!**/*.pyc"
+        - "!**/test/**"
+        - "!**/tests/**"
+        - "!**/idle_test/**"
+        - "!**/turtledemo/**"
+        - "!**/tkinter/test/**"
 
 dmg:
   artifactName: "${productName}-${version}-${arch}.${ext}"
@@ -158,6 +185,34 @@ linux:
       arch:
         - x64
   artifactName: "${productName}-${version}-${arch}.${ext}"
+  # Same as `win:` / `mac:` — redeclare research/ sidecar alongside the
+  # bundled python interpreter so the AppImage doesn't lose either.
+  extraResources:
+    - from: "../research"
+      to: "research"
+      filter:
+        - "**/*"
+        - "!__pycache__/**"
+        - "!**/__pycache__/**"
+        - "!*.pyc"
+        - "!**/*.pyc"
+        - "!.pytest_cache/**"
+        - "!.ruff_cache/**"
+        - "!.venv/**"
+        - "!venv/**"
+        - "!tests/**"
+        - "!**/*.egg-info/**"
+    - from: "build/python-runtime/linux-x64/python"
+      to: "python"
+      filter:
+        - "**/*"
+        - "!**/__pycache__/**"
+        - "!**/*.pyc"
+        - "!**/test/**"
+        - "!**/tests/**"
+        - "!**/idle_test/**"
+        - "!**/turtledemo/**"
+        - "!**/tkinter/test/**"
 
 # Cross-platform: don't try to rebuild native deps for the target. We
 # only have JS deps + Electron (no native modules). Disabling this

@@ -65,7 +65,8 @@ function locatePackagedSidecarRoot(resourcesPath, fsImpl = fs) {
  *      missing path — we want the spawn-side error to surface so users
  *      know their override is broken).
  *   2. Bundled-by-electron-builder runtime at
- *      `<resourcesPath>/python/<interpreter>` (PR-19, Windows).
+ *      `<resourcesPath>/python/<interpreter>` (PR-19 on Windows,
+ *      PR-62 on macOS + Linux).
  *   3. Dev-mode bundled runtime at
  *      `<repoRoot>/desktop/build/python-runtime/<host-key>/<interpreter>`
  *      (populated by `scripts/fetch-python-runtime.js`).
@@ -92,8 +93,10 @@ function resolvePythonExecutable(opts = {}) {
     }
 
     // 3. dev-mode: <repoRoot>/desktop/build/python-runtime/<key>/python/<interpreterRel>
+    //    Supported keys mirror python-runtime.config.json: win32-x64,
+    //    linux-x64, darwin-x64, darwin-arm64.
     const repoRoot = opts.repoRoot || findRepoRoot(__dirname);
-    if (repoRoot && arch === 'x64' && (platform === 'win32' || platform === 'linux')) {
+    if (repoRoot && isDevModeBundleSupported(platform, arch)) {
         const key = `${platform}-${arch}`;
         const devBundled = path.join(repoRoot, 'desktop', 'build', 'python-runtime', key, 'python', interpreterRel);
         if (fsImpl.existsSync(devBundled)) return devBundled;
@@ -101,6 +104,20 @@ function resolvePythonExecutable(opts = {}) {
 
     // 4. PATH fallback (existing behaviour pre-PR-19).
     return platform === 'win32' ? 'python' : 'python3';
+}
+
+/**
+ * Returns true when `<platform>-<arch>` matches one of the bundle keys
+ * pinned in `scripts/python-runtime.config.json`. Encoded here (not
+ * loaded from JSON) to keep this hot-path zero-IO; CI guards against
+ * drift via `test_research_sidecar_lookup.js`.
+ */
+function isDevModeBundleSupported(platform, arch) {
+    if (arch === 'x64' && (platform === 'win32' || platform === 'linux' || platform === 'darwin')) {
+        return true;
+    }
+    if (arch === 'arm64' && platform === 'darwin') return true;
+    return false;
 }
 
 function pythonExecutable() {
@@ -282,5 +299,6 @@ module.exports = {
     findRepoRoot,
     locatePackagedSidecarRoot,
     resolvePythonExecutable,
+    isDevModeBundleSupported,
     pythonExecutable,
 };
