@@ -436,11 +436,34 @@ async function stop() {
         return;
     }
     const proc = child;
+    const pid = proc.pid;
     child = null;
     actualPort = null;
-    try {
-        proc.kill(process.platform === 'win32' ? 'SIGTERM' : 'SIGINT');
-    } catch (_) {}
+    if (process.platform === 'win32' && pid) {
+        // Windows-specific: child.kill('SIGTERM') maps to TerminateProcess
+        // on the *immediate* child PID only. The python.exe interpreter
+        // we spawn frequently has child / grandchild python processes
+        // (uvicorn lifespan handlers, asyncio thread pool helpers) that
+        // can inherit the listening socket — when those survive, the
+        // socket on :5050 stays bound for several seconds after our
+        // child is "dead". `taskkill /F /T /PID <pid>` walks the
+        // parent-child tree via the kernel's PID table and forcibly
+        // terminates every descendant in one shot, freeing the socket
+        // synchronously. This is the same kill that `npm` / `electron`
+        // use on Windows for the same reason.
+        logSink('stop windows tree-kill /F /T /PID', pid);
+        try {
+            spawnSyncImpl('taskkill', ['/F', '/T', '/PID', String(pid)], {
+                encoding: 'utf8', timeout: 3000, windowsHide: true,
+            });
+        } catch (err) {
+            logSink('WARN taskkill failed:', err && err.message);
+        }
+    } else {
+        try {
+            proc.kill('SIGINT');
+        } catch (_) {}
+    }
     await new Promise((resolve) => {
         const t = setTimeout(() => {
             try {
@@ -513,7 +536,9 @@ async function restart(opts = {}) {
     // Whether we spawned or external-reused the previous instance, the
     // OS may need a beat to release the listening socket before our
     // fresh uvicorn can bind it. Block until /healthz stops responding.
+    logSink('restart waitForPortFree(3s) on :' + portToUse + ' wasExternal=' + wasExternal);
     let freed = await waitForPortFree(portToUse, 3000);
+    logSink('restart first waitForPortFree result freed=' + freed);
     if (!freed) {
         // Multiple causes possible:
         //  • externalReuse + stale pre-PR-65 sidecar 404'd /admin/shutdown
@@ -530,6 +555,9 @@ async function restart(opts = {}) {
         // and SIGKILL it — we'd rather kill an unrelated holder than
         // leave the user stuck with "port busy" after every Save.
         const kill = killByPort(portToUse);
+        logSink('restart killByPort result killed=' + kill.killed +
+            ' pids=' + JSON.stringify(kill.pids || []) +
+            (kill.error ? ' error=' + kill.error : ''));
         if (kill.killed) {
             logSink(
                 'freed :' + portToUse +
@@ -543,7 +571,13 @@ async function restart(opts = {}) {
                 'WARN OS-level kill on :' + portToUse + ' failed: ' + kill.error,
             );
         }
-        freed = await waitForPortFree(portToUse, 3000);
+        // Generous second-wait window: on Windows the kernel can take
+        // 5+ seconds to release a listening socket after the holder
+        // process tree exits. 3s here was sometimes too tight on slow
+        // machines (PR-68 user report).
+        logSink('restart second waitForPortFree(8s) on :' + portToUse);
+        freed = await waitForPortFree(portToUse, 8000);
+        logSink('restart second waitForPortFree result freed=' + freed);
     }
 
     if (!freed) {
