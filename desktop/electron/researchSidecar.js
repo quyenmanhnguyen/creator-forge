@@ -22,9 +22,31 @@ let spawnImpl = realSpawn;
 let spawnSyncImpl = realSpawnSync;
 
 const DEFAULT_PORT = Number(process.env.CREATOR_FORGE_RESEARCH_PORT || 5050);
-const HEALTH_TIMEOUT_MS = 30_000;
+const HEALTH_TIMEOUT_MS_DEFAULT = 90_000;
 const HEALTH_INTERVAL_MS = 500;
+const HEALTH_PROGRESS_LOG_MS = 5_000;
 const SERVICE_TAG = 'creator-forge.research';
+// How many trailing stderr lines to keep around so we can include them
+// in the timeout error message — the user's installer would otherwise
+// just see "sidecar didn't become healthy in Xs" with no clue why.
+const STDERR_TAIL_LINES = 20;
+
+/**
+ * Read the healthz timeout from `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS`
+ * at call time (not module load) so a) installers can override per
+ * machine without rebuilding, and b) tests can flip it via process.env
+ * after require(). Falls back to 90_000ms — chosen because real-world
+ * cold-start measurements showed up to ~70s on Windows boxes with
+ * antivirus + bundled python-build-standalone first-run.
+ */
+function healthTimeoutMs() {
+    const raw = process.env.CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS;
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n > 0) return n;
+    }
+    return HEALTH_TIMEOUT_MS_DEFAULT;
+}
 
 let child = null;
 let actualPort = null;
@@ -180,11 +202,37 @@ function probe(port) {
     });
 }
 
-async function waitForHealth(port) {
-    const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+/**
+ * Poll `:port/healthz` until it answers 200 or `timeoutMs` elapses.
+ * Logs progress every `HEALTH_PROGRESS_LOG_MS` so a slow cold-start
+ * (Windows + AV + bundled python first run) doesn't look like a hang.
+ */
+async function waitForHealth(port, timeoutMs) {
+    const budget = typeof timeoutMs === 'number' && timeoutMs > 0
+        ? timeoutMs
+        : healthTimeoutMs();
+    const startedAt = Date.now();
+    const deadline = startedAt + budget;
+    let lastProgressLog = startedAt;
     while (Date.now() < deadline) {
         const { ok } = await probe(port);
-        if (ok) return true;
+        if (ok) {
+            const elapsed = Date.now() - startedAt;
+            if (elapsed > HEALTH_PROGRESS_LOG_MS) {
+                logSink('healthz green on :' + port + ' after ' + elapsed + 'ms');
+            }
+            return true;
+        }
+        const now = Date.now();
+        if (now - lastProgressLog >= HEALTH_PROGRESS_LOG_MS) {
+            const elapsedSec = ((now - startedAt) / 1000).toFixed(1);
+            const remainingSec = Math.max(0, Math.round((deadline - now) / 1000));
+            logSink(
+                'still waiting for sidecar healthz on :' + port +
+                ' — ' + elapsedSec + 's elapsed, ~' + remainingSec + 's budget remaining',
+            );
+            lastProgressLog = now;
+        }
         await new Promise((r) => setTimeout(r, HEALTH_INTERVAL_MS));
     }
     return false;
@@ -405,18 +453,39 @@ async function start({ port = DEFAULT_PORT, repoRoot, extraEnv } = {}) {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    // Buffer the trailing stderr so we can attach it to the timeout
+    // error message — without this, the renderer's Save dialog would
+    // just show "sidecar didn't become healthy" with no clue whether
+    // uvicorn crashed (ImportError, ModuleNotFoundError, port-already-
+    // bound) or is just slow.
+    const stderrTail = [];
     child.stdout.on('data', (buf) => logSink('stdout', buf.toString().trim()));
-    child.stderr.on('data', (buf) => logSink('stderr', buf.toString().trim()));
+    child.stderr.on('data', (buf) => {
+        const line = buf.toString().trim();
+        if (line) {
+            logSink('stderr', line);
+            stderrTail.push(line);
+            while (stderrTail.length > STDERR_TAIL_LINES) stderrTail.shift();
+        }
+    });
     child.on('exit', (code, signal) => {
         logSink('exited', { code, signal });
         child = null;
         actualPort = null;
     });
 
-    const healthy = await waitForHealth(port);
+    const budget = healthTimeoutMs();
+    const healthy = await waitForHealth(port, budget);
     if (!healthy) {
         await stop();
-        throw new Error(`research sidecar did not become healthy on :${port} within ${HEALTH_TIMEOUT_MS}ms`);
+        const tail = stderrTail.length
+            ? '\nLast stderr from uvicorn:\n' + stderrTail.join('\n')
+            : '\nNo stderr captured — set CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS=120000 ' +
+              'to extend the wait if your machine has a slow first-import (e.g. AV ' +
+              'scanning python-build-standalone for the first time).';
+        throw new Error(
+            `research sidecar did not become healthy on :${port} within ${budget}ms.${tail}`,
+        );
     }
     actualPort = port;
     logSink('healthy on :' + port);
@@ -601,7 +670,7 @@ module.exports = {
     getPort,
     setLogSink,
     // Exported for offline tests (test_research_sidecar_lookup.js,
-    // test_research_sidecar_restart.js):
+    // test_research_sidecar_restart.js, test_research_sidecar_health_timeout.js):
     findRepoRoot,
     locatePackagedSidecarRoot,
     resolvePythonExecutable,
@@ -609,7 +678,10 @@ module.exports = {
     pythonExecutable,
     sendShutdown,
     waitForPortFree,
+    waitForHealth,
+    healthTimeoutMs,
     killByPort,
+    HEALTH_TIMEOUT_MS_DEFAULT,
     // Test-only hooks — used by test_research_sidecar_restart.js to
     // stub out child_process.{spawn,spawnSync} without touching
     // require.cache for a builtin module. NEVER call from runtime code.
