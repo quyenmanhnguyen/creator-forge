@@ -372,16 +372,27 @@ def test_generate_with_dna_skips_extract_when_override_provided() -> None:
 
 
 def test_generate_with_dna_expands_variants_per_scene() -> None:
-    """``images_per_scene == 3`` triggers one variant call per scene."""
-    variant_call_count = 0
+    """``images_per_scene == 3`` triggers one image-variant call per scene.
+
+    PR-48 added a parallel video-variant call per scene
+    (``expand_video_variants_for_images``); both image and video
+    variant LLM calls have the same fake response shape, but only the
+    image-variant call is what the orchestrator's variant phase is
+    measured by — count them separately to keep the assertion precise.
+    """
+    image_variant_call_count = 0
+    video_variant_call_count = 0
 
     def fake_chat(user: str, system: str) -> str:
-        nonlocal variant_call_count
+        nonlocal image_variant_call_count, video_variant_call_count
         if "visual director" in system.lower():
             return "noir 40s monochrome"
         if "scene-breakdown specialist" in system:
             return _TWO_SCENE_REPLY
-        variant_call_count += 1
+        if "flow video prompts" in system.lower():
+            video_variant_call_count += 1
+        else:
+            image_variant_call_count += 1
         return (
             "Wide tracking shot, exterior, low key.\n"
             "<<<VARIANT>>>\n"
@@ -397,7 +408,8 @@ def test_generate_with_dna_expands_variants_per_scene() -> None:
         chat_fn=fake_chat,
         images_per_scene=3,
     )
-    assert variant_call_count == 2  # one per scene
+    assert image_variant_call_count == 2  # one per scene
+    assert video_variant_call_count == 2  # PR-48 — one per scene
     assert dna == "noir 40s monochrome"
     assert len(scenes) == 2
     for s in scenes:
