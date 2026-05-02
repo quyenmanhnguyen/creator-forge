@@ -1266,6 +1266,72 @@ test("PR-B: countSettledImageRows — agrees with pairImagePathsForI2V on which 
     assert.ok(withHero.length > 0, "pairImagePathsForI2V should produce ≥1 video row with a hero image");
 });
 
+// Source-image URL propagation — when the matched image row has a
+// renderer-side ``url`` (a ``file://`` URL), pairing copies it onto
+// the video row as ``source_image_url`` so the Storyboard's video
+// table can render a hero-image thumbnail before the I2V job runs.
+test("source_image_url: propagates from matched image row's url field", () => {
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 2 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/img-v0.png" });
+    imageRows = helpers.applyBatchResult(imageRows, "1#1", { status: "generated", image_path: "/img-v1.png" });
+    // Simulate sbbResolveUrls populating the ``url`` field on image rows.
+    imageRows[0].url = "file:///img-v0.png";
+    imageRows[1].url = "file:///img-v1.png";
+
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 2 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v0.png");
+    assert.strictEqual(paired[0].source_image_url, "file:///img-v0.png", "video #0 must inherit url from image #0");
+    assert.strictEqual(paired[1].image_path, "/img-v1.png");
+    assert.strictEqual(paired[1].source_image_url, "file:///img-v1.png", "video #1 must inherit url from image #1");
+});
+
+test("source_image_url: stays unset when matched image row has no url yet", () => {
+    // Common race: image batch settled (image_path present) but
+    // sbbResolveUrls hasn't finished resolving file:// URLs yet.
+    // The video row should still get image_path set (so the gate
+    // releases) — but source_image_url stays absent so the renderer
+    // falls back to a "loading…" thumbnail.
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 1 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#0", { status: "generated", image_path: "/img-v0.png" });
+    // No url on the image row.
+
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 1 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].image_path, "/img-v0.png");
+    assert.ok(!paired[0].source_image_url, "source_image_url must be absent when image url not yet resolved");
+});
+
+test("source_image_url: fallback path inherits url from lowest-variant settled image", () => {
+    // Only variant 2 settled — both video #0 and video #1 should fall
+    // back to that image AND inherit its url.
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1), { imagesPerScene: 3 });
+    imageRows = helpers.applyBatchResult(imageRows, "1#2", { status: "generated", image_path: "/img-v2.png" });
+    imageRows[2].url = "file:///img-v2.png";
+
+    const videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 3 });
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(paired[0].source_image_url, "file:///img-v2.png", "video #0 fallback inherits image #2's url");
+    assert.strictEqual(paired[1].source_image_url, "file:///img-v2.png", "video #1 fallback inherits image #2's url");
+    assert.strictEqual(paired[2].source_image_url, "file:///img-v2.png", "video #2 exact match inherits image #2's url");
+});
+
+test("source_image_url: clears stale url when image_path drops to null", () => {
+    // Edge case: a row had a paired image previously, but
+    // re-pairing now finds no matching image (e.g. user deleted
+    // the image row). The stale source_image_url must be cleared
+    // so the Source column doesn't keep showing a phantom thumb.
+    let videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1), { videosPerScene: 1 });
+    videoRows[0] = Object.assign({}, videoRows[0], {
+        image_path: "/img-v0.png",
+        source_image_url: "file:///img-v0.png",
+    });
+    // No image rows now → pair finds nothing.
+    const paired = helpers.pairImagePathsForI2V(videoRows, []);
+    assert.strictEqual(paired[0].image_path, null, "image_path cleared when no match");
+    assert.strictEqual(paired[0].source_image_url, null, "stale source_image_url cleared too");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

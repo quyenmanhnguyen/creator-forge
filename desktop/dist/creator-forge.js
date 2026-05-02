@@ -1534,12 +1534,18 @@
             + ` title="Drop the selected rows from the table. Generated assets stay on disk."`
             + `${noneSelected ? ' disabled' : ''}>Delete selected</button>`
             + `</div>`;
+        // Video table includes a Source column that previews the
+        // hero image paired by ``pairImagePathsForI2V`` so the user
+        // can confirm which still each video row will animate from
+        // before pressing Generate. The image table omits this
+        // column — it has its own Output thumbnail already.
+        const sourceHeader = kind === 'video' ? '<th>Source</th>' : '';
         html += `<table class="swc-table"><thead><tr>
             <th class="sbb-select-cell"><input type="checkbox" data-sbb-bulk="header-select"
                 data-sbb-kind="${escapeHtml(kind)}"
                 ${allSelected ? 'checked' : ''}
                 ${rows.length === 0 ? 'disabled' : ''} /></th>
-            <th>#</th><th>Scene</th><th>Prompt</th><th>Status</th><th>Output</th><th>Actions</th>
+            <th>#</th><th>Scene</th>${sourceHeader}<th>Prompt</th><th>Status</th><th>Output</th><th>Actions</th>
         </tr></thead><tbody>`;
         // PR-24: count variants per scene_id so we can render
         // "scene N · variant K/M" labels — without this every variant
@@ -1624,12 +1630,32 @@
             const promptCell = inEdit
                 ? sbbRenderEditShell(kind, r)
                 : sbbRenderPromptCell(kind, r);
+            // Source cell — only emitted for the video table.
+            // Three states:
+            //   1. ``source_image_url`` resolved → render <img> thumb.
+            //   2. Only ``image_path`` populated → render placeholder
+            //      ("loading…") so the user sees the pairing landed
+            //      even before getFileUrl resolves.
+            //   3. No image_path → muted "no image yet" hint, makes
+            //      the I2V gate state visually obvious next to the
+            //      already-disabled Generate button.
+            let sourceCell = '';
+            if (kind === 'video') {
+                if (r.source_image_url) {
+                    sourceCell = `<td><div class="thumb-cell"><img src="${escapeHtml(r.source_image_url)}" alt="hero for scene ${escapeHtml(r.scene_id)}" /></div></td>`;
+                } else if (r.image_path) {
+                    sourceCell = `<td><div class="thumb-cell"><div class="thumb-placeholder">loading…</div></div></td>`;
+                } else {
+                    sourceCell = `<td><span class="muted">no image yet</span></td>`;
+                }
+            }
             const isSelected = selected.has(String(r.row_id));
             const trCls = isSelected ? ' class="sbb-row-selected"' : '';
             html += `<tr${trCls}>
                 <td class="sbb-select-cell"><input type="checkbox" data-sbb-row-select="${escapeHtml(r.row_id || '')}" data-sbb-kind="${escapeHtml(kind)}" ${isSelected ? 'checked' : ''} /></td>
                 <td class="scene-num">${escapeHtml(r.order)}</td>
                 <td><b>${escapeHtml(sceneCellLabel)}</b>${refBadge}<div class="reason">${escapeHtml(r.title)} · ${escapeHtml((typeof r.duration_s === 'number') ? r.duration_s.toFixed(1) : r.duration_s)}s</div></td>
+                ${sourceCell}
                 <td class="prompt-cell">${promptCell}</td>
                 <td>${statusCell}</td>
                 <td>${outCell}</td>
@@ -1871,6 +1897,12 @@
     /**
      * Resolve thumbnail file:// URLs after a phase settles. Reuses
      * `electronAPI.getFileUrl` (same approach as PR-20C).
+     *
+     * For ``kind === 'video'`` we also resolve a thumbnail URL for
+     * the row's paired *hero image* (``image_path`` populated by
+     * ``pairImagePathsForI2V``) into ``source_image_url`` so the
+     * video table can render a still preview of the I2V seed image
+     * before the I2V job emits any output of its own.
      */
     async function sbbResolveUrls(rows, kind) {
         if (!api || typeof api.getFileUrl !== 'function') return;
@@ -1880,6 +1912,11 @@
             if (pathField && !row.url) {
                 tasks.push(api.getFileUrl(pathField).then((res) => {
                     if (res && res.success && res.url) row.url = res.url;
+                }).catch(() => {}));
+            }
+            if (kind === 'video' && row.image_path && !row.source_image_url) {
+                tasks.push(api.getFileUrl(row.image_path).then((res) => {
+                    if (res && res.success && res.url) row.source_image_url = res.url;
                 }).catch(() => {}));
             }
         });
@@ -2471,6 +2508,9 @@
         const modeEl = $('sbb-video-mode');
         if (modeEl && modeEl.value !== 'i2v') modeEl.value = 'i2v';
         sbbRepaintVideo();
+        // Resolve a thumbnail URL for the just-paired hero image so
+        // the Source column shows a real preview, not just a path.
+        sbbResolveUrls(sbbState.videoRows, 'video').catch(() => {});
         const result = $('sbb-video-result');
         if (result) {
             const sceneLabel = sceneId != null && sceneId !== '' ? `scene ${sceneId}` : 'this scene';
@@ -2880,6 +2920,10 @@
         sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
         sbbRepaintAll();
         sbbResolveUrls(sbbState.imageRows, 'image').catch(() => {});
+        // Also resolve hero-image URLs for the freshly-paired video
+        // rows so the Source column flips from "loading…" to a real
+        // thumbnail without waiting for the I2V phase to start.
+        sbbResolveUrls(sbbState.videoRows, 'video').catch(() => {});
 
         // PR-B — once at least one image has settled, the Video
         // Generate button just became reachable. Smooth-scroll the
