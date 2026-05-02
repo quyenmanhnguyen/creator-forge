@@ -45,6 +45,64 @@ free) and `/producer/assemble` (which only needs ffmpeg) — those
 two cover the most recently merged load-bearing changes (PR-30,
 PR-31, PR-32).
 
+## Launching Electron headlessly on the linux Devin VM
+
+```bash
+cd /home/ubuntu/repos/creator-forge/desktop
+npm install --no-audit --no-fund   # only needed once per fresh box
+DISPLAY=:0 ./node_modules/.bin/electron . --no-sandbox --disable-gpu \
+  > /tmp/electron.log 2>&1 &
+```
+
+The Electron window renders to the same X server as the Devin
+browser (`DISPLAY=:0`). Maximize after launch with
+`wmctrl -r "Creator Forge" -b add,maximized_vert,maximized_horz`.
+
+The app dismisses on first launch with an API-keys modal — click
+`Cancel` if you don't have keys for the test, or supply them
+through the modal.
+
+### CDP attach for white-box assertions (HF-5 lesson)
+
+`creator-forge.js` is wrapped in an IIFE — `sbbState` and friends
+are **NOT on `window`**. The Electron build also calls
+`Menu.setApplicationMenu(null)` and binds nothing to F12 /
+Ctrl+Shift+I, so DevTools cannot be opened normally.
+
+For any test that needs to inspect or mutate renderer state
+(e.g. assert `sbbClear()` ran from inside `runSceneBreakdown`,
+inject fake batch rows, read state without LLM creds):
+
+1. Launch with a CDP port:
+   ```bash
+   ./node_modules/.bin/electron . --no-sandbox \
+     --remote-debugging-port=9223 &
+   curl -s http://127.0.0.1:9223/json/version   # confirm port up
+   ```
+2. Add a one-line test hook just before the `})();` at the bottom
+   of `desktop/dist/creator-forge.js`:
+   ```js
+   window.__test = { sbbState, sbbRepaintImage, /* etc */ };
+   ```
+3. Restart Electron (re-reads the file).
+4. Attach Puppeteer:
+   ```js
+   const puppeteer = require('./node_modules/puppeteer');
+   const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:9223' });
+   const [page] = (await browser.pages()).filter(p => p.url().includes('creator-forge.html'));
+   await page.evaluate(() => {
+     window.__test.sbbState.imageRows = [{ row_id: 'r1', status: 'fallback' }];
+     window.__test.sbbRepaintImage();
+   });
+   ```
+5. **Always revert the test hook before reporting** (`git checkout`).
+   It is not safe to commit — `window.__test` would leak production
+   state to any code running on the page.
+
+Note: `sbbRepaintImage()` writes its HTML into `#sbb-image-result`
+(a `<div>`), not into a fixed tbody id. Query rows with
+`document.querySelector('#sbb-image-result table tbody tr')`.
+
 ## Setting up a temporary accounts.json for Grok testing
 
 The Grok account file is loaded from `CREATOR_FORGE_ACCOUNTS_FILE`
@@ -123,253 +181,31 @@ The binary distinction is:
 
 1. **`ffprobe -show_entries 'stream=codec_type,codec_name'`** on each
    output:
-   - Burn: `[h264, aac]` only. **No `mov_text` stream.**
-   - Soft: `[h264, aac, mov_text]`. The `mov_text` stream is
-     present.
+   - `soft` mode → 3 streams: `video=h264`, `audio=aac`, `subtitle=mov_text`
+   - `burn` mode → 2 streams: `video=h264`, `audio=aac` (NO subtitle stream)
+2. **Visual inspection** of an extracted frame:
+   - `soft` mode → no captions visible (player would render mov_text on demand)
+   - `burn` mode → captions visible burned into the video pixels
 
-   If burn output also has `mov_text`, the implementation silently
-   fell back to soft and the burn feature is broken.
+Use `ffmpeg -ss 1 -i out.mp4 -frames:v 1 frame.png` to extract a
+frame at t=1s for visual proof.
 
-2. **`ffmpeg -ss 2.5 -i final.mp4 -frames:v 1 frame.png`** — extract
-   a raw frame from each output:
-   - Burn frame: must contain visible caption text rendered into
-     pixels (white outlined letters at the bottom).
-   - Soft frame: must NOT contain caption text (mov_text only
-     surfaces when the player has subs enabled; raw pixel
-     extraction bypasses that).
+## OS-level openFolder fallthrough on the Devin VM
 
-Use `read` tool on the PNGs to view them inline — visual
-verification is the only honest answer to "are the captions in the
-pixels". File-size heuristics work too (burn frame is
-10–40× larger than a solid-color soft frame) but visual is the
-ground truth.
+On the Devin linux VM there is NO GUI file manager registered for
+`xdg-open`. When `📂 Open folder` calls `shell.openPath(dir)`, the
+OS falls through to Chrome (the only registered file://-capable
+handler), which opens a new tab at `about:blank`. This is OS-level
+behavior, not a creator-forge bug. On a normal desktop install the
+user's chosen file manager opens. When testing this code path,
+assert that the IPC fired (no JS error) and treat the Chrome tab
+as evidence the OS got the request.
 
-## Schema regression
+## Findings carried over
 
-```bash
-curl -s -X POST http://127.0.0.1:5050/producer/assemble \
-  -H 'Content-Type: application/json' \
-  -d '{"scene_videos":["/tmp/cf-scenes/shot1.mp4"], "caption_mode":"explode"}'
-# expect HTTP 422 with body containing
-# "Input should be 'soft', 'none' or 'burn'"
-```
-
-## Storyboard — testing PR-A progress UI + PR-B I2V gate
-
-PR-A turned `/producer/scene_breakdown`'s static spinner into a
-live `.progress-block` with a phase label, animated bar, ticking
-elapsed counter, and an after-3s hint. PR-B disables the
-Generate-videos button when `mode=i2v` and 0 image rows have
-settled, with a Vietnamese tooltip; once at least one row settles
-the page smooth-scrolls down to `#sbb-video-section`.
-
-### What to assert (Test 1 — progress UI)
-
-With a long enough script (`scene_breakdown` should run ≥30 s),
-click **Break into scenes (DeepSeek)** and watch `#sb-result`.
-Expected DOM (NOT the legacy `<div class="loading">`):
-
-- `.progress-block` exists with children `.progress-label`,
-  `.progress-elapsed`, `.progress-bar`, `.progress-phase`, and
-  (after ~3s) `.progress-hint`.
-- `.progress-elapsed` ticks each second (1s `setInterval`).
-- `.progress-phase` text advances through the 5 phases in
-  `DEFAULT_SCENE_BREAKDOWN_PHASES` (defined in
-  `desktop/dist/storyboard_progress_helpers.js`):
-  - `t=0`     `Đang gửi yêu cầu sang DeepSeek…`
-  - `t=3000`  `Đang phân tích kịch bản và chia scene…`
-  - `t=25000` `Đang trích xuất Visual DNA…`
-  - `t=45000` `Đang sinh prompts variants song song…`
-  - `t=75000` `Vẫn đang xử lý — script dài cần thêm vài chục giây nữa…`
-- `formatElapsed` switches from `Xs` to `Xm Ys` at exactly 60s —
-  `1m 0s`, not `60s`.
-
-### What to assert (Test 2 — I2V gate + toggle)
-
-With scenes loaded but 0 images settled:
-- Mode = `i2v`: button.disabled=true, text is exactly
-  `Generate videos` (no `(N)` suffix), tooltip is exactly
-  `Tạo ảnh trước — I2V cần ảnh đã sinh xong làm hero frame. (Hoặc chuyển sang T2V để bỏ qua bước này.)`.
-- Toggle to `t2v`: button enables, text becomes
-  `Generate all (N)`, tooltip becomes the standard English
-  `Run videos generation on all N rows...`.
-- Toggle back to `i2v`: gate re-engages. **This second toggle
-  matters** — it proves the change-event listener fires both
-  directions, not just the first time.
-
-### What to assert (Test 3 — auto-scroll on first settle)
-
-This test requires real Grok image generation and is therefore
-gated on Puppeteer working (see Puppeteer gotcha below).
-With Video section initially below the viewport
-(`#sbb-video-section.getBoundingClientRect().top > window.innerHeight`),
-click **Generate images**, wait for the first row to flip to
-`status: 'generated'` with non-empty `image_path`. Within ~1s
-`#sbb-video-section` should smooth-scroll into view
-(`top` between 0 and `viewport_height * 0.66`) and the
-Generate-videos button should flip to `Generate all (M)` enabled.
-
-## Common gotchas
-
-### Sidecar caches stale code
-
-If you change Python code on a branch and then test, **the running
-sidecar is still on the old code**. Check before testing:
-
-```bash
-# Confirm the running enum matches your branch's expected modes:
-curl -s http://127.0.0.1:5050/openapi.json \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)
-  ["components"]["schemas"]["AssembleRequest"]
-  ["properties"]["caption_mode"])'
-```
-
-If the enum is wrong, restart the sidecar from the working tree
-(kill the existing PID, then re-run
-`python -m uvicorn research.api.main:app ...`). Electron is
-tolerant of this — it'll reuse the new sidecar via the existing
-pill.
-
-### duration_s reports the visual stream, not the container
-
-PR #43 fixed this. With `caption_mode="soft"` the `mov_text` track
-extends the mp4 container past the visual stream (e.g. 12.5s
-container vs 10.0s video stream when the SRT runs longer than
-the trimmed scenes). `duration_s` in the response now
-correctly reports the **visual** stream length, not the inflated
-container. ffprobe's `[FORMAT] duration=` is the container; per-
-`[STREAM] duration=` for the video stream is the truth.
-
-### Burn mode needs fontconfig + a usable font
-
-Ubuntu base images have `fontconfig` + DejaVu pre-installed, so
-burn just works on the standard VM. On a clean Windows / macOS /
-headless-Linux install, libass may fall back to a built-in font
-silently or error — if real-world burns fail there, install
-`fontconfig` + `fonts-dejavu` (or equivalent) on the host. The
-implementation never raises on font issues; it surfaces them as
-response warnings.
-
-### caption_mode="burn" but no SRT → silent skip + warning
-
-The implementation downgrades `burn` with no usable `srt_path` to
-`none` and emits a warning rather than 5xxing. If you're testing
-the burn happy path, make sure `srt_path` is set and the file
-exists — otherwise `captions_attached` will be `false` and you'll
-think burn is broken.
-
-### Window sizing for Electron testing
-
-Maximize the Electron window before recording any screen test.
-`xdotool search --name 'Creator Forge' windowsize 1600 1140` works
-on the standard VM. The default 800x600 hides several panels.
-
-### IPC client timeout on long LLM calls (and the 300s claim)
-
-The IPC layer at `desktop/electron/researchIPC.js:29` has a single
-global `timeout: 120_000` (2 minutes) for **every** request, not
-the 300s some older notes claim is configured per-endpoint. On a
-long scene_breakdown (12 scenes × 4 variants ≈ 48 LLM calls), the
-renderer can bail with `sidecar request timeout` even though the
-sidecar is still happily streaming DeepSeek responses. To keep a
-test under the ceiling, reduce the load: short script (≤200
-words) + `# scenes ≈ 4` + `images_per_scene = 1` typically returns
-in 30–60s. If you actually want to verify the long-running path
-more than 2 minutes deep, you'll need to bump that timeout in code
-for the test.
-
-### Puppeteer-from-Electron silent launch failure on sandboxed VMs
-
-On some sandboxed VMs (observed on a Devin runner), Puppeteer's
-`launch()` from inside Electron's `AuthService.setupAccount` exits
-silently with `Failed to launch the browser process: Code: 0` and
-empty stderr — even though a standalone Node script using the
-same `args` / `ignoreDefaultArgs` / `userDataDir` against the same
-Chrome binary launches fine and prints `LAUNCH OK Chrome/<ver>`.
-The failure is environment-specific to the Electron child-process
-spawn path, not a code bug.
-
-Mitigations to try, in order:
-
-1. Symlink a real Chrome binary at `/usr/bin/google-chrome` (see
-   gotcha below).
-2. Wipe the per-account session profile dir if a previous failed
-   launch corrupted it:
-   `rm -rf desktop/sessions/<email_safe>` (or the
-   `GROK_PROFILE_DIR` equivalent).
-3. As a last resort, run the full Electron app on a workstation
-   where Puppeteer can launch system Chrome successfully — the
-   silent-failure mode hasn't reproduced outside this sandbox.
-
-The pure helper `countSettledImageRows` is unit-tested
-(`desktop/tests/test_storyboard_batch_helpers.js`), so you can
-verify the gate-state and auto-scroll logic at the helper layer
-without a real Grok session, but the actual `scrollIntoView` call
-at the renderer level only fires when a real settled row arrives.
-
-### Chrome path detection only checks `/usr/bin/...`
-
-`desktop/src/browser.js:findChromePath()` checks four hardcoded
-Linux paths: `/usr/bin/{google-chrome, google-chrome-stable,
-chromium, chromium-browser}`. On Devin VMs the only `google-chrome`
-on `PATH` is `/home/ubuntu/.local/bin/google-chrome`, which is a
-`#!/bin/sh` shim that PUTs URLs to `localhost:29229/json/new` —
-NOT a real Chrome binary. If you symlink that shim into
-`/usr/bin/google-chrome`, Puppeteer happily launches it, the shim
-immediately exits with status 0, and you get the silent
-`Code: 0` failure described above.
-
-The right symlink target is the Puppeteer-managed Chrome already
-on disk:
-
-```bash
-PUPPET_CHROME=$(ls -d /home/ubuntu/.cache/puppeteer/chrome/linux-*/chrome-linux64/chrome | head -1)
-sudo ln -sf "$PUPPET_CHROME" /usr/bin/google-chrome
-# verify with: /usr/bin/google-chrome --version
-```
-
-This is a test-environment workaround for the `findChromePath`
-hardcoded list, not a fix — the production path uses the user's
-real Chrome install. An alternative is to set
-`CHROME_EXECUTABLE_PATH` (which the code respects) before
-launching Electron.
-
-## Sidecar working dir + log capture (when starting yourself)
-
-```bash
-cd /home/ubuntu/repos/creator-forge
-nohup python -m uvicorn research.api.main:app \
-  --host 127.0.0.1 --port 5050 \
-  > /tmp/sidecar.log 2>&1 &
-echo $! > /tmp/sidecar.pid
-sleep 3
-curl -s http://127.0.0.1:5050/healthz
-```
-
-## Lint & test commands
-
-- `ruff check research` — backend lint
-- `python -m pytest research/tests/ -q` — strict pytest bucket
-  (≈3s; runs API + assembler + tts_providers + video_probe). The
-  legacy `test_pixelle_*.py` and `test_youtube_*.py` collect-fail
-  on missing heavy deps (moviepy, edge-tts) — that's CI-marked
-  best-effort, not a regression.
-- `node desktop/tests/test_*.js` — desktop offline regression. Run
-  individually or `for f in desktop/tests/test_*.js; do node $f; done`.
-
-## When to skip live testing
-
-If the change is purely backend code with strong unit-test coverage
-(e.g. a new caption mode with full args-shape + integration tests in
-`test_assembler.py` + route tests in `test_api_producer.py`), you
-can skip live testing if all you'd be doing is re-running the
-unit assertions through curl. Live testing earns its keep when:
-
-- The change crosses a process boundary (Electron ↔ sidecar,
-  sidecar ↔ ffmpeg subprocess, ffmpeg ↔ fontconfig).
-- The pixel/audio output of ffmpeg is the actual deliverable
-  (frame extraction is the only real proof of "burn renders into
-  pixels").
-- The unit-test stubs subprocess.run — by definition, those tests
-  can't catch host-environment problems (missing ffmpeg, missing
-  font, broken pipe, etc.).
+- **Cloudflare turnstile blocks programmatic Grok login.** Manual
+  click required when the captcha appears.
+- **Electron DevTools is not bound** to F12 / Ctrl+Shift+I on this
+  build. Use the CDP attach pattern above.
+- **Mutagen + edge-tts not in CI strict bucket** — installed in env
+  config maintenance step instead.
