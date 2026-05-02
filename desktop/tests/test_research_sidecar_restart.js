@@ -88,11 +88,12 @@ function startFakeSidecar(opts = {}) {
  * require.cache for the builtin `child_process` because builtins are
  * not stored in `require.cache`).
  */
-function freshSidecar({ spawnStub } = {}) {
+function freshSidecar({ spawnStub, spawnSyncStub } = {}) {
     const sidecarPath = require.resolve('../electron/researchSidecar.js');
     delete require.cache[sidecarPath];
     const sidecar = require(sidecarPath);
     if (spawnStub) sidecar.__setSpawnImpl(spawnStub);
+    if (spawnSyncStub) sidecar.__setSpawnSyncImpl(spawnSyncStub);
     return sidecar;
 }
 
@@ -369,6 +370,188 @@ function makeFakeChild() {
             assert.ok(reused, 'expected info-level reuse log. logs=' + JSON.stringify(logs));
         } finally {
             try { fake.server.close(); } catch (_) {}
+        }
+    });
+
+    // ── kill-by-port fallback (PR-66) ─────────────────────────────────────
+
+    await test('killByPort: posix — parses lsof output and SIGKILLs each pid', async () => {
+        const spawnSyncCalls = [];
+        const spawnSyncStub = (cmd, args) => {
+            spawnSyncCalls.push({ cmd, args });
+            if (cmd === 'lsof') {
+                return { stdout: '12345\n67890\n', stderr: '', status: 0 };
+            }
+            return { stdout: '', stderr: '', status: 0 };
+        };
+        // Patch process.kill so the test doesn't actually try to send
+        // signals to fictional pids (or worse, real ones). Capture the
+        // call sequence instead.
+        const origKill = process.kill;
+        const killCalls = [];
+        process.kill = (pid, sig) => { killCalls.push({ pid, sig }); };
+        try {
+            const sidecar = freshSidecar({ spawnSyncStub });
+            // Force the platform branch even if running on win32 hosts.
+            const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+            Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+            try {
+                const result = sidecar.killByPort(5050);
+                assert.deepStrictEqual(spawnSyncCalls[0].cmd, 'lsof');
+                assert.ok(spawnSyncCalls[0].args.includes(':5050'),
+                    'lsof should target the port via :PORT arg');
+                assert.deepStrictEqual(result.pids, [12345, 67890]);
+                assert.strictEqual(result.killed, true);
+                assert.deepStrictEqual(killCalls, [
+                    { pid: 12345, sig: 'SIGKILL' },
+                    { pid: 67890, sig: 'SIGKILL' },
+                ]);
+            } finally {
+                if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+            }
+        } finally {
+            process.kill = origKill;
+        }
+    });
+
+    await test('killByPort: posix — empty lsof output → killed=false', async () => {
+        const spawnSyncStub = () => ({ stdout: '', stderr: '', status: 1 });
+        const sidecar = freshSidecar({ spawnSyncStub });
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+        try {
+            const result = sidecar.killByPort(5050);
+            assert.strictEqual(result.killed, false);
+            assert.deepStrictEqual(result.pids, []);
+        } finally {
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+        }
+    });
+
+    await test('killByPort: windows — parses netstat LISTENING line and runs taskkill', async () => {
+        const spawnSyncCalls = [];
+        const spawnSyncStub = (cmd, args) => {
+            spawnSyncCalls.push({ cmd, args });
+            if (cmd === 'netstat') {
+                return {
+                    stdout:
+                        '  Proto  Local Address          Foreign Address        State           PID\r\n' +
+                        '  TCP    127.0.0.1:5050         0.0.0.0:0              LISTENING       4242\r\n' +
+                        '  TCP    127.0.0.1:5050         127.0.0.1:50001        ESTABLISHED     7777\r\n' +
+                        '  TCP    127.0.0.1:8080         0.0.0.0:0              LISTENING       9999\r\n',
+                    stderr: '', status: 0,
+                };
+            }
+            return { stdout: 'SUCCESS', stderr: '', status: 0 };
+        };
+        const sidecar = freshSidecar({ spawnSyncStub });
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+        try {
+            const result = sidecar.killByPort(5050);
+            // Should ONLY pick the LISTENING row on :5050 — not the
+            // ESTABLISHED client connection, not the unrelated :8080.
+            assert.deepStrictEqual(result.pids, [4242]);
+            assert.strictEqual(result.killed, true);
+            // Verify taskkill ran with /F /PID 4242.
+            const taskkillCalls = spawnSyncCalls.filter((c) => c.cmd === 'taskkill');
+            assert.strictEqual(taskkillCalls.length, 1);
+            assert.deepStrictEqual(taskkillCalls[0].args, ['/F', '/PID', '4242']);
+        } finally {
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+        }
+    });
+
+    await test('killByPort: command missing → returns error gracefully', async () => {
+        const spawnSyncStub = () => { throw new Error('ENOENT lsof'); };
+        const sidecar = freshSidecar({ spawnSyncStub });
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+        try {
+            const result = sidecar.killByPort(5050);
+            assert.strictEqual(result.killed, false);
+            assert.match(result.error || '', /ENOENT lsof/);
+        } finally {
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+        }
+    });
+
+    await test('restart: stale external sidecar (404 on /admin/shutdown) → killByPort fallback frees the port', async () => {
+        // The bug we're fixing in PR-66: a pre-PR-65 sidecar that 404s
+        // /admin/shutdown left restart() throwing "port still busy"
+        // after the 5s waitForPortFree timeout. The fallback should
+        // now invoke killByPort which mocked here closes the fake
+        // sidecar so the second waitForPortFree sees an empty port.
+        const spawnCalls = [];
+        const spawnStub = (cmd, args, opts) => {
+            spawnCalls.push({ cmd, args, env: opts && opts.env });
+            const portIdx = args.indexOf('--port');
+            const port = portIdx >= 0 ? Number(args[portIdx + 1]) : null;
+            if (port) {
+                const s = http.createServer((req, res) => {
+                    if (req.url === '/healthz') {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(SERVICE_TAG_BODY);
+                    } else {
+                        res.writeHead(404).end();
+                    }
+                });
+                s.listen(port, '127.0.0.1');
+                servers.push(s);
+            }
+            return makeFakeChild();
+        };
+
+        const servers = [];
+        // Stale sidecar: ACCEPTS /healthz but 404s /admin/shutdown.
+        const fake = await startFakeSidecar({ acceptShutdown: false });
+        servers.push(fake.server);
+
+        // Mock spawnSync so killByPort returns killed=true and we can
+        // close the fake server in response (mimicking SIGKILL).
+        const spawnSyncStub = (cmd, args) => {
+            if (cmd === 'lsof') {
+                // Return a fictional pid; the actual close is done in
+                // the process.kill stub below so the order is right.
+                return { stdout: '99999\n', stderr: '', status: 0 };
+            }
+            return { stdout: '', stderr: '', status: 0 };
+        };
+        const origKill = process.kill;
+        process.kill = (pid, sig) => {
+            if (pid === 99999 && sig === 'SIGKILL') {
+                try { fake.server.close(); } catch (_) {}
+            }
+        };
+
+        const sidecar = freshSidecar({ spawnStub, spawnSyncStub });
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+        try {
+            const fakeRoot = path.join(__dirname, '..', '..');
+            await sidecar.start({ port: fake.port, repoRoot: fakeRoot, extraEnv: {} });
+
+            const newEnv = { DEEPSEEK_API_KEY: 'sk-applies-after-killbyport' };
+            // Without the killByPort fallback, this would throw the
+            // "port still busy" error after ~5s.
+            await sidecar.restart({ port: fake.port, repoRoot: fakeRoot, extraEnv: newEnv });
+
+            // The fake sidecar got the shutdown POST (and 404'd it).
+            assert.strictEqual(fake.state.shutdownCount, 1, 'shutdown POST count');
+            // Then killByPort fired (verified by the close happening in process.kill).
+            // And spawn ran with the new extraEnv.
+            assert.strictEqual(spawnCalls.length, 1, 'spawn call count');
+            assert.strictEqual(
+                spawnCalls[0].env.DEEPSEEK_API_KEY,
+                'sk-applies-after-killbyport',
+                'spawned env should have new DEEPSEEK_API_KEY despite stale sidecar',
+            );
+        } finally {
+            process.kill = origKill;
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+            for (const s of servers) {
+                try { s.close(); } catch (_) {}
+            }
         }
     });
 

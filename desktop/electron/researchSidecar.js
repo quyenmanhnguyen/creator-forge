@@ -9,15 +9,17 @@
  * `http://127.0.0.1:<port>/...` and return parsed JSON to the renderer.
  */
 
-const { spawn: realSpawn } = require('child_process');
+const { spawn: realSpawn, spawnSync: realSpawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
-// Test hook — only the offline test suite calls __setSpawnImpl to swap
-// in a stub so it can assert spawn args without launching real Python.
-// Runtime callers always go through the real `child_process.spawn`.
+// Test hook — only the offline test suite calls __setSpawnImpl /
+// __setSpawnSyncImpl to swap in stubs so it can assert spawn args
+// without launching real Python or invoking real lsof/taskkill.
+// Runtime callers always go through the real child_process functions.
 let spawnImpl = realSpawn;
+let spawnSyncImpl = realSpawnSync;
 
 const DEFAULT_PORT = Number(process.env.CREATOR_FORGE_RESEARCH_PORT || 5050);
 const HEALTH_TIMEOUT_MS = 30_000;
@@ -225,6 +227,69 @@ function sendShutdown(port) {
         });
         req.end();
     });
+}
+
+/**
+ * Last-resort fallback used by `restart()` when `/admin/shutdown`
+ * has either returned a non-200 (the listening sidecar is a stale
+ * pre-PR-65 build that doesn't have the endpoint) or has 200'd but
+ * the process didn't actually exit (asyncio task starved, OS hung,
+ * etc.). Finds whatever PID is bound to `:port` via the platform's
+ * native CLI (`lsof` on linux/mac, `netstat`+`taskkill` on windows)
+ * and SIGKILLs it. Returns `{ killed, pids }` — caller logs the
+ * outcome and re-checks `waitForPortFree()`.
+ *
+ * Safe-by-default: only invoked from the externalReuse-shutdown-
+ * timed-out path. We never reach this branch when our own spawned
+ * child is the holder (stop() already SIGKILLed it). The risk of
+ * killing a dev's manual `uvicorn ... --reload` is acceptable — it
+ * is the same risk as `/admin/shutdown` itself, which `restart()`
+ * is documented to perform when applying new keys.
+ */
+function killByPort(port) {
+    const pids = [];
+    try {
+        if (process.platform === 'win32') {
+            const out = spawnSyncImpl('netstat', ['-ano'], {
+                encoding: 'utf8', timeout: 3000,
+            });
+            const stdout = (out && out.stdout) || '';
+            const wanted = `:${port} `;
+            for (const line of stdout.split(/\r?\n/)) {
+                if (!line.includes(wanted)) continue;
+                if (!/\bLISTENING\b/i.test(line)) continue;
+                const cols = line.trim().split(/\s+/);
+                const pid = Number(cols[cols.length - 1]);
+                if (Number.isFinite(pid) && pid > 0 && !pids.includes(pid)) {
+                    pids.push(pid);
+                }
+            }
+            for (const pid of pids) {
+                spawnSyncImpl('taskkill', ['/F', '/PID', String(pid)], {
+                    encoding: 'utf8', timeout: 3000,
+                });
+            }
+        } else {
+            const out = spawnSyncImpl('lsof', ['-ti', `:${port}`, '-sTCP:LISTEN'], {
+                encoding: 'utf8', timeout: 3000,
+            });
+            const stdout = (out && out.stdout) || '';
+            for (const line of stdout.split(/\r?\n/)) {
+                const pid = Number(line.trim());
+                if (Number.isFinite(pid) && pid > 0 && !pids.includes(pid)) {
+                    pids.push(pid);
+                }
+            }
+            for (const pid of pids) {
+                try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+            }
+        }
+    } catch (err) {
+        // lsof / netstat may be missing on minimal images. Surface the
+        // failure to the caller; they fall through to the clear error.
+        return { killed: false, pids: [], error: err && err.message };
+    }
+    return { killed: pids.length > 0, pids };
 }
 
 /**
@@ -447,10 +512,28 @@ async function restart(opts = {}) {
 
     // Whether we spawned or external-reused the previous instance, the
     // OS may need a beat to release the listening socket before our
-    // fresh uvicorn can bind it. Block until /healthz stops responding
-    // (or until the timeout — at which point we surface a clear error
-    // so the user knows what to do).
-    const freed = await waitForPortFree(portToUse, 5000);
+    // fresh uvicorn can bind it. Block until /healthz stops responding.
+    let freed = await waitForPortFree(portToUse, 5000);
+    if (!freed && wasExternal) {
+        // Common cause: the externally-launched sidecar is a stale
+        // pre-PR-65 build, so /admin/shutdown 404'd above and the
+        // process is still alive. Fall back to OS-level kill so the
+        // user doesn't have to open a terminal and chase the PID.
+        const kill = killByPort(portToUse);
+        if (kill.killed) {
+            logSink(
+                'killed stale sidecar on :' + portToUse +
+                ' via OS-level kill (pids=' + kill.pids.join(',') + ') — ' +
+                '/admin/shutdown didn\'t apply (likely an older build).',
+            );
+        } else if (kill.error) {
+            logSink(
+                'WARN OS-level kill on :' + portToUse + ' failed: ' + kill.error,
+            );
+        }
+        freed = await waitForPortFree(portToUse, 3000);
+    }
+
     if (!freed) {
         throw new Error(
             `research sidecar restart: port :${portToUse} still busy after shutdown attempt. ` +
@@ -480,8 +563,10 @@ module.exports = {
     pythonExecutable,
     sendShutdown,
     waitForPortFree,
+    killByPort,
     // Test-only hooks — used by test_research_sidecar_restart.js to
-    // stub out child_process.spawn without touching require.cache for
-    // a builtin module. NEVER call from runtime code.
+    // stub out child_process.{spawn,spawnSync} without touching
+    // require.cache for a builtin module. NEVER call from runtime code.
     __setSpawnImpl(impl) { spawnImpl = impl || realSpawn; },
+    __setSpawnSyncImpl(impl) { spawnSyncImpl = impl || realSpawnSync; },
 };
