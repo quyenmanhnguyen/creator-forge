@@ -898,6 +898,12 @@
             showError('sb-result', { status: 422, message: 'Paste or send a script first.' });
             return;
         }
+        // HF-5 #7 — every fresh scene_breakdown wipes the batch tables so
+        // stale image/video rows from a previous script never bleed into
+        // the new run. Cheaper than relying on the user to click Clear,
+        // and matches the mental model that breaking a script restarts
+        // the storyboard from scratch.
+        sbbClear();
         const nField = $('sb-n-scenes').value;
         // PR-27: pull the Batch panel's "Images per scene" select so
         // the LLM expands variants up front (constraint F1) and the
@@ -1584,6 +1590,10 @@
             target.innerHTML = sbbRenderTable(sbbState.imageRows, 'image');
         }
         sbbUpdateGenerateButton('image');
+        // HF-5 #10 — keep the section-header progress badge in lock-step
+        // with row state. Cheap (linear over rows) and gives the user a
+        // headline number without scrolling through a long table.
+        sbbUpdateProgressBadge('image');
         // PR-B — the Video Generate button's gate depends on the
         // count of settled image rows, so refresh it whenever the
         // image table changes (rows added, deleted, status flipped,
@@ -1604,6 +1614,8 @@
             target.innerHTML = sbbRenderTable(sbbState.videoRows, 'video');
         }
         sbbUpdateGenerateButton('video');
+        // HF-5 #10 — same headline counter as the image table.
+        sbbUpdateProgressBadge('video');
     }
 
     /**
@@ -2259,7 +2271,10 @@
             return;
         }
         const imagesPerScene = sbbReadVariantCount('sbb-images-per-scene', 4);
-        const videosPerScene = sbbReadVariantCount('sbb-videos-per-scene', 2);
+        // HF-5 #12 — Pro mode is always-on so videos-per-scene is hardcoded
+        // to 1. The hidden <select id="sbb-videos-per-scene"> is preserved
+        // for backward compat with any code path still reading that id.
+        const videosPerScene = 1;
         sbbState.imageRows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene });
         sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene });
         sbbRepaintAll();
@@ -2305,9 +2320,9 @@
             return;
         }
         sbbState.imageRows = helpers.initImageRowsFromScenes(scenes, { imagesPerScene });
-        // Video rows refresh too — variants per scene comes from the
-        // separate video select.
-        const videosPerScene = sbbReadVariantCount('sbb-videos-per-scene', 2);
+        // HF-5 #12 — Pro mode is always-on; video rows always pair 1:1
+        // with their image variant.
+        const videosPerScene = 1;
         sbbState.videoRows = helpers.initVideoRowsFromScenes(scenes, { videosPerScene });
         // Drop any selection that no longer matches a row.
         sbbState.imageSelected = helpers.reconcileSelection(sbbState.imageSelected, sbbState.imageRows);
@@ -2648,6 +2663,143 @@
         sbbState.imageRows = [];
         sbbState.videoRows = [];
         sbbRepaintAll();
+    }
+
+    /**
+     * HF-5 #9 — Bulk re-run only the rows that landed in the fallback
+     * bucket on the last batch. Settled / pending / generating rows are
+     * skipped. Reuses the existing single-row retry plumbing
+     * (``sbbRunImageBatchForRowIds`` / ``sbbRunVideoBatchForRowIds``) so
+     * the IPC payload + state-flip semantics are bytes-identical to a
+     * sequence of per-row Retry clicks — no new code paths in the
+     * planners.
+     */
+    async function sbbRetryFailed(kind) {
+        const rows = kind === 'video' ? sbbState.videoRows : sbbState.imageRows;
+        const ids = new Set();
+        for (const r of rows) {
+            if (r && r.status === 'fallback') {
+                ids.add(String(r.row_id != null ? r.row_id : r.scene_id));
+            }
+        }
+        const banner = $(kind === 'video' ? 'sbb-video-result' : 'sbb-image-result');
+        if (!ids.size) {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="empty">No fallback rows to retry — every row either succeeded or has not run yet.</div>',
+            );
+            return;
+        }
+        if (kind === 'video') return sbbRunVideoBatchForRowIds(ids);
+        return sbbRunImageBatchForRowIds(ids);
+    }
+
+    /**
+     * HF-5 #10 — repaint the small status pill that lives in the section
+     * header next to the Generate / Retry / Open-folder buttons. Format:
+     *
+     *   ``3/12 done · 2 failed · ETA ~2m``
+     *
+     * Empty when no rows exist (CSS :empty rule collapses the badge).
+     * ETA is a coarse estimate (remaining rows × assumed per-row
+     * throughput); a precise ETA would need IPC-level timing telemetry
+     * the current pipeline doesn't expose.
+     */
+    function sbbUpdateProgressBadge(kind) {
+        const target = $(kind === 'video' ? 'sbb-video-progress-badge' : 'sbb-image-progress-badge');
+        if (!target) return;
+        const rows = kind === 'video' ? sbbState.videoRows : sbbState.imageRows;
+        if (!rows.length) {
+            target.textContent = '';
+            return;
+        }
+        let done = 0;
+        let failed = 0;
+        let pending = 0;
+        let generating = 0;
+        for (const r of rows) {
+            const s = r && r.status;
+            if (s === 'generated' || s === 'retried') done += 1;
+            else if (s === 'fallback') failed += 1;
+            else if (s === 'generating') generating += 1;
+            else pending += 1;
+        }
+        const total = rows.length;
+        const parts = [`${done}/${total} done`];
+        if (failed) parts.push(`${failed} failed`);
+        const remaining = pending + generating;
+        if (remaining > 0) {
+            const perRowSec = kind === 'video' ? 60 : 25;
+            const etaSec = remaining * perRowSec;
+            const etaStr = etaSec < 60 ? `${etaSec}s` : `~${Math.max(1, Math.round(etaSec / 60))}m`;
+            parts.push(`ETA ${etaStr}`);
+        }
+        target.textContent = parts.join(' · ');
+    }
+
+    /**
+     * HF-5 #11 — open the output folder for a given batch kind in the
+     * OS file browser. Resolution order:
+     *   1. ``sbb-output-dir`` hidden input (user picked an explicit folder).
+     *   2. parent dir of the first settled row's saved file (auto-create
+     *      timestamped folders land here on first generation).
+     * Falls back to a friendly empty banner when neither is available.
+     */
+    async function sbbOpenOutputFolder(kind) {
+        const banner = $(kind === 'video' ? 'sbb-video-result' : 'sbb-image-result');
+        if (!api || typeof api.openFolder !== 'function') {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="error">electronAPI.openFolder unavailable — update the desktop shell.</div>',
+            );
+            return;
+        }
+        const explicit = (($('sbb-output-dir') || {}).value || '').trim();
+        let target = explicit;
+        if (!target) {
+            const rows = kind === 'video' ? sbbState.videoRows : sbbState.imageRows;
+            for (const r of rows) {
+                const path = (r && (r.video_path || r.image_path)) || '';
+                if (typeof path === 'string' && path) {
+                    const idx = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+                    target = idx >= 0 ? path.slice(0, idx) : '';
+                    if (target) break;
+                }
+            }
+        }
+        if (!target) {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="empty">No output folder yet — pick one with the 📁 button or generate a row first.</div>',
+            );
+            return;
+        }
+        try {
+            await api.openFolder(target);
+        } catch (err) {
+            console.warn('openFolder failed:', err);
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                `<div class="error">openFolder failed: ${escapeHtml(err && err.message || String(err))}</div>`,
+            );
+        }
+    }
+
+    /**
+     * HF-5 #1 — the icon-only 📁 picker has no visible textbox, so we
+     * surface the chosen path via the button's tooltip instead. Called
+     * on init + every time ``sbbPickOutputDir`` mutates the hidden input.
+     */
+    function sbbRefreshOutputDirTooltip() {
+        const btn = $('sbb-output-dir-picker');
+        const input = $('sbb-output-dir');
+        if (!btn) return;
+        const value = (input && input.value || '').trim();
+        if (value) {
+            btn.title = `Output folder: ${value} (click to change)`;
+        } else {
+            btn.title = 'Choose output folder (auto-create ~/.creator-forge/output/batch-<timestamp>/ if blank)';
+        }
     }
 
     /**
@@ -3247,12 +3399,23 @@
         sbbState.currentVideoBatchRowIds = (plan.rowIds || plan.sceneIds).slice();
         sbbRepaintVideo();
 
+        // HF-5 #8 — wire the Duration dropdown into the video IPC. The
+        // Service-layer (VideoService.buildVideoBody +
+        // I2VService.buildI2VBody) already accepts ``config.videoLength``
+        // and falls back to defaults when missing, so the field is
+        // forward-compatible with older shells.
+        const durationEl = $('sbb-duration');
+        const rawDuration = durationEl && durationEl.value ? parseInt(durationEl.value, 10) : NaN;
+        const config = Number.isFinite(rawDuration) && rawDuration > 0
+            ? { videoLength: rawDuration }
+            : {};
+
         let resp;
         try {
             if (mode === 'i2v') {
-                resp = await api.i2v.generate({ items: plan.items });
+                resp = await api.i2v.generate({ items: plan.items, config });
             } else {
-                resp = await api.video.generate({ prompts: plan.prompts });
+                resp = await api.video.generate({ prompts: plan.prompts, config });
             }
         } catch (err) {
             $('sbb-video-result').insertAdjacentHTML('afterbegin', `<div class="error">${escapeHtml(mode)}:generate IPC threw: ${escapeHtml(err && err.message || String(err))}</div>`);
@@ -3339,6 +3502,13 @@
         'storyboard-batch-clear': async () => sbbClear(),
         'storyboard-batch-image': sbbGenerateImages,
         'storyboard-batch-video': sbbGenerateVideos,
+        // HF-5 #9 — bulk re-run all rows that landed in the fallback
+        // bucket on the last batch. Settled rows are skipped.
+        'storyboard-batch-retry-failed-image': async () => sbbRetryFailed('image'),
+        'storyboard-batch-retry-failed-video': async () => sbbRetryFailed('video'),
+        // HF-5 #11 — open the active output folder in the OS file browser.
+        'storyboard-batch-open-output-image': async () => sbbOpenOutputFolder('image'),
+        'storyboard-batch-open-output-video': async () => sbbOpenOutputFolder('video'),
         'storyboard-batch-login': sbbOpenLogin,
         // PR-27: re-roll all variants for every scene currently in
         // the image-batch table using the current Visual DNA.
@@ -3349,7 +3519,12 @@
         'storyboard-ref-clear': async () => sbbClearGlobalRefs(),
         // PR-24: native folder pickers — drop the chosen path into the
         // matching <input>. Cancel is a no-op (preserves current value).
-        'storyboard-batch-pick-output': async () => sbbPickOutputDir('sbb-output-dir'),
+        // HF-5 #1 — the picker now drives the icon-only 📁 button; refresh
+        // the tooltip so the user sees the chosen path on hover.
+        'storyboard-batch-pick-output': async () => {
+            await sbbPickOutputDir('sbb-output-dir');
+            sbbRefreshOutputDirTooltip();
+        },
         'producer-short-pick-output': async () => sbbPickOutputDir('ps-output-dir'),
         // PR-31: Video Assembly panel — file pickers + autofill +
         // POST /producer/assemble.
@@ -3436,6 +3611,14 @@
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.
         sbbRepaintAll();
+        // HF-5 #1 — paint the picker tooltip from cold start so users
+        // who haven't picked anything yet still see the helper text.
+        sbbRefreshOutputDirTooltip();
+        // HF-5 #5 — Pro mode is now always-on. The HTML default already
+        // sets ``checked``, but force it programmatically too so a stale
+        // session restore can't sneak through with Pro mode off.
+        const proModeForceCb = $('sbb-pro-mode');
+        if (proModeForceCb) proModeForceCb.checked = true;
         // PR-48 — wire Pro mode + image/video count auto-sync.
         // Order matters: apply Pro mode FIRST so a stale checkbox
         // from a previous session restore is reflected in the images
