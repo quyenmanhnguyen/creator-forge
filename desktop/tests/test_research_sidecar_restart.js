@@ -103,9 +103,10 @@ function freshSidecar({ spawnStub, spawnSyncStub } = {}) {
  * need to drive output; they only check that spawn was called with
  * the right env.
  */
-function makeFakeChild() {
+function makeFakeChild(pid) {
     const handlers = {};
     return {
+        pid: pid,
         stdout: { on: () => {} },
         stderr: { on: () => {} },
         on(event, cb) { handlers[event] = cb; },
@@ -697,6 +698,90 @@ function makeFakeChild() {
             for (const s of servers) {
                 try { s.close(); } catch (_) {}
             }
+        }
+    });
+
+    await test('stop: windows runs taskkill /F /T /PID against the spawned child tree (PR-68)', async () => {
+        // Reproduces the PR-68 fix: on Windows, child.kill() only
+        // TerminateProcess'es the immediate PID, so any python /
+        // uvicorn helper threads that inherited the listening socket
+        // can keep :5050 bound for several seconds. stop() now
+        // explicitly runs `taskkill /F /T /PID <child.pid>` to walk
+        // the parent-child tree and forcibly terminate every
+        // descendant. This test verifies the right command is run.
+
+        const taskkillCalls = [];
+        const spawnSyncStub = (cmd, args) => {
+            if (cmd === 'taskkill') {
+                taskkillCalls.push({ cmd, args });
+            }
+            return { stdout: 'SUCCESS', stderr: '', status: 0 };
+        };
+
+        const spawnedChildPid = 41234;
+        const spawnStub = (cmd, args, opts) => {
+            const portIdx = args.indexOf('--port');
+            const port = portIdx >= 0 ? Number(args[portIdx + 1]) : null;
+            // We need the fake healthz to come up so start() resolves.
+            if (port) {
+                const s = http.createServer((req, res) => {
+                    if (req.url === '/healthz') {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(SERVICE_TAG_BODY);
+                    } else {
+                        res.writeHead(404).end();
+                    }
+                });
+                s.listen(port, '127.0.0.1');
+                servers.push(s);
+            }
+            return makeFakeChild(spawnedChildPid);
+        };
+
+        const servers = [];
+        const sidecar = freshSidecar({ spawnStub, spawnSyncStub });
+        const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+        const logs = [];
+        sidecar.setLogSink((...args) => logs.push(args.map(String).join(' ')));
+
+        try {
+            const fakeRoot = path.join(__dirname, '..', '..');
+
+            const free = await new Promise((resolve) => {
+                const s = http.createServer();
+                s.listen(0, '127.0.0.1', () => {
+                    const p = s.address().port;
+                    s.close(() => resolve(p));
+                });
+            });
+
+            await sidecar.start({ port: free, repoRoot: fakeRoot, extraEnv: {} });
+            // Close the fake healthz server so stop()'s post-kill
+            // wait can resolve quickly.
+            for (const s of servers) { try { s.close(); } catch (_) {} }
+
+            await sidecar.stop();
+
+            // stop() should have invoked taskkill /F /T /PID <pid>
+            // exactly once with the spawned child's pid.
+            assert.strictEqual(taskkillCalls.length, 1,
+                'expected exactly one taskkill call from stop()');
+            assert.deepStrictEqual(
+                taskkillCalls[0].args,
+                ['/F', '/T', '/PID', String(spawnedChildPid)],
+                'taskkill should /F /T /PID the spawned child',
+            );
+
+            const treeKillLog = logs.find((l) =>
+                l.includes('stop windows tree-kill') &&
+                l.includes(String(spawnedChildPid)));
+            assert.ok(treeKillLog,
+                'expected stop() to log the tree-kill action. logs=\n' + logs.join('\n'));
+        } finally {
+            if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+            for (const s of servers) { try { s.close(); } catch (_) {} }
         }
     });
 
