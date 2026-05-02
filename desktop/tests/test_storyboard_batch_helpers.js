@@ -1176,6 +1176,96 @@ test("PR-48: pairImagePathsForI2V — different scenes do NOT cross-pair", () =>
     assert.strictEqual(paired[1].image_path, null, "scene 2's video must NOT borrow scene 1's image");
 });
 
+// ── PR-B: countSettledImageRows (video Generate gate) ────────────────────
+
+test("PR-B: countSettledImageRows — counts only generated/retried with image_path", () => {
+    const rows = [
+        { row_id: "1#0", scene_id: 1, status: "generated", image_path: "/tmp/a.png" },
+        { row_id: "1#1", scene_id: 1, status: "retried",   image_path: "/tmp/b.png" },
+        { row_id: "2#0", scene_id: 2, status: "pending",   image_path: null },
+        { row_id: "2#1", scene_id: 2, status: "generating", image_path: null },
+        { row_id: "3#0", scene_id: 3, status: "fallback",  image_path: null, reason: "rate-limited" },
+        { row_id: "4#0", scene_id: 4, status: "skipped",   image_path: null, reason: "missing prompt" },
+    ];
+    assert.strictEqual(helpers.countSettledImageRows(rows), 2,
+        "only the 'generated' + 'retried' rows with non-empty image_path should count");
+});
+
+test("PR-B: countSettledImageRows — rejects status:generated with empty image_path", () => {
+    // Defensive: if a backend payload races such that status flips
+    // before image_path is filled in, we MUST NOT count that row as
+    // settled — clicking Generate videos in that window would hand a
+    // missing-file path to I2V.
+    const rows = [
+        { row_id: "1#0", scene_id: 1, status: "generated", image_path: "" },
+        { row_id: "1#1", scene_id: 1, status: "generated", image_path: null },
+        { row_id: "2#0", scene_id: 2, status: "generated" },  // no field at all
+        { row_id: "3#0", scene_id: 3, status: "retried",  image_path: 0 },  // wrong type
+        { row_id: "4#0", scene_id: 4, status: "generated", image_path: "/tmp/ok.png" },
+    ];
+    assert.strictEqual(helpers.countSettledImageRows(rows), 1,
+        "only the row with a non-empty string image_path counts");
+});
+
+test("PR-B: countSettledImageRows — null/undefined/scalar input → 0", () => {
+    assert.strictEqual(helpers.countSettledImageRows(null), 0);
+    assert.strictEqual(helpers.countSettledImageRows(undefined), 0);
+    assert.strictEqual(helpers.countSettledImageRows("not-an-array"), 0);
+    assert.strictEqual(helpers.countSettledImageRows({}), 0);
+    assert.strictEqual(helpers.countSettledImageRows(42), 0);
+});
+
+test("PR-B: countSettledImageRows — empty array → 0", () => {
+    assert.strictEqual(helpers.countSettledImageRows([]), 0);
+});
+
+test("PR-B: countSettledImageRows — handles malformed entries without throwing", () => {
+    // Real-world: a stale payload may have null entries or non-objects.
+    // Helper must skip rather than crash so the gate logic is safe to
+    // call from every repaint.
+    const rows = [
+        null,
+        undefined,
+        "not-an-object",
+        42,
+        { row_id: "1#0", scene_id: 1, status: "generated", image_path: "/tmp/ok.png" },
+        { /* missing status */ image_path: "/tmp/orphan.png" },
+        { status: "generated" /* missing image_path */ },
+    ];
+    assert.strictEqual(helpers.countSettledImageRows(rows), 1);
+});
+
+test("PR-B: countSettledImageRows — caller's array is not mutated", () => {
+    const rows = [
+        { row_id: "1#0", status: "generated", image_path: "/tmp/a.png" },
+        { row_id: "2#0", status: "pending",   image_path: null },
+    ];
+    const snapshot = JSON.stringify(rows);
+    helpers.countSettledImageRows(rows);
+    assert.strictEqual(JSON.stringify(rows), snapshot,
+        "input rows must not be mutated");
+});
+
+test("PR-B: countSettledImageRows — agrees with pairImagePathsForI2V on which rows produce a binding", () => {
+    // Cross-check: the gate's settled-count must match the helper that
+    // actually pairs image_paths into video rows. If countSettledImageRows
+    // says ≥1 then pairImagePathsForI2V must produce ≥1 video row with
+    // a non-null hero_image (matched by scene_id).
+    const imageRows = [
+        { row_id: "1#0", scene_id: 1, variant_idx: 0, status: "generated", image_path: "/tmp/s1v0.png" },
+        { row_id: "2#0", scene_id: 2, variant_idx: 0, status: "fallback",  image_path: null },
+    ];
+    const videoRows = [
+        { row_id: "1#0", scene_id: 1, variant_idx: 0, status: "pending" },
+        { row_id: "2#0", scene_id: 2, variant_idx: 0, status: "pending" },
+    ];
+    const settled = helpers.countSettledImageRows(imageRows);
+    const paired = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    const withHero = paired.filter((r) => r.hero_image || r.image_path);
+    assert.ok(settled > 0, "scene 1 should be settled");
+    assert.ok(withHero.length > 0, "pairImagePathsForI2V should produce ≥1 video row with a hero image");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

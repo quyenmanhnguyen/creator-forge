@@ -1273,6 +1273,13 @@
         } else if (t.matches('input[type="checkbox"][data-sbb-bulk="header-select"]')) {
             const kind = t.getAttribute('data-sbb-kind');
             sbbToggleSelectAll(kind);
+        } else if (t.id === 'sbb-video-mode') {
+            // PR-B — toggling I2V ↔ T2V flips the image-prerequisite
+            // gate on the Generate-videos button, so refresh the
+            // button label/disabled state here. We don't repaint the
+            // whole table because nothing else in the table depends
+            // on the mode.
+            sbbUpdateGenerateButton('video');
         }
     });
 
@@ -1383,6 +1390,14 @@
             target.innerHTML = sbbRenderTable(sbbState.imageRows, 'image');
         }
         sbbUpdateGenerateButton('image');
+        // PR-B — the Video Generate button's gate depends on the
+        // count of settled image rows, so refresh it whenever the
+        // image table changes (rows added, deleted, status flipped,
+        // or batch progress ticks). Cheaper than a full
+        // ``sbbRepaintAll`` and keeps the button label in lock-step
+        // with image state without repainting the (potentially
+        // long) video table.
+        sbbUpdateGenerateButton('video');
     }
 
     /** Repaint just the video batch table. */
@@ -1430,6 +1445,32 @@
         const selected = kind === 'video' ? sbbState.videoSelected : sbbState.imageSelected;
         const noun = kind === 'video' ? 'videos' : 'images';
         const selSize = (selected && typeof selected.size === 'number') ? selected.size : 0;
+
+        // PR-B — gate the Video Generate button when running in I2V
+        // mode and zero image rows have settled with an ``image_path``
+        // on disk. The user's natural flow is "generate images → see
+        // them → generate videos that use those images as the hero
+        // frame", and clicking Generate videos before any image
+        // exists silently produces zero-byte / fallback videos. T2V
+        // mode skips the gate since it doesn't need a hero image.
+        // The image-side button is never gated this way — it has its
+        // own pre-conditions (scenes parsed first, handled by the
+        // empty-rows branch below).
+        if (kind === 'video') {
+            const helpers = window.StoryboardBatchHelpers;
+            const settled = (helpers && typeof helpers.countSettledImageRows === 'function')
+                ? helpers.countSettledImageRows(sbbState.imageRows)
+                : 0;
+            const modeEl = $('sbb-video-mode');
+            const mode = (modeEl && modeEl.value) || 'i2v';
+            if (mode === 'i2v' && settled === 0) {
+                btn.textContent = 'Generate videos';
+                btn.setAttribute('disabled', 'disabled');
+                btn.title = 'Tạo ảnh trước — I2V cần ảnh đã sinh xong làm hero frame. (Hoặc chuyển sang T2V để bỏ qua bước này.)';
+                return;
+            }
+        }
+
         if (!rows.length) {
             btn.textContent = `Generate ${noun}`;
             btn.removeAttribute('disabled');
@@ -2839,6 +2880,21 @@
         sbbState.videoRows = helpers.pairImagePathsForI2V(sbbState.videoRows, sbbState.imageRows);
         sbbRepaintAll();
         sbbResolveUrls(sbbState.imageRows, 'image').catch(() => {});
+
+        // PR-B — once at least one image has settled, the Video
+        // Generate button just became reachable. Smooth-scroll the
+        // Video panel into view so the user can immediately continue
+        // the Image → Video flow without hunting for the section
+        // below the (potentially long) image table. ``scrollResultIntoView``
+        // is a no-op when the panel is already on screen, so this is
+        // idempotent across multiple batch runs / retries.
+        const settledNow = (typeof helpers.countSettledImageRows === 'function')
+            ? helpers.countSettledImageRows(sbbState.imageRows)
+            : 0;
+        if (settledNow > 0) {
+            const videoSection = document.getElementById('sbb-video-section');
+            if (videoSection) scrollResultIntoView(videoSection);
+        }
     }
 
     /**
