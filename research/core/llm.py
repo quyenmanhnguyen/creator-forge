@@ -365,6 +365,103 @@ def refine_per_scene_narrations(
     return out
 
 
+def refine_script_for_narration(
+    *,
+    raw_script: str,
+    scene_image_prompts: list[str] | None = None,
+    target_duration_s: float | None = None,
+    language: str = "English",
+    words_per_second: float = 2.5,
+) -> str:
+    """Distil any input (storyline, JSON blob, prompt dump, draft) into a
+    clean voice-over narration script.
+
+    The Compose-audio path used to TTS-render whatever the user pasted into
+    the script box verbatim. When the input is actually a paste of upstream
+    image-prompt JSON (``"negative_prompt": [...], "avoid": [...]``) or a
+    draft full of bracketed lists, the result is unintelligible audio.
+    This helper asks DeepSeek to produce a single flowing narration that:
+
+    * Tells the storyline implied by ``raw_script`` (extracting it from
+      whatever syntax surrounds it -- JSON, lists, prompt fragments).
+    * Describes / complements what the storyboard's
+      ``scene_image_prompts`` show, so the audio matches the visuals
+      even when the input script was off-topic / contaminated.
+    * Fits the total ``target_duration_s`` (sum of scene_videos when
+      the renderer can compute it) at ~``words_per_second`` cadence --
+      so the rendered audio is short enough to ride the assembled
+      video without bleeding past it.
+
+    Returns a single string (the refined narration). Empty input,
+    missing key (raises ``RuntimeError(ERR_NO_DEEPSEEK_KEY)``), and any
+    LLM error are the caller's responsibility -- the renderer surfaces
+    these as warnings and keeps the user's textarea unchanged.
+    """
+    text = (raw_script or "").strip()
+    if not text:
+        return ""
+    prompts = [str(p).strip() for p in (scene_image_prompts or []) if p and str(p).strip()]
+    try:
+        dur_f = float(target_duration_s) if target_duration_s is not None else 0.0
+    except (TypeError, ValueError):
+        dur_f = 0.0
+    if dur_f > 0:
+        target_words = max(20, int(round(dur_f * words_per_second)))
+        budget_hint = (
+            f"- The total narration MUST fit roughly {target_words} words"
+            f" (plus or minus 10%) so it rides a ~{round(dur_f, 1)}s video"
+            f" at a natural pace. Prefer slightly shorter to slightly longer."
+        )
+    else:
+        target_words = 0
+        budget_hint = (
+            "- Keep the narration concise -- one or two short paragraphs"
+            " is usually enough."
+        )
+    sys = (
+        "You convert raw input (which may be a storyline, a JSON blob,"
+        " an image-prompt dump, or a messy draft) into a CLEAN voice-over"
+        " narration ready for text-to-speech.\n"
+        "INPUTS:\n"
+        "- RAW_INPUT: anything the user pasted in (treat as best-effort"
+        " source material -- extract the underlying storyline; if it's"
+        " purely prompt syntax with no narrative, fall back to the"
+        " image_prompts).\n"
+        "- IMAGE_PROMPTS: per-scene visual descriptions in playback"
+        " order. Use them to ground the narration in what's on screen.\n"
+        "RULES:\n"
+        "- Output ONE flowing narration. No section headers. No scene"
+        " labels. No JSON. No bracketed lists. No prompt syntax (no"
+        " 'negative_prompt', no 'avoid', no comma-separated keyword"
+        " lists). No code fences.\n"
+        "- Strip out anything that looks like a generation prompt"
+        " (camera directions in brackets, lighting tags, NSFW filter"
+        " words, list-of-keywords) -- the goal is what a viewer should"
+        " HEAR, not what the image model needs to read.\n"
+        "- Maintain emotional continuity scene-to-scene.\n"
+        f"{budget_hint}\n"
+        f"- Write the narration in {language}.\n"
+        "OUTPUT FORMAT: a single JSON object with one key \"narration\""
+        " whose value is the cleaned narration as a single string. No"
+        " other keys."
+    )
+    user_payload = {
+        "RAW_INPUT": text,
+        "IMAGE_PROMPTS": prompts,
+        "TARGET_DURATION_S": round(dur_f, 2) if dur_f > 0 else None,
+        "TARGET_WORDS": target_words or None,
+    }
+    raw = chat_json(json.dumps(user_payload, ensure_ascii=False), system=sys)
+    parsed = parse_llm_json(raw)
+    out = parsed.get("narration")
+    if isinstance(out, str):
+        return out.strip()
+    if isinstance(out, list):
+        joined = " ".join(str(x).strip() for x in out if str(x).strip())
+        return joined
+    return ""
+
+
 def humanize_rewrite(script: str, *, language: str) -> str:
     """Step 5 — rewrite to remove AI tells without shrinking length."""
     sys = (

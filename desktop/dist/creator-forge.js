@@ -3601,6 +3601,79 @@
         psScriptUserEdited = false;
     }
 
+    /**
+     * PR-X — "Refine script" button. Posts the current ps-script value
+     * (or sb-script fallback), the storyboard's per-scene image_prompts,
+     * and the settled scene_videos paths to ``/producer/refine_script``.
+     * The sidecar asks DeepSeek to (a) extract the underlying storyline
+     * from any prompt JSON / bracketed lists / keyword dumps the user
+     * pasted in, (b) match the narration to what each scene's image
+     * shows, and (c) size the output to fit the assembled video at a
+     * natural TTS cadence. On success the cleaned narration replaces
+     * ps-script's value (and the auto-mirror flag is armed off so a
+     * subsequent edit to sb-script does not clobber the cleaned
+     * narration). On warning (missing key, LLM error) ps-script is
+     * left as-is and a status banner is shown above the result panel.
+     */
+    async function runRefineScript() {
+        const script = asNonEmpty($('ps-script').value) || asNonEmpty($('sb-script').value);
+        if (!script) {
+            showError('ps-result', { status: 422, message: 'Paste a script first (Compose audio script field is empty).' });
+            return;
+        }
+        if (!api || !api.producer || typeof api.producer.refineScript !== 'function') {
+            showError('ps-result', { status: 0, message: 'electronAPI.producer.refineScript is unavailable — desktop shell needs the new preload.' });
+            return;
+        }
+        const params = { script };
+        const scenes = Array.isArray(state.lastScenes) ? state.lastScenes : [];
+        if (scenes.length) {
+            params.scene_image_prompts = scenes.map((s) => {
+                if (!s || typeof s !== 'object') return '';
+                return s.image_prompt != null ? String(s.image_prompt).trim() : '';
+            });
+        }
+        // Auto-fit target: scene videos auto-fill from settled rows of
+        // the Video batch above. Explicit override wins.
+        const sceneVideos = psRefreshReferenceVideos();
+        if (sceneVideos.length) params.scene_videos = sceneVideos;
+        const targetRaw = ($('ps-target-duration') && $('ps-target-duration').value) || '';
+        const target = parseFloat(targetRaw);
+        if (Number.isFinite(target) && target > 0) {
+            params.target_duration_s = target;
+        }
+        showLoading('ps-result', 'Refining script for narration (DeepSeek LLM)...');
+        try {
+            const data = await api.producer.refineScript(params);
+            const refined = (data && typeof data.refined_script === 'string') ? data.refined_script : '';
+            const usedLlm = !!(data && data.used_llm);
+            const warnings = (data && Array.isArray(data.warnings)) ? data.warnings : [];
+            if (usedLlm && refined) {
+                $('ps-script').value = refined;
+                // PR-B mirror semantics — once the refined script is in
+                // ps-script, treat that as a hand-edit so a subsequent
+                // edit to sb-script does not clobber it. Same pattern as
+                // copyScriptFromStoryboard's inverse.
+                psScriptUserEdited = true;
+            }
+            const target = $('ps-result');
+            if (target) {
+                const head = usedLlm
+                    ? `<div class="info">Refined script ready (${data.original_length} → ${data.refined_length} chars` +
+                      (data.target_words ? `, target ${data.target_words} words for ${data.target_duration_s}s video` : '') +
+                      ').</div>'
+                    : `<div class="info">Script unchanged (LLM did not run).</div>`;
+                const warnHtml = warnings.length
+                    ? `<div class="warn">${warnings.map(escapeHtml).join('<br>')}</div>`
+                    : '';
+                target.innerHTML = head + warnHtml;
+                scrollResultIntoView(target);
+            }
+        } catch (err) {
+            showError('ps-result', err);
+        }
+    }
+
     // ─── Studio reset & cross-tab handoff ──────────────────────────────────
     function resetStudio() {
         state.lastTopic = '';
@@ -3645,6 +3718,10 @@
         humanize: runHumanize,
         'scene-breakdown': runSceneBreakdown,
         'compose-short': runComposeShort,
+        // PR-X — LLM clean-up of the Compose-audio script before TTS.
+        // Strips prompt JSON / bracketed lists / keyword dumps, sizes
+        // narration to scene_videos duration via ffprobe-sum.
+        'refine-script': runRefineScript,
         // PR-A — manual re-pull of settled scene videos into the Compose
         // panel's reference summary (used for SRT auto-fit).
         'compose-refresh-reference': composeRefreshReference,

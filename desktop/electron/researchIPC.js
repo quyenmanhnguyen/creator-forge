@@ -75,6 +75,13 @@ const CHANNELS = {
     // compose. Request shape is a strict subset of /producer/short
     // (no style / scene_assets / aspect / visual_provider).
     'producer:composeAudio':      { method: 'POST', path: '/producer/audio' },
+    // PR: LLM-driven script clean-up before TTS. Renderer's "Refine
+    // script" button calls this to rewrite the Compose-audio script
+    // textarea -- strips prompt JSON / bracketed lists / keyword
+    // dumps, sizes the output to the assembled video duration. Falls
+    // back to the original script (200 + warning) when
+    // DEEPSEEK_API_KEY is missing.
+    'producer:refineScript':      { method: 'POST', path: '/producer/refine_script' },
     // PR-31: Video Assembly — concat per-scene MP4s, replace audio with
     // /producer/audio output, attach soft mov_text subs, write
     // ~/.creator-forge/output/assembly-<ts>/final.mp4.

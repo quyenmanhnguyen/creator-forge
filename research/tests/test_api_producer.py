@@ -2742,6 +2742,242 @@ def test_audio_pre_pr_a_request_unchanged(monkeypatch, tmp_path):
     assert body["target_duration_s"] == 0.0
 
 
+
+
+# ─── /producer/refine_script — LLM clean-up before TTS ───────────────
+#
+# These tests stub ``llm.refine_script_for_narration`` so the route
+# logic is exercised without going to DeepSeek. The deeper helper
+# behaviour (prompt shape, JSON parsing) lives in
+# ``research/tests/test_llm.py``; here we cover request validation,
+# duration budgeting, robust-failure on missing key / LLM error, and
+# the response-shape adapter.
+
+
+def test_refine_script_calls_llm_and_returns_cleaned_narration(monkeypatch):
+    """Happy path — ``used_llm=True`` and ``refined_script`` is the
+    LLM's output. The helper receives the raw script + image_prompts +
+    the resolved target duration."""
+    captured: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return "Dawn breaks over the harbor. A lone fisherman casts his line."
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", fake_refine)
+
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": "{ 'avoid': ['nsfw'], 'negative_prompt': ['blurry'] }",
+            "scene_image_prompts": [
+                "Wide shot of a calm sea at dawn.",
+                "Close-up of an angler casting a line.",
+            ],
+            "target_duration_s": 12.0,
+            "language": "English",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is True
+    assert body["refined_script"] == (
+        "Dawn breaks over the harbor. A lone fisherman casts his line."
+    )
+    assert body["original_length"] == len(
+        "{ 'avoid': ['nsfw'], 'negative_prompt': ['blurry'] }"
+    )
+    assert body["refined_length"] > 0
+    assert body["target_duration_s"] == pytest.approx(12.0)
+    assert body["target_words"] == 30  # 12.0s * 2.5 wps
+    assert body["warnings"] == []
+
+    # Helper saw the right inputs.
+    assert captured["raw_script"] == (
+        "{ 'avoid': ['nsfw'], 'negative_prompt': ['blurry'] }"
+    )
+    assert captured["scene_image_prompts"] == [
+        "Wide shot of a calm sea at dawn.",
+        "Close-up of an angler casting a line.",
+    ]
+    assert captured["target_duration_s"] == pytest.approx(12.0)
+    assert captured["language"] == "English"
+
+
+def test_refine_script_uses_scene_videos_when_no_explicit_target(monkeypatch):
+    """When ``target_duration_s`` is missing the route runs ffprobe on
+    each ``scene_videos`` entry and uses the summed duration as the
+    word budget — matching the auto-fit semantics of /producer/audio."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=5.0,
+            video_stream_duration_sec=5.0,
+            has_video_stream=True,
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return "A short narration."
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", fake_refine)
+
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": "raw input",
+            "scene_videos": ["/scene1.mp4", "/scene2.mp4", "/scene3.mp4"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_duration_s"] == pytest.approx(15.0)  # 3 × 5.0
+    assert body["target_words"] == 38  # 15.0 * 2.5 = 37.5 → round to 38
+    assert captured["target_duration_s"] == pytest.approx(15.0)
+
+
+def test_refine_script_explicit_override_wins_over_scene_videos(monkeypatch):
+    """When both ``target_duration_s`` and ``scene_videos`` are sent,
+    the explicit override wins (no ffprobe is run)."""
+    probed: list[str] = []
+
+    def fake_probe(path, *_, **__):
+        probed.append(path)
+        from research.core.pixelle.video_probe import VideoProbeResult
+
+        return VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=99.0,
+            video_stream_duration_sec=99.0,
+            has_video_stream=True,
+        )
+
+    monkeypatch.setattr(producer_route, "probe_video_file", fake_probe)
+    monkeypatch.setattr(
+        llm, "refine_script_for_narration", lambda **_: "ok"
+    )
+
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": "raw",
+            "scene_videos": ["/scene1.mp4"],
+            "target_duration_s": 8.0,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_duration_s"] == pytest.approx(8.0)
+    assert probed == [], "ffprobe should be skipped when explicit override is set"
+
+
+def test_refine_script_missing_key_falls_back(monkeypatch):
+    """Missing ``DEEPSEEK_API_KEY`` ⇒ 200 + warning + ``used_llm=False``;
+    ``refined_script`` mirrors the original input so the renderer can
+    just keep the textarea unchanged."""
+
+    def boom(**_):
+        raise RuntimeError(llm.ERR_NO_DEEPSEEK_KEY)
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", boom)
+
+    r = client.post(
+        "/producer/refine_script",
+        json={"script": "raw script content"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is False
+    assert body["refined_script"] == "raw script content"
+    assert body["original_length"] == body["refined_length"]
+    assert any(
+        "DEEPSEEK_API_KEY not set" in w for w in body["warnings"]
+    ), body["warnings"]
+
+
+def test_refine_script_llm_error_falls_back(monkeypatch):
+    """Any other LLM exception ⇒ 200 + warning + original returned."""
+
+    def boom(**_):
+        raise ValueError("downstream parse failed")
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", boom)
+
+    r = client.post(
+        "/producer/refine_script",
+        json={"script": "raw script content"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is False
+    assert body["refined_script"] == "raw script content"
+    assert any(
+        "Refine-script failed" in w and "downstream parse failed" in w
+        for w in body["warnings"]
+    ), body["warnings"]
+
+
+def test_refine_script_empty_llm_output_falls_back(monkeypatch):
+    """LLM returned empty string ⇒ 200 + warning + original returned
+    (the renderer should not blank the textarea on a no-op rewrite)."""
+    monkeypatch.setattr(
+        llm, "refine_script_for_narration", lambda **_: "   "
+    )
+
+    r = client.post(
+        "/producer/refine_script",
+        json={"script": "raw script content"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is False
+    assert body["refined_script"] == "raw script content"
+    assert any("empty output" in w for w in body["warnings"]), body["warnings"]
+
+
+def test_refine_script_rejects_blank_script():
+    """Validator: blank / whitespace-only script ⇒ 422."""
+    for bad in ["", "   ", "\n\n"]:
+        r = client.post("/producer/refine_script", json={"script": bad})
+        assert r.status_code == 422, r.text
+
+
+def test_refine_script_strips_invalid_image_prompt_entries(monkeypatch):
+    """Validator: ``scene_image_prompts`` accepts mixed types — None /
+    int / blank — coerced to empty strings so the LLM helper sees a
+    clean list of prompts."""
+    captured: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", fake_refine)
+
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": "raw",
+            "scene_image_prompts": ["  prompt one  ", None, 42, ""],
+        },
+    )
+    assert r.status_code == 200, r.text
+    # Helper receives the cleaned list (with empty entries preserved
+    # as empty strings — the helper itself filters them out).
+    assert captured["scene_image_prompts"] == ["prompt one", "", "42", ""]
+
+
 # ─── /producer/assemble — PR-31 (concat scene videos + audio + soft subs) ───
 #
 # These tests stub ``assembler.assemble_final_mp4`` (and its underlying
