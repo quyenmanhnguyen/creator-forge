@@ -459,7 +459,7 @@ function makeFakeChild(pid) {
         }
     });
 
-    await test('killByPort: windows — parses netstat LISTENING line and runs taskkill', async () => {
+    await test('killByPort: windows — parses netstat LISTENING line and runs taskkill /F /T /PID (tree-kill)', async () => {
         const spawnSyncCalls = [];
         const spawnSyncStub = (cmd, args) => {
             spawnSyncCalls.push({ cmd, args });
@@ -484,10 +484,12 @@ function makeFakeChild(pid) {
             // ESTABLISHED client connection, not the unrelated :8080.
             assert.deepStrictEqual(result.pids, [4242]);
             assert.strictEqual(result.killed, true);
-            // Verify taskkill ran with /F /PID 4242.
+            // Verify taskkill ran with /F /T /PID 4242 (tree-kill so the
+            // watchfiles --reload reloader and all child uvicorn processes
+            // are terminated together, not just the immediate PID).
             const taskkillCalls = spawnSyncCalls.filter((c) => c.cmd === 'taskkill');
             assert.strictEqual(taskkillCalls.length, 1);
-            assert.deepStrictEqual(taskkillCalls[0].args, ['/F', '/PID', '4242']);
+            assert.deepStrictEqual(taskkillCalls[0].args, ['/F', '/T', '/PID', '4242']);
         } finally {
             if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
         }

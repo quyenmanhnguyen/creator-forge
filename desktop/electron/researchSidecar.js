@@ -314,7 +314,13 @@ function killByPort(port) {
                 }
             }
             for (const pid of pids) {
-                spawnSyncImpl('taskkill', ['/F', '/PID', String(pid)], {
+                // Use /T (tree-kill) so the entire process group is
+                // terminated — critical when uvicorn was launched with
+                // --reload: the watchfiles reloader parent survives a
+                // plain /F kill and immediately respawns the child,
+                // racing against waitForPortFree and leaving the port
+                // still bound.
+                spawnSyncImpl('taskkill', ['/F', '/T', '/PID', String(pid)], {
                     encoding: 'utf8', timeout: 3000,
                 });
             }

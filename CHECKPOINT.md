@@ -1,8 +1,8 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-03 (post HF-10 sprint — audio caption enhancements + image retry improvements)
-> Main HEAD: `c84dd17` — `feat(image): boost output count on retry + enhanced reject reasons (#83)`
-> Last sprint code commits: `53d2d43` (PR-79) → `9385554` (PR-80) → `e71553a` (PR-81) → `bff32f9` (PR-82) → `c84dd17` (PR-83) → HF-10 in-progress on branch `devin/1777811026-audio-caption-enhancements`
+> Last updated: 2026-05-03 (post PR-85 — fix killByPort Windows tree-kill on API key Save)
+> Main HEAD: `PR-85` — `fix(sidecar): use /F /T /PID tree-kill in killByPort on Windows`
+> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → PR-85 (local fix)
 
 ---
 
@@ -12,15 +12,25 @@
 | --- | --- |
 | **CI strict pytest bucket** | **265 passed** (`test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler` + `test_llm_helpers`) — +19 from HF-10 additions (PR-82/83 image retry, HF-10 +14 assembler burn-style + +5 producer caption/rate). Previously +26 from HF-9 additions. |
 | **Full pytest (local, all deps)** | **663 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap) |
-| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **123 / 123** (+7 from PR-82/83: auto-retry, tiered reject); `test_storyboard_assemble_helpers.js`: **33 / 33** (+12 from HF-10: caption style/font/position constants + burn payload fields). Cross-platform path assertions hardened for Windows. |
+| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **123 / 123**; `test_storyboard_assemble_helpers.js`: **33 / 33**; `test_research_sidecar_restart.js`: **16 / 16** (PR-85: tree-kill assertion updated). |
 | `ruff check research` | clean |
 | `node --check` (Electron entry points + dist) | clean |
 | Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
-| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) |
+| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) · **PR-85: API key Save no longer throws "port still busy" in dev mode** |
 
 ---
 
-## Sprint History (PR-47 → PR-83 + HF-10 WIP)
+## Sprint History (PR-47 → PR-85)
+
+### PR-85 — fix(sidecar): `killByPort` Windows tree-kill on API key Save
+
+User report: "Keys saved, sidecar restart failed: research sidecar restart: port :5050 still busy after shutdown attempt" — occurs every time user clicks Save in the Settings ⚙ dialog while running in dev mode (`npm run dev`).
+
+**Root cause:** `npm run dev` starts uvicorn with `--reload` (watchfiles reloader). When the sidecar tries to restart on API key Save, it calls `killByPort()` which found the LISTENING PID via `netstat -ano` and called `taskkill /F /PID <pid>`. This killed only the **immediate** child uvicorn process — the **watchfiles reloader parent** (a separate PID) survived and immediately respawned uvicorn before `waitForPortFree()` saw the port as free. The race left the port perpetually busy.
+
+**Fix:** Changed `taskkill /F /PID` → `taskkill /F /T /PID` in `killByPort()`. The `/T` flag walks the kernel's parent-child process tree and kills **all descendants** (reloader + child uvicorn) atomically — same mechanism already used in `stop()` (PR-68).
+
+**Test update:** `test_research_sidecar_restart.js` → `killByPort: windows` test renamed and assertion updated from `['/F', '/PID', '4242']` → `['/F', '/T', '/PID', '4242']`. All 16 tests pass.
 
 ### HF-10 — Audio caption enhancements + voice expansion (WIP, branch `devin/1777811026-audio-caption-enhancements`)
 
