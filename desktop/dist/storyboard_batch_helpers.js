@@ -233,7 +233,13 @@
                 && bytes < MIN_OK_IMAGE_BYTES
             ) {
                 status = "fallback";
-                reason = `image is ${Math.round(bytes / 1024)} KB — below 100 KB minimum, treated as failed`;
+                const sizeKB = Math.round(bytes / 1024);
+                const detail = sizeKB < 30
+                    ? " (likely CDN moderation placeholder — Grok blurred or blocked the image)"
+                    : sizeKB < 60
+                        ? " (likely incomplete download or preview frame)"
+                        : " (image too small to be a real generation)";
+                reason = `image is ${sizeKB} KB — below 100 KB minimum${detail}`;
             }
             return Object.assign({}, row, {
                 status,
