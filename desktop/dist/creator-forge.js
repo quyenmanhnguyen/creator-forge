@@ -1177,6 +1177,26 @@
         if (Number.isFinite(target) && target > 0) {
             params.target_duration_s = target;
         }
+        // Per-scene narration: when the storyboard has been broken into
+        // scenes, send each scene's narration as its own slot so the
+        // sidecar TTS-renders one voice clip per scene (matching the
+        // image / video phase) instead of dumping the whole script into
+        // a single TTS pass. The i-th narration aligns with the i-th
+        // scene_video so silence padding fits the assembled timeline.
+        // When no scenes are in memory (or every narration is blank)
+        // the sidecar falls back to the legacy single-pass path.
+        const scenes = Array.isArray(state.lastScenes) ? state.lastScenes : [];
+        if (scenes.length) {
+            const sceneNarrations = scenes.map(s => {
+                if (!s || typeof s !== 'object') return '';
+                const n = (s.narration == null) ? '' : String(s.narration).trim();
+                return n;
+            });
+            const anyNonBlank = sceneNarrations.some(n => n.length > 0);
+            if (anyNonBlank) {
+                params.scene_narrations = sceneNarrations;
+            }
+        }
         showLoading('ps-result', 'Rendering TTS audio (this usually takes a few seconds)...');
         try {
             const data = await api.producer.composeAudio(params);
@@ -1204,6 +1224,13 @@
         const scaledLabel = d.captions_scaled
             ? `auto-fit · ${targetSecs.toFixed(2)}s`
             : 'native TTS timing';
+        // Surface per-scene mode so the user can confirm narration was
+        // synthesised one TTS pass per scene (matching the storyboard
+        // beat-by-beat) instead of dumping the full script.
+        const scenesRendered = Number(d.scenes_rendered) || 0;
+        const sceneModeLabel = scenesRendered > 0
+            ? `per-scene · ${scenesRendered} scene${scenesRendered === 1 ? '' : 's'}`
+            : 'single-pass';
         html += `<div class="stats-row">
             <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
@@ -1212,6 +1239,7 @@
             <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
             <span>Caption source<b>${escapeHtml(d.caption_source || 'none')}</b></span>
             <span>SRT timing<b>${escapeHtml(scaledLabel)}</b></span>
+            <span>TTS mode<b>${escapeHtml(sceneModeLabel)}</b></span>
         </div>`;
         const paths = [
             [`voice.${fmt}`, d.audio_path],
@@ -3324,7 +3352,16 @@
                 if (banner) banner.insertAdjacentHTML('afterbegin', `<div class="error">${channel} IPC threw: ${escapeHtml(o.err && o.err.message || String(o.err))}</div>`);
                 continue;
             }
-            const settled = helpers.mapBatchResponse(o.resp, o.plan.sceneIds, 'image', o.plan.rowIds || o.plan.sceneIds);
+            const mapped = helpers.mapBatchResponse(o.resp, o.plan.sceneIds, 'image', o.plan.rowIds || o.plan.sceneIds);
+            // Hot-fix — ImageService / RefImageService return ``savedFiles``
+            // as a ``string[]`` (no per-file ``bytes``), so ``mapped`` lands
+            // here with ``bytes === 0`` and the ``MIN_OK_IMAGE_BYTES`` gate
+            // in ``applyBatchResult`` would silently skip a < 200 KB file.
+            // Stat each settled image on disk so the gate sees the real
+            // size before the row reaches the I2V batch.
+            const settled = (typeof helpers.enrichBatchRowsWithFileBytes === 'function' && api && typeof api.statBytes === 'function')
+                ? await helpers.enrichBatchRowsWithFileBytes(mapped, api.statBytes)
+                : mapped;
             for (const r of settled) {
                 sbbState.imageRows = helpers.applyBatchResult(sbbState.imageRows, r.row_id != null ? r.row_id : r.scene_id, r);
             }

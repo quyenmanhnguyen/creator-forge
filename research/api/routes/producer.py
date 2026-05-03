@@ -22,7 +22,9 @@ Robust failure mode (matches PR-1/2/3/4/5/6):
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -59,6 +61,10 @@ from research.core.pixelle import (
     make_short,
     scale_captions_to_duration,
     serialize_breakdown_md,
+)
+from research.core.pixelle.assembler import (
+    _concat_list_line,
+    _resolve_ffmpeg,
 )
 from research.core.pixelle.video_probe import (
     MIN_FINAL_MP4_BYTES,
@@ -952,12 +958,29 @@ def _sum_scene_video_duration(
     Returns 0.0 when ``scene_videos`` is empty or no probe yielded a
     usable duration — caller treats that as "no scaling".
     """
-    total = 0.0
+    durations = _per_scene_video_durations(scene_videos, warnings=warnings)
+    return float(sum(d for d in durations if d > 0))
+
+
+def _per_scene_video_durations(
+    scene_videos: list[str], *, warnings: list[str]
+) -> list[float]:
+    """Probe each scene video and return per-scene durations (seconds).
+
+    Mirrors :func:`_sum_scene_video_duration`'s robustness contract but
+    keeps the per-scene granularity needed by the per-scene-narration
+    flow (each scene's audio is padded / shifted independently). A
+    missing / un-probable file lands at ``0.0`` in the returned list
+    and a warning is appended; callers treat ``0.0`` as "no usable
+    duration for this scene".
+    """
+    out: list[float] = []
     if not scene_videos:
-        return 0.0
+        return out
     for raw in scene_videos:
         path = (raw or "").strip()
         if not path:
+            out.append(0.0)
             continue
         try:
             probe = probe_video_file(path)
@@ -965,13 +988,12 @@ def _sum_scene_video_duration(
             warnings.append(
                 f"Scene video probe failed for {path!r}: {type(exc).__name__}: {exc}"
             )
+            out.append(0.0)
             continue
         if not probe.exists:
             warnings.append(f"Scene video missing: {path}")
+            out.append(0.0)
             continue
-        # Prefer the video stream duration over the container duration —
-        # mov_text subs / silent audio padding can extend the container
-        # beyond the actual visual length.
         dur = (
             probe.video_stream_duration_sec
             if probe.video_stream_duration_sec is not None
@@ -985,9 +1007,10 @@ def _sum_scene_video_duration(
                 )
             else:
                 warnings.append(f"ffprobe returned no duration for {path}.")
+            out.append(0.0)
             continue
-        total += float(dur)
-    return total
+        out.append(float(dur))
+    return out
 
 
 def _default_audio_output_dir() -> Path:
@@ -1013,6 +1036,36 @@ _AUDIO_FORMAT_BY_PROVIDER: dict[str, Literal["mp3", "wav"]] = {
 
 class AudioOnlyRequest(BaseModel):
     script: str = Field(..., min_length=1, description="Full narration script (single voice).")
+    # Per-scene narration — one entry per storyboard scene, in playback
+    # order. When this list is non-empty (and at least one entry is
+    # non-blank) the route runs **per-scene TTS**: each scene is
+    # synthesised independently, padded with silence to match the
+    # corresponding ``scene_videos`` duration when shorter, then
+    # concatenated into ``voice.mp3`` so the narration tracks the
+    # storyboard beat-by-beat instead of dumping the whole script onto
+    # one timeline. The SRT is built per-scene with each scene's
+    # captions time-shifted by the cumulative scene start so they
+    # align with the assembled video's timeline.
+    #
+    # ``script`` remains required for back-compat (legacy clients only
+    # set ``script``) — when ``scene_narrations`` is non-empty it
+    # supersedes ``script`` for synthesis but ``script`` is still used
+    # as the sentence-fallback source if a TTS engine fails to surface
+    # word boundaries.
+    scene_narrations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-scene narration texts (one per scene, in playback "
+            "order). When non-empty and at least one entry has content, the "
+            "route TTS-synthesises each scene independently, pads each "
+            "scene's audio with silence to match the corresponding "
+            "``scene_videos`` duration when shorter, concatenates them into "
+            "the final voice file, and emits per-scene captions time-shifted "
+            "to align with the assembled video timeline. ``script`` is then "
+            "treated as a back-compat field only. When empty (legacy "
+            "behavior), the entire ``script`` is rendered as one TTS pass."
+        ),
+    )
     tts_provider: str = Field(
         DEFAULT_TTS_PROVIDER,
         description=(
@@ -1088,6 +1141,28 @@ class AudioOnlyRequest(BaseModel):
                 cleaned.append(str(item))
         return cleaned
 
+    @field_validator("scene_narrations", mode="before")
+    @classmethod
+    def _strip_scene_narrations(cls, v: object) -> object:
+        # Preserve list length (so the i-th entry still aligns with the
+        # i-th scene_video) but normalise individual entries: ``None``
+        # / non-string → ``""``; trailing whitespace is stripped. We
+        # do NOT drop blank entries here — a blank narration for scene
+        # k means "no voice for this scene, just silence under the
+        # video", and the route honours that by writing a silent
+        # segment of the matching scene-video duration.
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                cleaned.append(item.strip())
+            elif item is None:
+                cleaned.append("")
+            else:
+                cleaned.append(str(item).strip())
+        return cleaned
+
 
 class AudioOnlyResponse(BaseModel):
     audio_path: str
@@ -1107,6 +1182,367 @@ class AudioOnlyResponse(BaseModel):
     # responses (pre-PR-A clients) keep parsing.
     target_duration_s: float = 0.0
     captions_scaled: bool = False
+    # Per-scene narration mode (default 0 = off). Equal to the number
+    # of scene_narrations slots that successfully synthesised + were
+    # concatenated into ``audio_path``. The renderer surfaces this so
+    # the user can confirm "yes, voice was rendered per-scene, not
+    # from the full script".
+    scenes_rendered: int = 0
+
+
+@dataclass
+class _PerSceneSynthResult:
+    """Outcome of synthesising one scene's narration as part of the
+    per-scene audio flow. Pure data so the orchestrator stays testable
+    without ffmpeg present.
+    """
+
+    audio_path: Path  # Empty Path when synth failed for this slot.
+    duration_s: float = 0.0
+    captions: list[Caption] = field(default_factory=list)
+    caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+    target_duration_s: float = 0.0  # 0 → no scene_videos pin for this slot
+    pad_silence_s: float = 0.0  # silence to append to reach target_duration_s
+    final_segment_duration_s: float = 0.0  # max(duration_s, target_duration_s)
+    # Set when this scene was a blank narration AND we couldn't fall
+    # back to silent video alignment (no scene_video duration). Used
+    # by the orchestrator to skip the slot rather than bake an empty
+    # segment into the final audio.
+    skipped: bool = False
+    skip_reason: str = ""
+
+
+def _ffmpeg_concat_audio_segments(
+    segments: list[Path],
+    *,
+    silence_pads_s: list[float],
+    output_path: Path,
+    audio_format: Literal["mp3", "wav"],
+    timeout_s: float = 600.0,
+) -> tuple[bool, str]:
+    """Concatenate per-scene audio files (+ optional silence pads) via ffmpeg.
+
+    Each ``segments[i]`` is the synthesised audio for scene ``i``;
+    ``silence_pads_s[i]`` is appended after that scene's audio to fit
+    the corresponding scene_video duration. Returns
+    ``(ok, error_message)``. Never raises — caller decides how to
+    surface the failure to the user via ``warnings``.
+
+    Implementation: writes a concat-demuxer list pointing at the
+    segment files, generates the silent pads via ``anullsrc`` filter,
+    then runs ``ffmpeg -f concat -safe 0 -i list.txt -c:a libmp3lame``
+    (or pcm_s16le for wav). To keep the concat demuxer happy across
+    codec/sample-rate variations we re-encode rather than copying
+    streams.
+
+    The silence pads are baked in by interleaving silent files into
+    the concat list. We synthesise them with
+    ``-f lavfi -i anullsrc=...`` per pad, write to a per-pad temp file,
+    and unlink them after concat returns.
+    """
+    binary = _resolve_ffmpeg()
+    if not binary:
+        return False, "ffmpeg not on PATH and FFMPEG_PATH not set"
+    if not segments:
+        return False, "no per-scene audio segments to concatenate"
+    if len(silence_pads_s) != len(segments):
+        return False, (
+            f"silence_pads_s length {len(silence_pads_s)} != segments {len(segments)}"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    work_dir = output_path.parent
+    list_path = work_dir / f"_scene_audio_list_{int(time.time() * 1000)}.txt"
+    silence_paths: list[Path] = []
+
+    try:
+        # 1. Generate silence pads (one file per non-zero pad).
+        for i, pad_s in enumerate(silence_pads_s):
+            if pad_s <= 0.001:
+                silence_paths.append(Path(""))
+                continue
+            silence_path = work_dir / f"_silence_{i}_{int(time.time() * 1000)}.{audio_format}"
+            silence_paths.append(silence_path)
+            codec_args = (
+                ["-c:a", "libmp3lame", "-b:a", "128k"]
+                if audio_format == "mp3"
+                else ["-c:a", "pcm_s16le"]
+            )
+            silence_cmd = [
+                binary,
+                "-y",
+                "-loglevel", "error",
+                "-f", "lavfi",
+                "-i", f"anullsrc=channel_layout=mono:sample_rate=24000:duration={pad_s:.3f}",
+                *codec_args,
+                str(silence_path),
+            ]
+            try:
+                proc = subprocess.run(  # noqa: S603 — controlled cmd, no shell=True.
+                    silence_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"ffmpeg silence-pad {i} timed out after {timeout_s}s"
+            if proc.returncode != 0:
+                return False, (
+                    f"ffmpeg silence-pad {i} failed: "
+                    f"rc={proc.returncode} stderr={(proc.stderr or '').strip()[:400]}"
+                )
+
+        # 2. Build the concat list interleaving real segments and silence pads.
+        concat_lines: list[str] = []
+        for seg, sil in zip(segments, silence_paths):
+            if seg and str(seg):
+                concat_lines.append(_concat_list_line(seg))
+            if sil and str(sil):
+                concat_lines.append(_concat_list_line(sil))
+        list_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        # 3. Run ffmpeg concat demuxer.
+        codec_args = (
+            ["-c:a", "libmp3lame", "-b:a", "128k"]
+            if audio_format == "mp3"
+            else ["-c:a", "pcm_s16le"]
+        )
+        concat_cmd = [
+            binary,
+            "-y",
+            "-loglevel", "error",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_path),
+            *codec_args,
+            str(output_path),
+        ]
+        try:
+            proc = subprocess.run(  # noqa: S603 — controlled cmd, no shell=True.
+                concat_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"ffmpeg concat timed out after {timeout_s}s"
+        if proc.returncode != 0:
+            return False, (
+                f"ffmpeg concat failed: "
+                f"rc={proc.returncode} stderr={(proc.stderr or '').strip()[:400]}"
+            )
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return False, f"ffmpeg concat completed but output is empty at {output_path}"
+        return True, ""
+    finally:
+        # Best-effort cleanup of the staged list and silence files.
+        try:
+            if list_path.exists():
+                list_path.unlink()
+        except OSError:
+            pass
+        for sil in silence_paths:
+            try:
+                if sil and str(sil) and Path(sil).exists():
+                    Path(sil).unlink()
+            except OSError:
+                pass
+
+
+def _synthesize_per_scene_audio(
+    scene_narrations: list[str],
+    *,
+    adapter: Any,
+    voice: str,
+    output_dir: Path,
+    scene_video_durations: list[float],
+    audio_format: Literal["mp3", "wav"],
+    warnings: list[str],
+) -> tuple[list[_PerSceneSynthResult], list[Caption]]:
+    """Run TTS per-scene and pad each segment to its scene_video duration.
+
+    Returns ``(per_scene_results, combined_captions)`` where
+    ``combined_captions`` is the per-scene captions time-shifted by
+    cumulative segment duration so they align with the final
+    concatenated audio (which is also the assembled video timeline as
+    long as ``scene_video_durations`` matches ``scene_narrations``).
+
+    Robust-failure: a scene whose TTS raises is logged into
+    ``warnings`` and replaced with silence the length of its
+    ``scene_video_durations`` entry (or skipped entirely when no scene
+    video duration is known for that slot — caller should treat the
+    skip as "no entry in the final concat").
+    """
+    results: list[_PerSceneSynthResult] = []
+    combined_captions: list[Caption] = []
+    cumulative_offset_s = 0.0
+
+    for i, raw_narration in enumerate(scene_narrations):
+        narration = (raw_narration or "").strip()
+        target_dur = (
+            float(scene_video_durations[i])
+            if i < len(scene_video_durations) and scene_video_durations[i] > 0
+            else 0.0
+        )
+        scene_path = output_dir / f"voice_scene_{i + 1:02d}.{audio_format}"
+
+        if not narration:
+            # Blank narration → silent segment for this scene's video
+            # duration. If we don't have a scene_video duration we
+            # have no way to size the silence, so we skip the slot
+            # entirely (the user clearly intended scene_narrations to
+            # be a sparse list and didn't pass scene_videos).
+            if target_dur <= 0:
+                results.append(
+                    _PerSceneSynthResult(
+                        audio_path=Path(""),
+                        skipped=True,
+                        skip_reason=(
+                            f"scene {i + 1}: blank narration and no scene_video "
+                            "duration — skipped from per-scene audio"
+                        ),
+                    )
+                )
+                warnings.append(results[-1].skip_reason)
+                continue
+            # Silence pad will be added by the concat helper; the
+            # "segment" is just the silence so we record an empty
+            # audio_path and a pad_silence_s of target_dur.
+            results.append(
+                _PerSceneSynthResult(
+                    audio_path=Path(""),
+                    duration_s=0.0,
+                    captions=[],
+                    caption_source="none",
+                    target_duration_s=target_dur,
+                    pad_silence_s=target_dur,
+                    final_segment_duration_s=target_dur,
+                )
+            )
+            cumulative_offset_s += target_dur
+            continue
+
+        # Real narration → TTS this scene independently.
+        try:
+            tts_result = adapter.synthesize_with_timing(
+                narration, output_path=scene_path, voice=voice
+            )
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            warnings.append(
+                f"Scene {i + 1} TTS failed: {type(exc).__name__}: {exc}"
+            )
+            # Replace with silence of scene_video length so the timeline
+            # still makes sense; if we don't have a target duration,
+            # skip this slot entirely (cumulative offset unchanged).
+            if target_dur > 0:
+                results.append(
+                    _PerSceneSynthResult(
+                        audio_path=Path(""),
+                        duration_s=0.0,
+                        captions=[],
+                        caption_source="none",
+                        target_duration_s=target_dur,
+                        pad_silence_s=target_dur,
+                        final_segment_duration_s=target_dur,
+                    )
+                )
+                cumulative_offset_s += target_dur
+            else:
+                results.append(
+                    _PerSceneSynthResult(
+                        audio_path=Path(""),
+                        skipped=True,
+                        skip_reason=(
+                            f"scene {i + 1}: TTS failed and no scene_video duration "
+                            "to substitute silence — skipped"
+                        ),
+                    )
+                )
+            continue
+
+        if isinstance(getattr(tts_result, "audio_path", None), Path):
+            scene_path = tts_result.audio_path
+        scene_dur = float(tts_result.duration_seconds or 0.0)
+
+        # Build per-scene captions from word boundaries; fall back to
+        # sentence split over the natural TTS duration. We do NOT
+        # scale to target_dur here — captions are linked to the actual
+        # voice they describe, not the silent padding that follows.
+        scene_caps: list[Caption] = []
+        scene_caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
+        if tts_result.word_boundaries:
+            try:
+                scene_caps = group_word_boundaries(tts_result.word_boundaries)
+                scene_caption_source = "word_boundaries"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"Scene {i + 1} caption grouping failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                scene_caps = []
+        if not scene_caps:
+            try:
+                scene_caps = fallback_captions_from_text(
+                    narration, audio_duration_s=scene_dur or 0.0
+                )
+                scene_caption_source = "sentence_fallback" if scene_caps else "none"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"Scene {i + 1} caption fallback failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                scene_caps = []
+                scene_caption_source = "none"
+
+        # Pad with silence when narration is shorter than the scene
+        # video; never truncate (audio is the master). When narration
+        # is *longer* than the scene video, we keep the audio as-is
+        # and warn the user — final_segment_duration_s is then >
+        # target_duration_s, which means the assembled video will run
+        # out of pixels before the audio runs out.
+        if target_dur > 0 and scene_dur > 0:
+            if scene_dur >= target_dur - 0.05:
+                pad = 0.0
+                if scene_dur > target_dur + 0.5:
+                    warnings.append(
+                        f"Scene {i + 1} narration is {scene_dur:.2f}s but "
+                        f"scene_video is only {target_dur:.2f}s — final audio "
+                        "will outrun the visual track for this scene."
+                    )
+                final_seg = scene_dur
+            else:
+                pad = float(target_dur) - float(scene_dur)
+                final_seg = target_dur
+        else:
+            pad = 0.0
+            final_seg = scene_dur
+
+        # Time-shift this scene's captions to the assembled timeline.
+        for cap in scene_caps:
+            combined_captions.append(
+                Caption(
+                    start_s=float(cumulative_offset_s + cap.start_s),
+                    end_s=float(cumulative_offset_s + cap.end_s),
+                    text=cap.text,
+                )
+            )
+
+        results.append(
+            _PerSceneSynthResult(
+                audio_path=scene_path,
+                duration_s=scene_dur,
+                captions=scene_caps,
+                caption_source=scene_caption_source,
+                target_duration_s=target_dur,
+                pad_silence_s=pad,
+                final_segment_duration_s=final_seg,
+            )
+        )
+        cumulative_offset_s += final_seg
+
+    return results, combined_captions
 
 
 @router.post("/audio", response_model=AudioOnlyResponse)
@@ -1122,6 +1558,14 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     2. **Captions**: word boundaries first, sentence fallback when the
        engine can't supply timing. Optionally serialised to
        ``captions.srt``.
+
+    Per-scene mode: when ``scene_narrations`` is non-empty (and at
+    least one entry has content) the route synthesises each scene
+    independently and concatenates them into ``voice.mp3`` via ffmpeg
+    so the narration tracks the storyboard beat-by-beat instead of
+    rendering the full ``script`` as a single TTS pass. Per-scene
+    captions are time-shifted by cumulative segment duration so they
+    align with the assembled video timeline.
     """
     script = req.script.strip()
     warnings: list[str] = []
@@ -1158,6 +1602,9 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     # — same convention as ``/producer/short``.
     audio_path = output_dir / "voice.mp3"
     srt_path = output_dir / "captions.srt"
+    audio_format_default: Literal["mp3", "wav"] = _AUDIO_FORMAT_BY_PROVIDER.get(
+        _provider_key, "mp3"
+    )
 
     audio_ok = False
     duration_s = 0.0
@@ -1165,45 +1612,136 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     caption_source: Literal["word_boundaries", "sentence_fallback", "none"] = "none"
     engine_name = EdgeTTSAdapter.name
 
-    try:
-        adapter = _resolve_tts_adapter(req.tts_provider)
-        engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
-        tts_result = adapter.synthesize_with_timing(
-            script, output_path=audio_path, voice=req.voice
+    # Per-scene mode is enabled when the renderer sent at least one
+    # non-blank narration entry. When all entries are blank we fall
+    # back to the legacy single-pass TTS — there's nothing to render
+    # per-scene and concatenating only silence wouldn't produce a
+    # useful audio file.
+    per_scene_active = any(bool((s or "").strip()) for s in req.scene_narrations)
+    scenes_rendered = 0
+
+    if per_scene_active:
+        scene_video_durations = _per_scene_video_durations(
+            req.scene_videos, warnings=warnings
         )
-        if isinstance(getattr(tts_result, "audio_path", None), Path):
-            audio_path = tts_result.audio_path
-        audio_ok = audio_path.exists()
-        duration_s = float(tts_result.duration_seconds or 0.0)
+        try:
+            adapter = _resolve_tts_adapter(req.tts_provider)
+            engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+            per_scene_results, combined_captions = _synthesize_per_scene_audio(
+                req.scene_narrations,
+                adapter=adapter,
+                voice=req.voice,
+                output_dir=output_dir,
+                scene_video_durations=scene_video_durations,
+                audio_format=audio_format_default,
+                warnings=warnings,
+            )
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            msg = f"Per-scene TTS failed: {type(exc).__name__}: {exc}"
+            logger.warning(msg)
+            warnings.append(msg)
+            per_scene_results = []
+            combined_captions = []
 
-        if tts_result.word_boundaries:
-            try:
-                captions = group_word_boundaries(tts_result.word_boundaries)
-                caption_source = "word_boundaries"
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"Caption grouping failed: {type(exc).__name__}: {exc}")
-                captions = []
-
-        if not captions:
-            try:
-                captions = fallback_captions_from_text(
-                    script, audio_duration_s=duration_s or 0.0
+        # Filter out skipped scenes (blank narration + no scene video
+        # duration). Each remaining slot contributes an audio segment
+        # (real narration OR pure silence at scene_video duration).
+        live_segments = [r for r in per_scene_results if not r.skipped]
+        if live_segments:
+            audio_segments = [r.audio_path for r in live_segments]
+            silence_pads = [r.pad_silence_s for r in live_segments]
+            ok, err = _ffmpeg_concat_audio_segments(
+                audio_segments,
+                silence_pads_s=silence_pads,
+                output_path=audio_path,
+                audio_format=audio_format_default,
+                timeout_s=600.0,
+            )
+            if ok:
+                audio_ok = audio_path.exists()
+                duration_s = float(
+                    sum(r.final_segment_duration_s for r in live_segments)
                 )
-                caption_source = "sentence_fallback" if captions else "none"
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"Caption fallback failed: {type(exc).__name__}: {exc}")
-                captions = []
-                caption_source = "none"
-    except Exception as exc:  # noqa: BLE001 — boundary catch.
-        msg = f"TTS failed: {type(exc).__name__}: {exc}"
-        logger.warning(msg)
-        warnings.append(msg)
+                captions = combined_captions
+                # Caption source is "word_boundaries" if any scene
+                # produced timed captions; falls back to
+                # "sentence_fallback" / "none" otherwise.
+                if any(r.caption_source == "word_boundaries" for r in live_segments):
+                    caption_source = "word_boundaries"
+                elif any(r.caption_source == "sentence_fallback" for r in live_segments):
+                    caption_source = "sentence_fallback"
+                else:
+                    caption_source = "none"
+                scenes_rendered = sum(
+                    1 for r in live_segments if r.duration_s > 0 and r.audio_path
+                )
+                # Best-effort cleanup of the per-scene segment files
+                # that survived the concat — they're redundant once
+                # voice.mp3 exists.
+                for seg in audio_segments:
+                    try:
+                        if seg and Path(seg).exists() and Path(seg) != audio_path:
+                            Path(seg).unlink()
+                    except OSError:
+                        pass
+            else:
+                warnings.append(f"Per-scene audio concat failed: {err}")
+                # Fall back to legacy single-pass synth so the user
+                # still gets *some* audio rather than an empty result.
+                per_scene_active = False
+        else:
+            warnings.append(
+                "Per-scene narration: every slot was skipped — falling back to "
+                "single-pass TTS over ``script``."
+            )
+            per_scene_active = False
+
+    if not per_scene_active:
+        try:
+            adapter = _resolve_tts_adapter(req.tts_provider)
+            engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+            tts_result = adapter.synthesize_with_timing(
+                script, output_path=audio_path, voice=req.voice
+            )
+            if isinstance(getattr(tts_result, "audio_path", None), Path):
+                audio_path = tts_result.audio_path
+            audio_ok = audio_path.exists()
+            duration_s = float(tts_result.duration_seconds or 0.0)
+
+            if tts_result.word_boundaries:
+                try:
+                    captions = group_word_boundaries(tts_result.word_boundaries)
+                    caption_source = "word_boundaries"
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"Caption grouping failed: {type(exc).__name__}: {exc}")
+                    captions = []
+
+            if not captions:
+                try:
+                    captions = fallback_captions_from_text(
+                        script, audio_duration_s=duration_s or 0.0
+                    )
+                    caption_source = "sentence_fallback" if captions else "none"
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"Caption fallback failed: {type(exc).__name__}: {exc}")
+                    captions = []
+                    caption_source = "none"
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            msg = f"TTS failed: {type(exc).__name__}: {exc}"
+            logger.warning(msg)
+            warnings.append(msg)
 
     # PR-A — auto-sync SRT timing to the assembled video. Resolve the
     # target duration before serialising to .srt so the file on disk
     # already reflects the scaling. ``target_duration_s`` (explicit
     # override) wins over ffprobe-derived ``scene_videos`` when both
     # are set.
+    #
+    # Per-scene mode skips this scaling because per-scene captions are
+    # already aligned to the assembled video timeline (each scene's
+    # captions cover its own slice; silence padding fills the gap to
+    # the next scene). Re-scaling them linearly against the summed
+    # duration would actually mis-align them.
     target_duration_s = 0.0
     if req.target_duration_s and req.target_duration_s > 0:
         target_duration_s = float(req.target_duration_s)
@@ -1213,32 +1751,33 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         )
 
     captions_scaled = False
-    if target_duration_s > 0 and captions:
-        # Stretch / compress the existing captions linearly. If TTS
-        # never produced timed captions but we have a script + target,
-        # fall back to a sentence split spread across the target so the
-        # video still has subtitles.
-        captions = scale_captions_to_duration(captions, target_duration_s)
-        captions_scaled = True
-    elif target_duration_s > 0 and not captions:
-        try:
-            captions = fallback_captions_from_text(
-                script, audio_duration_s=target_duration_s
-            )
-            if captions:
-                caption_source = "sentence_fallback"
-                captions_scaled = True
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(
-                f"Caption auto-fit fallback failed: {type(exc).__name__}: {exc}"
-            )
+    if not per_scene_active:
+        if target_duration_s > 0 and captions:
+            # Stretch / compress the existing captions linearly. If TTS
+            # never produced timed captions but we have a script + target,
+            # fall back to a sentence split spread across the target so the
+            # video still has subtitles.
+            captions = scale_captions_to_duration(captions, target_duration_s)
+            captions_scaled = True
+        elif target_duration_s > 0 and not captions:
+            try:
+                captions = fallback_captions_from_text(
+                    script, audio_duration_s=target_duration_s
+                )
+                if captions:
+                    caption_source = "sentence_fallback"
+                    captions_scaled = True
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"Caption auto-fit fallback failed: {type(exc).__name__}: {exc}"
+                )
 
-    if target_duration_s > 0 and duration_s > target_duration_s + 0.05:
-        warnings.append(
-            f"Narration audio is {duration_s:.2f}s but target is "
-            f"{target_duration_s:.2f}s — captions were compressed to fit "
-            "the shorter video. Consider trimming the script."
-        )
+        if target_duration_s > 0 and duration_s > target_duration_s + 0.05:
+            warnings.append(
+                f"Narration audio is {duration_s:.2f}s but target is "
+                f"{target_duration_s:.2f}s — captions were compressed to fit "
+                "the shorter video. Consider trimming the script."
+            )
 
     written_srt: Path | None = None
     if req.write_srt and captions:
@@ -1265,6 +1804,7 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         warnings=warnings,
         target_duration_s=round(target_duration_s, 3),
         captions_scaled=captions_scaled,
+        scenes_rendered=scenes_rendered,
     )
 
 

@@ -168,6 +168,118 @@ test("applyBatchResult: 'generated' image with no bytes reported is left alone (
     assert.strictEqual(rows[0].status, "generated", "no bytes field → gate is a no-op");
 });
 
+// Hot-fix regression coverage: ImageService / RefImageService return
+// ``savedFiles`` as a string[] (paths only — no per-file ``bytes``).
+// ``mapBatchResponse`` therefore lands rows here with ``bytes === 0``
+// even when the file on disk is fine, which silently no-ops the
+// MIN_OK_IMAGE_BYTES gate. The renderer now closes the loop with
+// ``enrichBatchRowsWithFileBytes`` (sync stat via ``electronAPI.statBytes``)
+// before handing rows to ``applyBatchResult``.
+
+test("enrichBatchRowsWithFileBytes: backfills bytes from disk for image rows missing it", async () => {
+    const calls = [];
+    const stat = async (path) => {
+        calls.push(path);
+        const sizes = { "/img/a.jpg": 250 * 1024, "/img/b.jpg": 80 * 1024 };
+        return { exists: path in sizes, size: sizes[path] || 0 };
+    };
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/a.jpg", bytes: 0 },
+        { scene_id: 2, status: "generated", image_path: "/img/b.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.deepStrictEqual(calls, ["/img/a.jpg", "/img/b.jpg"]);
+    assert.strictEqual(enriched[0].bytes, 250 * 1024);
+    assert.strictEqual(enriched[1].bytes, 80 * 1024);
+    // Caller's array must not be mutated.
+    assert.strictEqual(mapped[0].bytes, 0);
+    assert.strictEqual(mapped[1].bytes, 0);
+});
+
+test("enrichBatchRowsWithFileBytes: feeds applyBatchResult so the < 200 KB gate fires", async () => {
+    // The bug: the renderer's old wiring used to pass rows with
+    // ``bytes === 0`` straight into ``applyBatchResult``, and the
+    // gate (``bytes > 0 && bytes < MIN_OK_IMAGE_BYTES``) silently
+    // skipped, letting ~80 KB Grok error pages through as
+    // ``generated`` and into the I2V batch. After enrichment the
+    // gate fires and the row is correctly demoted to fallback.
+    const stat = async () => ({ exists: true, size: 80 * 1024 });
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/blank.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    rows = helpers.applyBatchResult(rows, enriched[0].scene_id, enriched[0]);
+    assert.strictEqual(rows[0].status, "fallback", "80 KB image must NOT count as generated after enrichment");
+    assert.match(rows[0].reason, /80 KB/);
+    assert.match(rows[0].reason, /below 200 KB/);
+});
+
+test("enrichBatchRowsWithFileBytes: leaves rows alone when bytes already known (trusted IPC path)", async () => {
+    let called = 0;
+    const stat = async () => { called += 1; return { exists: true, size: 1 * 1024 }; };
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/a.jpg", bytes: 250 * 1024 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(called, 0, "stat must not be called when bytes already > 0");
+    assert.strictEqual(enriched[0].bytes, 250 * 1024);
+});
+
+test("enrichBatchRowsWithFileBytes: ignores fallback / skipped / pending rows", async () => {
+    let called = 0;
+    const stat = async () => { called += 1; return { exists: true, size: 1024 }; };
+    const mapped = [
+        { scene_id: 1, status: "fallback", reason: "no usable image" },
+        { scene_id: 2, status: "skipped", reason: "no prompt" },
+        { scene_id: 3, status: "pending" },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(called, 0, "stat must not be called for non-generated rows");
+    assert.deepStrictEqual(enriched, mapped, "rows are passed through untouched");
+});
+
+test("enrichBatchRowsWithFileBytes: video rows are untouched (gate is image-only)", async () => {
+    let called = 0;
+    const stat = async () => { called += 1; return { exists: true, size: 1024 }; };
+    const mapped = [
+        { scene_id: 1, status: "generated", video_path: "/v.mp4", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(called, 0, "video rows have no image_path so the gate doesn't apply");
+    assert.deepStrictEqual(enriched, mapped);
+});
+
+test("enrichBatchRowsWithFileBytes: stat exception is swallowed; row keeps bytes=0 so gate stays opt-in", async () => {
+    const stat = async () => { throw new Error("EBUSY"); };
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/x.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(enriched[0].bytes, 0, "stat error keeps row at bytes=0 (no false positive demote)");
+    // applyBatchResult would then leave this row alone (bytes==0 → no
+    // gate fire), preserving the legacy "trust IPC" behavior on
+    // transient stat failures.
+});
+
+test("enrichBatchRowsWithFileBytes: accepts bare numeric stat return for unit-test ergonomics", async () => {
+    const stat = async () => 250 * 1024;
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/a.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(enriched[0].bytes, 250 * 1024);
+});
+
+test("enrichBatchRowsWithFileBytes: missing statBytesFn → no-op (keeps legacy renderers working)", async () => {
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/img/a.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, null);
+    assert.deepStrictEqual(enriched, mapped);
+});
+
 test("pairImagePathsForI2V: copies path only for settled image rows", () => {
     let imageRows = helpers.initImageRowsFromScenes(SCENES);
     imageRows = helpers.startBatchPhase(imageRows);
