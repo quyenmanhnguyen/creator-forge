@@ -1,8 +1,8 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-02 (post HF-4/5/6/7 sprint, PR-48 → PR-72)
-> Main HEAD: `0beba4b` — `docs: update CHECKPOINT post PR-48–PR-72 + HF-4..6 sprint`
-> Last code commit on main: `9f95c26` — `fix(sidecar): real TCP bind probe in waitForPortFree (PR-72) (#72)`
+> Last updated: 2026-05-03 (post Compose/Assembly UX sprint, PR-75 + PR-77)
+> Main HEAD: `22a1ef9` — `PR-B: real-flow auto-fill + image-size gate + script mirror + scene-prompt diversity (#77)`
+> Last sprint code commits: `f342dc0` (PR-75 — Compose audio-only + auto-fit SRT) and `22a1ef9` (PR-77 — real-flow scene auto-fill + script mirror + image-size gate + LLM diversity)
 
 ---
 
@@ -10,15 +10,28 @@
 
 | Metric | Value |
 | --- | --- |
-| **CI strict pytest bucket** | **213 passed** (research/tests/test_api_*.py + test_video_probe + test_pixelle_tts_providers + test_assembler) |
-| **Desktop offline test files** | **28 / 28 PASS** (deterministic on 3 re-runs) |
+| **CI strict pytest bucket** | **220 passed** (research/tests/test_api_*.py + test_video_probe + test_pixelle_tts_providers + test_assembler) — +7 from PR-75 producer-route additions |
+| **Pixelle UX tests (PR-75/PR-77)** | **59 passed** (`test_pixelle_subtitles.py` SRT auto-fit + `test_pixelle_scene_breakdown.py` diversity rule) — runnable locally, not in CI strict bucket |
+| **Desktop offline test files** | **28 / 28 PASS** (deterministic on 3 re-runs) — `test_storyboard_batch_helpers.js`: **107 / 107** (+4 image-size gate, was 103); `test_storyboard_assemble_helpers.js`: **21 / 21** (+5 real-flow `video_path` + status filter, was ~16) |
 | `ruff check research` | clean |
-| `node --check` (Electron entry points) | clean |
+| `node --check` (Electron entry points + dist) | clean |
 | Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
+| Live E2E verification | **PR-75: 8/8 assertions** (backend + Compose UI + 1-click Assemble final.mp4) · **PR-77: 4/4 fixes** (CDP-driven renderer probes for real-flow autofill + script-mirror + image-size gate, sidecar eval for LLM diversity) |
 
 ---
 
-## Sprint History (PR-48 → PR-72)
+## Sprint History (PR-48 → PR-77)
+
+### HF-8 — Compose audio-only + auto-fit SRT + Video Assembly auto-fill (PR-75, PR-77)
+
+User feedback after the HF-7 hardening: "`Output mode` and `Style` selectors on Compose are noise — TTS is always the default mode. Captions don't match scene durations. Video Assembly's `scene_videos` doesn't auto-fill from the I2V batch table. Hot-loaded script from Storyboard doesn't propagate into Compose. Some Grok image rows visibly broken (~50–150 KB blank pages) but renderer still treats them as `generated`. Variant scene prompts open with the same noun phrase across scenes."
+
+| PR | Title | What it ships |
+|---|---|---|
+| #75 | feat(compose,assemble): drop short mode, auto-fit SRT to video, auto-fill assembly | Removes `Output mode` + `Style` selectors from Compose (mode pinned to `/producer/audio`). Adds `Target duration override` (s) + `Reference scene videos` summary panel that pulls scene paths from the latest I2V batch state. Backend `/producer/audio` accepts `scene_videos[]` + `target_duration_s` and runs `_resolve_target_duration` (ffprobe-driven sum, override wins) + `scale_captions_to_duration` (linear stretch so `last.end_s == target_s`). `Video Assembly` auto-fills `scene_videos` from the batch table on settle, plus `Narration audio` + `Captions` after Compose audio finishes. Adds 13 new tests (7 producer, 6 subtitles). `/producer/short` retained for back-compat. |
+| #77 | PR-B: real-flow auto-fill + image-size gate + script mirror + scene-prompt diversity | **(1)** `pullScenePathsFromBatch` reads `r.video_path` (real renderer state from `applyBatchResult`) in addition to `r.savedFile` (legacy IPC contract / fixtures), and explicitly filters status to `{generated, retried, settled, fallback}` — `failed` / `generating` / `pending` / `skipped` are dropped. **(2)** New `MIN_OK_IMAGE_BYTES = 200 * 1024` gate in `applyBatchResult`: when an IPC layer reports `generated` / `retried` for an image but the file is < 200 KB, the row is demoted to `fallback` with a human-readable reason (`image is X KB — below 200 KB minimum, treated as failed`) so `pairImagePathsForI2V` won't promote a broken Grok page into the I2V batch. **(3)** Compose `#ps-script` auto-mirrors from Storyboard's `#sb-script` on cold paint and on every Storyboard edit, gated by a `psScriptUserEdited` flag that flips on the first hand-edit so manual tweaks are never clobbered (`Copy script from above` re-arms the mirror). **(4)** Scene-breakdown system prompt gains Hard rule #6 "SCENE-TO-SCENE DIVERSITY" requiring no two `IMAGE PROMPT`s open with the same noun phrase / framing clause and no two `FLOW VIDEO PROMPT`s open with the same camera move — concrete rotation list spans composition (wide / medium / tight close-up / over-the-shoulder / top-down / mirrored), camera angle (eye-level / low / high / dutch / aerial), and detail focus (hero subject / hands / texture / environmental cue). |
+
+Both PRs were live-tested end-to-end with screen recordings + ffprobe evidence + DOM assertions. PR-77 introduced a CDP-driven testing recipe: launch Electron with `--remote-debugging-port=9222 --remote-allow-origins=...`, drive renderer-side pure helpers (e.g. `window.StoryboardAssembleHelpers.pullScenePathsFromBatch`) directly from a Python CDP client (`/tmp/cdp_eval.py`), and probe the running sidecar's in-process `build_breakdown_system_prompt` to verify the LLM diversity rule actually ships. This unblocks future renderer fixes that previously needed Grok / DeepSeek credentials to exercise.
 
 ### HF-4 — Storyboard / Variant / Fan-out (PR-47 … PR-61)
 
@@ -63,11 +76,22 @@ PR-72 is the fix that unblocked Windows users on the API-keys Save flow. PR-71 +
 
 ---
 
+## Architectural deltas from HF-8
+
+* **Compose panel is single-mode.** `creator-forge.html` no longer renders `Output mode` / `Style` selectors; `creator-forge.js` always POSTs to `/producer/audio`. The legacy `/producer/short` route still exists in `research/api/routes/producer.py` and remains covered by `test_api_producer.py` for back-compat.
+* **Auto-fit SRT contract.** `/producer/audio` accepts (in addition to the prior fields) `scene_videos: list[str]` and `target_duration_s: float | None`. Resolution rule: explicit `target_duration_s` wins; otherwise `_resolve_target_duration` ffprobes each `scene_videos[]` path and sums their durations. When a target is resolved, `scale_captions_to_duration` linearly stretches the caption timeline so `last.end_s == target`. Response gains `target_duration_s` + `captions_scaled` flags so the renderer can show "SRT timing: auto-fit · 30.00s" vs "native TTS timing".
+* **Renderer ↔ batch row contract.** Renderer state holds `video_path` (set by `applyBatchResult`); legacy IPC fixtures used `savedFile`. `pullScenePathsFromBatch` now accepts both, with `video_path` prioritised. Statuses are filtered explicitly — only `{generated, retried, settled, fallback}` are eligible for promotion to `scene_videos`.
+* **Image-row size gate.** Single source of truth is `MIN_OK_IMAGE_BYTES = 200 * 1024` inside `desktop/dist/storyboard_batch_helpers.js`. Any change to this threshold should also update `test_storyboard_batch_helpers.js` (4 dedicated cases — exact threshold, just-below, just-above, video rows with no `bytes`).
+* **Script-mirror flag.** `psScriptUserEdited` lives at module scope in `creator-forge.js`. It is wired to the Compose `#ps-script` `input` event (one-shot flip) and is reset by `copyScriptFromStoryboard` (the explicit "Copy script from above" button) — never by automated mirror writes.
+* **LLM scene-prompt diversity rule.** Hard rule #6 inside `build_breakdown_system_prompt` in `research/core/pixelle/scene_breakdown.py`. The rule is interpolated with `n_scenes` and asserts on first-eight-words-readable distinguishability. Adherence is non-deterministic (LLM behaviour); regression test `test_pixelle_scene_breakdown.py` only verifies the rule ships in the prompt body.
+
+---
+
 ## Test Inventory
 
-### Strict CI bucket (213 passed)
+### Strict CI bucket (220 passed)
 
-`research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py`, `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`.
+`research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py` (+7 cases from PR-75 — `target_duration_s` resolution, `scene_videos[]` ffprobe sum, override-wins rule, `captions_scaled` response flag), `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`.
 
 ### Desktop offline tests (28 files, all PASS)
 
@@ -118,10 +142,14 @@ test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.
 | Multi-account fan-out scheduler | `desktop/src/services/multiAccountFanOut.js` |
 | Python sidecar entry | `research/api/main.py` |
 | Bundled python runtime locator | `desktop/electron/researchSidecar.js::resolvePythonExecutable` |
+| Compose / Video Assembly UX (HF-8) | `desktop/dist/creator-forge.html` (Compose `ps-*` IDs, Video Assembly `pa-*` IDs) + `desktop/dist/creator-forge.js` (`psSyncScriptFromStoryboard`, `paAutoFillScenesFromBatch`, `psComposeAudio` request builder) |
+| Renderer pure helpers (HF-8) | `desktop/dist/storyboard_assemble_helpers.js` (`pullScenePathsFromBatch`, `validateAssembleForm`) + `desktop/dist/storyboard_batch_helpers.js` (`applyBatchResult`, `pairImagePathsForI2V`, `MIN_OK_IMAGE_BYTES`) |
+| `/producer/audio` auto-fit SRT (PR-75) | `research/api/routes/producer.py` (`_resolve_target_duration`) + `research/core/pixelle/subtitles.py` (`scale_captions_to_duration`) |
+| Scene breakdown LLM prompt (PR-77) | `research/core/pixelle/scene_breakdown.py::build_breakdown_system_prompt` (Hard rule #6 — SCENE-TO-SCENE DIVERSITY) |
 
 ---
 
-## Running locally (verified 2026-05-02)
+## Running locally (verified 2026-05-03)
 
 ```bash
 # Sidecar — terminal 1, from REPO ROOT
@@ -149,4 +177,8 @@ API keys are persisted per-user via the ⚙ Settings dialog at `userData/api-key
 
 * The sidecar restart hot path is now well-tested (28 desktop offline files, including 4 dedicated to sidecar). New work touching `researchSidecar.js` should add cases to one of `test_research_sidecar_{restart,health_timeout,port_bind,lookup}.js`.
 * `electron-builder.yml` copies `research/` into `extraResources` so the packaged app finds it via `process.resourcesPath`. Don't break that — `desktop/tests/test_research_sidecar_lookup.js` will catch most regressions.
+* HF-8 added a CDP-driven testing recipe for renderer-side fixes that don't require Grok / DeepSeek credentials — launch Electron with `--remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222`, then drive the pure helpers exposed on `window.StoryboardAssembleHelpers` / `window.StoryboardBatchHelpers` directly from a CDP client. Use this before reaching for full E2E with credentials.
+* When changing the Compose / Video Assembly form contract, update both halves: backend Pydantic schema in `research/api/routes/producer.py` *and* the renderer request builder in `desktop/dist/creator-forge.js`. The PR-75 strict CI bucket (`test_api_producer.py`) catches most schema drift.
+* The image-size gate threshold (`MIN_OK_IMAGE_BYTES = 200 * 1024`) is empirically calibrated against Grok 720×1280 outputs. If Grok upgrades to a higher-res output, re-measure and bump in lockstep with `test_storyboard_batch_helpers.js`.
+* The LLM diversity rule (Hard rule #6) only ensures the *prompt* is shipped — LLM adherence is non-deterministic. If users still report repetitive scene openings, the next escalation is per-scene LLM post-processing (compute a similarity score on the first N words of each `IMAGE PROMPT` and reroll outliers) rather than tightening the prompt further.
 * `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS` is the per-machine env knob for users whose Windows cold-start is exceptionally slow (>90s). 180000 (3 min) is a safe upper bound to suggest.
