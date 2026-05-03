@@ -1,8 +1,9 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-02 (post HF-4/5/6/7 sprint, PR-48 → PR-72)
-> Main HEAD: `0beba4b` — `docs: update CHECKPOINT post PR-48–PR-72 + HF-4..6 sprint`
+> Last updated: 2026-05-02 (post HF-4/5/6/7 sprint, PR-48 → PR-73)
+> Main HEAD: `8c964ee` — `docs(checkpoint): rewrite to reflect actual main HEAD (post PR-72) (#73)`
 > Last code commit on main: `9f95c26` — `fix(sidecar): real TCP bind probe in waitForPortFree (PR-72) (#72)`
+> User confirmation: PR-72 verified working on Windows — "đã fix rồi" (Save flow no longer hits WinError 10048).
 
 ---
 
@@ -18,7 +19,7 @@
 
 ---
 
-## Sprint History (PR-48 → PR-72)
+## Sprint History (PR-48 → PR-73)
 
 ### HF-4 — Storyboard / Variant / Fan-out (PR-47 … PR-61)
 
@@ -57,9 +58,15 @@ A chain of seven follow-up fixes triggered by users hitting `sidecar restart fai
 | #67 | always run `killByPort` fallback when `waitForPortFree` times out (PR-66 follow-up) | The fallback only ran in the `externalReuse` branch; spawned-mode could also leak the port. |
 | #68 | tree-kill child on Windows + extensive restart logging (PR-67 follow-up) | Windows `child.kill('SIGTERM')` only terminates the immediate PID, leaving uvicorn descendants alive. Fixed via `taskkill /F /T /PID`. |
 | #71 | bump healthz wait to 30s → 90s + 5s progress logs + surface stderr tail (HF-6) | Cold-start of bundled `python-build-standalone` + AV scanning on Windows can take ~70s. The prior 30s budget timed out and gave no clue why. New env override: `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS`. |
-| #72 | **real TCP bind probe in `waitForPortFree`** (HF-7) | Pre-PR-72 `waitForPortFree` checked `/healthz` (HTTP). `/healthz` goes silent the moment the python process dies, but on Windows the kernel can hold the listening socket in `TIME_WAIT` for several more seconds — leading to `WinError 10048: error while attempting to bind on address ('127.0.0.1', 5050)` from the new uvicorn spawn. Replaced HTTP probe with `net.createServer().listen(port)` — kernel-truth answer. |
+| #72 | **real TCP bind probe in `waitForPortFree`** (HF-7) | Pre-PR-72 `waitForPortFree` checked `/healthz` (HTTP). `/healthz` goes silent the moment the python process dies, but on Windows the kernel can hold the listening socket in `TIME_WAIT` for several more seconds — leading to `WinError 10048: error while attempting to bind on address ('127.0.0.1', 5050)` from the new uvicorn spawn. Replaced HTTP probe with `net.createServer().listen(port)` — kernel-truth answer. **Verified on user's Windows machine — Save flow now succeeds.** |
 
 PR-72 is the fix that unblocked Windows users on the API-keys Save flow. PR-71 + PR-72 are both required: PR-71 buys the time budget the slow Windows cold-start needs; PR-72 ensures the spawn can actually bind once the old sidecar's socket releases.
+
+### Docs (PR-73)
+
+| PR | Title | Notes |
+|---|---|---|
+| #73 | docs(checkpoint): rewrite to reflect actual main HEAD (post PR-72) | Replaces stale pre-HF-5 plan content (the previous `0beba4b` commit had a misleading message — its body still claimed HF-5 was 'plan approved, not yet implemented'). New body has accurate sprint history, test counts, file pointers. |
 
 ---
 
