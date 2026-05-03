@@ -1566,19 +1566,20 @@
                 </div>
             </div>
 
+            <!-- PR-A: Compose audio panel. Always /producer/audio — the
+                 legacy "short" mode (TTS + visuals + 9:16 mp4) was
+                 removed because the I2V/Veo3 batch + Video Assembly
+                 panel now produce real per-scene visuals. The route
+                 still exists in the sidecar for back-compat / tests
+                 but the renderer never calls it. -->
             <div class="panel" data-form="compose-short">
-                <h2>Compose <span class="pill" id="ps-mode-pill">/producer/short</span></h2>
+                <h2>Compose audio <span class="pill">/producer/audio</span></h2>
                 <div class="desc">
-                    TTS → captions → 9:16 mp4. Reuses the script above (or paste a different one).
-                    Edge-TTS voice + placeholder gradient background; AI per-scene visuals land in PR-A3+.
+                    TTS → narration audio (mp3/wav) + captions.srt. Captions auto-fit the
+                    duration of the scene videos generated above so the SRT lines up with
+                    Video Assembly. Override below if the target should be a custom length.
                 </div>
                 <div class="form-grid">
-                    <label title="Audio-only mode skips ffmpeg/moviepy entirely — TTS writes voice.mp3 (or .wav) and an optional captions.srt, no mp4. Useful for voiceover-first workflows where you want the audio first, then build visuals later.">Output mode
-                        <select id="ps-mode">
-                            <option value="short" selected>Full short (TTS + visuals + 9:16 mp4)</option>
-                            <option value="audio">Audio only (TTS → MP3/WAV)</option>
-                        </select>
-                    </label>
                     <label title="Edge-TTS = online (Microsoft, free, requires internet). Piper-TTS = local / offline (~25MB per voice; install `pip install piper-tts` and place a voice .onnx under ~/.creator-forge/piper-voices/).">TTS provider
                         <select id="ps-tts-provider">
                             <option value="edge-tts" selected>edge-tts (online · default)</option>
@@ -1592,23 +1593,20 @@
                             <option value="vi_VN-vais1000-medium">vi_VN-vais1000-medium (piper-tts)</option>
                         </select>
                     </label>
-                    <label data-ps-mode-show="short" title="Background gradient for the 9:16 mp4 — only used in 'Full short' mode.">Style
-                        <select id="ps-style">
-                            <option value="violet-pink">violet-pink</option>
-                            <option value="sunset">sunset</option>
-                            <option value="ocean">ocean</option>
-                            <option value="mono">mono</option>
-                            <option value="matcha">matcha</option>
-                        </select>
-                    </label>
-                    <label title="Where to save voice.mp3 / captions.srt / short.mp4. Leave blank to auto-create ~/.creator-forge/output/short-<timestamp>/ on your machine.">Output folder (optional)
+                    <label title="Where to save voice.mp3 / captions.srt. Leave blank to auto-create ~/.creator-forge/output/audio-<timestamp>/ on your machine.">Output folder (optional)
                         <span class="dir-picker-row">
-                            <input id="ps-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/short-<timestamp>/" />
+                            <input id="ps-output-dir" type="text" placeholder="blank = auto-create ~/.creator-forge/output/audio-<timestamp>/" />
                             <button type="button" class="secondary" data-run="producer-short-pick-output">Browse…</button>
                         </span>
                     </label>
+                    <label title="Override the SRT timing target in seconds. Blank = auto-fit to the scene videos generated above. 0 = no scaling (captions follow native TTS timing).">Target duration override (s)
+                        <input id="ps-target-duration" type="number" step="0.1" min="0" placeholder="blank = auto-fit to scene videos" />
+                    </label>
                     <label class="checkbox-row">
-                        <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to mp4
+                        <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to audio
+                    </label>
+                    <label class="form-row-full" title="Auto-filled from the Video batch above whenever rows settle. ffprobe sums their durations and scales the SRT so subtitles cover the assembled video. Read-only summary; clear via 'Refresh from Video batch' below.">Reference scene videos (auto-fit target)
+                        <input id="ps-reference-summary" type="text" readonly placeholder="no scene videos yet — generate the Video batch above to enable auto-fit" />
                     </label>
                     <label class="form-row-full">Script
                         <textarea id="ps-script" rows="6" placeholder="paste narration script (or use the script above)"></textarea>
@@ -1616,36 +1614,42 @@
                 </div>
                 <div class="actions">
                     <button class="ghost" data-action="copy-script-from-storyboard">Copy script from above</button>
-                    <button class="primary" id="ps-run-btn" data-run="compose-short">Compose short</button>
+                    <button class="ghost" data-run="compose-refresh-reference" title="Re-pull settled scene video paths from the Video batch above into the auto-fit target.">Refresh from Video batch</button>
+                    <button class="primary" id="ps-run-btn" data-run="compose-short">Compose audio</button>
                 </div>
                 <div class="result" id="ps-result"></div>
             </div>
 
-            <!-- PR-31: Video Assembly. Stitches per-scene mp4s + audio mp3 +
-                 captions.srt into a single final.mp4 via the sidecar's
-                 /producer/assemble route. Audio mode "replace" + trim to
-                 "video" + soft mov_text subs are the defaults; burn-in is
-                 deferred to PR-32. -->
+            <!-- PR-31 + PR-A: Video Assembly. Stitches per-scene mp4s +
+                 narration mp3 + captions.srt into a single final.mp4 via
+                 the sidecar's /producer/assemble route. Scene videos and
+                 narration audio + SRT auto-fill from the Video batch
+                 above and the most recent /producer/audio render — the
+                 form is read-mostly and "press Assemble" should be the
+                 normal path. Audio mode 'replace' + trim 'video' + soft
+                 mov_text subs are pinned defaults (the backend still
+                 supports the others for power users via the wire API). -->
             <div class="panel" data-form="assemble">
                 <h2>Video Assembly <span class="pill">/producer/assemble</span></h2>
                 <div class="desc">
-                    Concat the scene videos generated above, replace the audio with a narration track
-                    (typically the <code>voice.mp3</code> from <em>Audio only</em> Compose), and attach
-                    <code>captions.srt</code> as soft subtitles. ffmpeg runs in the sidecar — keep it running.
+                    Concat the scene videos generated above, replace their audio with the narration
+                    rendered by Compose audio, and attach <code>captions.srt</code> as soft subtitles.
+                    Scene videos auto-fill the moment the Video batch settles; narration and SRT
+                    auto-fill the moment Compose audio finishes. ffmpeg runs in the sidecar.
                 </div>
                 <div class="form-grid">
-                    <label class="form-row-full" title="One absolute path per line, in playback order. Click 'Pull from Video batch' to auto-fill from settled rows above.">Scene videos
-                        <textarea id="pa-scene-videos" rows="5" placeholder="/abs/path/shot1.mp4&#10;/abs/path/shot2.mp4&#10;/abs/path/shot3.mp4"></textarea>
+                    <label class="form-row-full" title="One absolute path per line, in playback order. Auto-fills from settled rows of the Video batch above. Edit freely; click 'Refresh from Video batch' to re-pull.">Scene videos (auto-filled)
+                        <textarea id="pa-scene-videos" rows="5" placeholder="auto-fills when scene videos are generated above — or paste one absolute path per line"></textarea>
                     </label>
-                    <label title="Path to the narration mp3/wav. Leave blank to keep whatever audio the scene videos already carry.">Narration audio
+                    <label title="Path to the narration mp3/wav. Auto-filled with the most recent voice.mp3 from Compose audio. Leave blank to keep the audio the scene videos already carry.">Narration audio (auto-filled)
                         <span class="dir-picker-row">
-                            <input id="pa-audio-path" type="text" placeholder="/abs/path/voice.mp3 (blank = scene audio)" />
+                            <input id="pa-audio-path" type="text" placeholder="auto-fills from Compose audio output above" />
                             <button type="button" class="secondary" data-run="assemble-pick-audio">Browse…</button>
                         </span>
                     </label>
-                    <label title="Optional path to captions.srt. With caption_mode='soft', attaches as a selectable subtitle track (mov_text). With caption_mode='burn' (PR-32), the SRT is rendered into the video stream so every player sees them.">Captions (.srt, optional)
+                    <label title="Path to captions.srt. Auto-filled with the SRT written by the most recent Compose audio render. Attached as a selectable soft (mov_text) subtitle track.">Captions (.srt, auto-filled)
                         <span class="dir-picker-row">
-                            <input id="pa-srt-path" type="text" placeholder="/abs/path/captions.srt" />
+                            <input id="pa-srt-path" type="text" placeholder="auto-fills from Compose audio output above" />
                             <button type="button" class="secondary" data-run="assemble-pick-srt">Browse…</button>
                         </span>
                     </label>
@@ -1655,29 +1659,10 @@
                             <button type="button" class="secondary" data-run="assemble-pick-output">Browse…</button>
                         </span>
                     </label>
-                    <label title="'replace' drops scene audio and uses the narration as the only audio (default). 'none' keeps whatever audio the scene videos already carry.">Audio mode
-                        <select id="pa-audio-mode">
-                            <option value="replace" selected>replace (use narration only)</option>
-                            <option value="none">none (keep scene audio)</option>
-                        </select>
-                    </label>
-                    <label title="'video' caps the output at the summed scene durations — extra narration is cut. 'audio' uses ffmpeg -shortest so the audio length wins.">Trim to
-                        <select id="pa-trim-to">
-                            <option value="video" selected>video (default)</option>
-                            <option value="audio">audio (-shortest)</option>
-                        </select>
-                    </label>
-                    <label title="'soft' attaches the srt as a selectable mov_text subtitle track (default — fast, no re-render). 'burn' renders the srt pixels into the video stream so every player sees them (PR-32 — slower, requires a font resolvable by fontconfig). 'none' drops the srt entirely.">Caption mode
-                        <select id="pa-caption-mode">
-                            <option value="soft" selected>soft (mov_text track)</option>
-                            <option value="burn">burn (rendered into video)</option>
-                            <option value="none">none (drop srt)</option>
-                        </select>
-                    </label>
                 </div>
                 <div class="actions">
-                    <button class="ghost" data-run="assemble-pull-from-batch" title="Auto-fill the scene videos textarea with all settled rows from the Video batch above, in scene order.">Pull from Video batch</button>
-                    <button class="ghost" data-run="assemble-use-latest-audio" title="Set the narration audio to the most recent voice.mp3 from /producer/audio.">Use latest /producer/audio</button>
+                    <button class="ghost" data-run="assemble-pull-from-batch" title="Re-pull the scene videos textarea with all settled rows from the Video batch above, in scene order. Useful after editing rows or re-running a single scene.">Refresh from Video batch</button>
+                    <button class="ghost" data-run="assemble-use-latest-audio" title="Set the narration audio + SRT to the most recent /producer/audio render on disk.">Use latest /producer/audio</button>
                     <button class="primary" id="pa-run-btn" data-run="assemble">Assemble final MP4</button>
                 </div>
                 <div class="result" id="pa-result"></div>

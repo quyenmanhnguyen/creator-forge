@@ -158,6 +158,58 @@ def fallback_captions_from_text(text: str, *, audio_duration_s: float) -> list[C
     return captions
 
 
+def scale_captions_to_duration(
+    captions: list[Caption], target_duration_s: float
+) -> list[Caption]:
+    """Linearly stretch / compress captions so the last one ends at ``target_duration_s``.
+
+    Used by ``/producer/audio`` (PR-A) when the user wants the SRT to
+    cover the assembled video, even though the TTS audio is shorter or
+    longer than the visual track. Behaviour:
+
+    - Empty ``captions`` or non-positive ``target_duration_s`` → returns
+      the input unchanged (no-op so callers can hand the same list
+      through whether scaling is on or off).
+    - The factor is ``target_duration_s / current_end``, where
+      ``current_end`` is the end timestamp of the last caption. If
+      ``current_end`` is 0 (degenerate single zero-length caption), we
+      spread the captions evenly across the target instead.
+
+    Returns a new list — captions are immutable dataclasses so we can't
+    mutate in place anyway.
+    """
+    if not captions or target_duration_s <= 0:
+        return list(captions)
+
+    current_end = captions[-1].end_s
+    if current_end <= 0:
+        # Degenerate: every caption is at t=0. Spread evenly so the user
+        # still sees subtitles flow across the video.
+        n = len(captions)
+        slot = float(target_duration_s) / n
+        return [
+            Caption(
+                start_s=i * slot,
+                end_s=(i + 1) * slot,
+                text=cap.text,
+            )
+            for i, cap in enumerate(captions)
+        ]
+
+    factor = float(target_duration_s) / float(current_end)
+    if factor == 1.0:
+        return list(captions)
+
+    return [
+        Caption(
+            start_s=max(0.0, cap.start_s * factor),
+            end_s=max(0.0, cap.end_s * factor),
+            text=cap.text,
+        )
+        for cap in captions
+    ]
+
+
 def captions_to_srt(captions: list[Caption]) -> str:
     """Render captions as a SubRip (.srt) document."""
     lines: list[str] = []

@@ -92,6 +92,7 @@ from core.pixelle.subtitles import (
     captions_to_srt,
     fallback_captions_from_text,
     group_word_boundaries,
+    scale_captions_to_duration,
     split_by_sentences,
 )
 from core.pixelle.tts import (
@@ -204,6 +205,7 @@ __all__ = [
     "make_short",
     "parse_breakdown_response",
     "parse_variant_response",
+    "scale_captions_to_duration",
     "serialize_breakdown_json",
     "serialize_breakdown_md",
     "split_by_sentences",
