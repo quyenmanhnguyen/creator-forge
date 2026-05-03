@@ -1,7 +1,7 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-02 (post-PR-61 validation pass)
-> Main HEAD: `9e3f204` — `feat(fanout): work-stealing multi-account scheduler for video / i2v / refimg (Phase 2 of PR-47) (#61)`
+> Last updated: 2026-05-02 (post-PR-63 validation pass)
+> Main HEAD: `d7a7563` — `feat(packaging): bundle Python runtime for macOS + Linux installers (PR-62) (#63)`
 
 ## Status
 
@@ -10,11 +10,11 @@
 | Strict pytest bucket (CI must-pass) | **213 passed** (was 209 in pre-PR-57 checkpoint; +4 from PR-60 voices filter / unknown provider / case-insensitive) |
 | `test_pixelle_visual_dna.py` | **30 passed** (run from `research/` due to `core` import path) |
 | `test_pixelle_tts_timing.py` | **7 passed** (was 4; +3 from PR-57 v6/v7/helper boundary branches) |
-| Desktop offline tests | **24/24 files PASS** (was 20 pre-PR-57; +4 from PR-60 voice picker + PR-61 video/i2v/refimg `_processOneBatchItem` tests) |
+| Desktop offline tests | **25/25 files PASS** (was 20 pre-PR-57; +4 from PR-60 voice picker + PR-61 video/i2v/refimg `_processOneBatchItem` tests, +1 from PR-59 keys store; PR-63 added 9 net assertions to the existing fetch-python-runtime + sidecar-lookup files) |
 | `test_storyboard_batch_helpers.js` | 103 / 103 (unchanged since PR-54) |
 | Ruff lint | clean |
 | Live E2E (backend) | ✅ Verified 2026-05-02 — `/producer/audio` (now `caption_source = word_boundaries` post-PR-57), `/producer/voices` provider filter, multi-account work-stealing across video batch |
-| Open PRs | **3** (PR-58 sentinel, PR-59 keys store, this PR-56 checkpoint refresh) |
+| Open PRs | **0** — all P2 + P3 backlog items from HF-4 are now merged |
 
 ## PR History (post-HF-4)
 
@@ -32,17 +32,27 @@
 | PR-52 | P3 — IPC fan-out stats + console log mirroring | ✅ Merged (live-tested 5/5 assertions) |
 | PR-53 | Hotfix — split image / video variant call counters in visual DNA test | ✅ Merged |
 | PR-54 | Source column on video batch table (paired hero image preview) | ✅ Merged (live-tested 5/5 assertions via DevTools harness) |
+| PR-56 | docs(checkpoint): post-PR-54 → post-PR-61 refresh | ✅ Merged |
 | PR-57 | edge-tts v7.x WordBoundary fix (pass `boundary="WordBoundary"`) | ✅ Merged (live-tested 8/8 assertions; flipped `caption_source` from `sentence_fallback` → `word_boundaries`) |
-| PR-58 | CI sentinel workflow — open issue when CI on `main` goes red | 🟢 Open, 2/2 CI green |
-| PR-59 | Persistent API-keys store + ⚙ Settings dialog (auto-open on first launch) | 🟢 Open, 2/2 CI green |
+| PR-58 | CI sentinel workflow — open issue when CI on `main` goes red | ✅ Merged (dormant on feature branches by GitHub design; live-arms on next main-branch CI run) |
+| PR-59 | Persistent API-keys store + ⚙ Settings dialog (auto-open on first launch) | ✅ Merged (12-case `test_keys_store.js` PASS; HF-1 promoted to persistent) |
 | PR-60 | TTS provider-tagged voices + Compose voice-picker filter | ✅ Merged (live-tested 10/10 assertions: 5 sidecar API + 5 UI Electron) |
 | PR-61 | Phase 2 multi-account fan-out (`video` / `i2v` / `refimg`) | ✅ Merged (live-tested 7/8 assertions with 2 Grok accounts; A4 verified transitively) |
+| PR-63 | Bundle Python runtime for macOS + Linux installers (Phase 2 of PR-19) | ✅ Merged (mac DMG + linux AppImage now ship the bundled cpython interpreter; offline tests +9 assertions) |
 
-PR-55 / PR-56 reserved for the prior checkpoint commit + this refresh.
+PR-55 / PR-62 reserved (PR-62 is the internal label this CHECKPOINT uses for the work merged via PR-63's branch).
 
 ---
 
 ## What changed since post-PR-54 checkpoint
+
+### PR-63 — Bundle Python runtime for macOS + Linux installers (P3, closes Phase 2 of PR-19)
+- Pinned `darwin-x64` + `darwin-arm64` in `scripts/python-runtime.config.json` using SHA256s from the same python-build-standalone `20250918` release as the existing win/linux pins.
+- Dropped the "darwin out of scope" throw in `platformKey()`; added `prefetch:python:mac:x64` / `prefetch:python:mac:arm64` / `prefetch:python:mac` npm scripts and chained the prefetch step into `dist:mac` + `dist:linux` (mirrors `dist:win`).
+- New `mac.extraResources` + `linux.extraResources` blocks in `desktop/electron-builder.yml`. The mac block uses electron-builder's `${arch}` substitution so a single config produces both Intel x64 and Apple Silicon arm64 DMGs from per-arch trees.
+- Refactored `resolvePythonExecutable`'s dev-mode lookup gate into a new exported helper `isDevModeBundleSupported(platform, arch)` whose truth-table is asserted directly in tests (covers `win32-x64`, `linux-x64`, `darwin-x64`, `darwin-arm64`).
+- Tests: `test_fetch_python_runtime.js` 18 → 23 cases (darwin platformKey + config + URL); `test_research_sidecar_lookup.js` 17 → 21 cases (darwin packaged + dev x64/arm64, unsupported platform fallthrough, isDevModeBundleSupported truth-table). Total 25/25 desktop offline files PASS.
+- Not live-verified on a real mac host (Devin VM is linux); offline tests + URL composition smoke (`--offline-cache-only`) are the verification surface this pass. Real `dist:mac` end-to-end requires an actual macOS host because `prefetch:python:mac` runs `pip install -r research/requirements.txt` against the bundled mac binaries.
 
 ### PR-57 — edge-tts v7.x WordBoundary fix (P3)
 - Root cause: edge-tts v7.0+ added a `boundary` param to `Communicate.__init__` defaulting to `"SentenceBoundary"`. Pre-v7 code worked because v6.x emitted WordBoundary by default; v7.2.8 silently dropped to sentence chunks → `_run_with_timing` fell back to `fallback_captions_from_text`.
@@ -55,7 +65,7 @@ PR-55 / PR-56 reserved for the prior checkpoint commit + this refresh.
 - De-dupes by reusing an open issue if one already exists.
 - `workflow_dispatch` fallback for manual dry-run.
 - Closes the "Lessons learned" P3 below (option 2 — post-merge sentinel).
-- Cannot be live-tested before merge (GitHub design: `workflow_run` listeners only fire from default-branch copy).
+- Now armed: lives on `main` and will fire automatically the next time CI on `main` concludes red. Manual dry-run via `workflow_dispatch` is still available from the Actions tab.
 
 ### PR-59 — Persistent API-keys store + ⚙ Settings dialog (HF-1 follow-up)
 - ⚙ button in `creator-forge.html` header opens an API-keys modal whitelisting 5 keys: `DEEPSEEK`, `YOUTUBE`, `GOOGLE`, `GEMINI`, `RUNNINGHUB`.
@@ -111,15 +121,15 @@ UI panels NOT re-tested live this pass (renderer code unchanged):
 
 ---
 
-## Backlog (post-PR-61)
+## Backlog (post-PR-63)
 
-The pre-PR-57 backlog dropped 4 items (P2 video fan-out → PR-61, P2 TTS provider UI → PR-60, P3 edge-tts WordBoundary → PR-57, P3 CI pre-merge integration → PR-58). Remaining items, ranked:
+The HF-4 → post-PR-61 backlog dropped 4 items (PR-57/58/60/61). PR-63 closes the remaining two installer-parity items. The carry-over "Devin Review informational findings cleanup" row is dropped — none of the 5 most recent merged PRs (57/58/59/60/61/63) had Devin Review comments to address. Remaining items, ranked:
 
 | Priority | Item | Size | Source / Notes |
 |----------|------|------|----------------|
-| **P3** | Devin Review informational findings cleanup | Small | Carry-over. |
-| **P3** | Bundle Python runtime for Windows packaging | Medium | `PR-18` Electron-builder + `PR-19` bundle-python-windows already merged; verify on real Windows host + extend to `dist:linux` / `dist:mac` (currently `darwin-*` raises "follow-up PR" by design). |
-| **P3** | macOS / Linux installer parity | Medium | `electron-builder.yml` has `mac` (DMG) + `linux` (AppImage) targets but they don't pull in the bundled python runtime — only `win` does. Once the `darwin-*` branch in `scripts/fetch-python-runtime.js` is implemented, mirror the `extraResources` block. |
+| **P3** | macOS / Windows code-signing | Medium | `electron-builder.yml` has `identity: null` for macOS (Gatekeeper warning on first launch). Future PR can wire `CSC_LINK` / `CSC_KEY_PASSWORD` for mac and `CSC_LINK` / signtool for Windows. Requires the user to provide an Apple developer cert + a Windows code-signing cert (out of scope for any session that doesn't have them). |
+| **P3** | Real-host installer verification | Small | PR-63 ships per-arch macOS + Linux bundling but it has only been smoke-tested on a Linux Devin VM (offline tests + `--offline-cache-only` URL flow). Run `npm run dist:mac` on a real mac and `npm run dist:linux` on a real linux box, install the resulting DMG / AppImage, launch the app, confirm the bundled interpreter resolves at `<resourcesPath>/python/bin/python3` and the sidecar pill goes green. |
+| **P3** | Auto-update channel | Medium | `electron-updater` is wired in `autoUpdater.js` but `publish: null` in `electron-builder.yml` — no actual update channel exists. PR can wire `publish: github` once we decide on the release cadence. |
 
 ---
 
@@ -191,7 +201,7 @@ pytest research/tests/test_api_*.py \
        research/tests/test_video_probe.py -q          # 213 strict pytest
 (cd research && pytest tests/test_pixelle_visual_dna.py -q)  # +30 visual DNA
 pytest research/tests/test_pixelle_tts_timing.py -q   # +7 edge-tts timing (PR-57)
-for t in desktop/tests/test_*.js; do node "$t"; done   # 24 desktop offline files
+for t in desktop/tests/test_*.js; do node "$t"; done   # 25 desktop offline files
 ```
 
 ---
