@@ -1,264 +1,152 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-02 (HF-5 Batch Panel Overhaul — plan approved, not yet implemented)
-> Main HEAD: `d7a7563` — `feat(packaging): bundle Python runtime for macOS + Linux installers (PR-62) (#63)`
-
----
-
-## 🚧 HF-5 — Batch Panel Overhaul (IN PROGRESS)
-
-**Goal:** Streamline the "Batch Image + Video" panel into a cleaner production interface.
-**Status:** Plan approved → implementation not started yet.
-**Files to modify:** `desktop/dist/creator-forge.html` + `desktop/dist/creator-forge.js` (2 files only — no backend changes needed)
-
-### HTML Changes (6 items)
-
-| # | Change | Detail |
-|---|--------|--------|
-| 1 | OUTPUT FOLDER — compact to icon-only 📁 | Remove label + textbox; keep only `📁` icon button in panel header. Path stored in hidden `<input type="hidden" id="sbb-output-dir">`. Tooltip shows current path. |
-| 2 | VIDEO MODE — hide entirely | Wrap in `display:none`. Default stays `i2v`. Code continues reading from hidden element. |
-| 3 | IMAGES PER SCENE — hide | Pro mode always-on → always 1 image. Hide the select, preserve element for backward compat. |
-| 4 | VIDEOS PER SCENE → DURATION dropdown | Remove "Videos per scene" select. Add `DURATION` dropdown: `6s` (default) / `10s`. Videos per scene hardcoded = 1. |
-| 5 | PRO MODE — hide (always on) | Wrap checkbox in `display:none`. Programmatically set `checked = true` on init. |
-| 6 | Section header toolbar | Each section (Image/Video) gets: progress badge + "🔄 Retry failed" button + "📂 Open folder" button |
-
-### JS Changes (6 items)
-
-| # | Change | Detail |
-|---|--------|--------|
-| 7 | Auto-reset batch table | `runSceneBreakdown()` calls `sbbClear()` at the top → table always starts clean on re-run |
-| 8 | Duration wiring | Read `$('sbb-duration').value` → pass as `config.videoLength` in both `api.i2v.generate` and `api.video.generate` calls |
-| 9 | Retry Failed handler | New `sbbRetryFailed(kind)` — collects `row_id`s where `status === 'fallback'` → delegates to existing `sbbRunImageBatchForRowIds` / `sbbRunVideoBatchForRowIds` |
-| 10 | Progress badge | New `sbbUpdateProgressBadge(kind)` — counts rows by status, formats as `3/12 done · 2 failed · ETA ~2m`. Called from `sbbRepaintImage()` / `sbbRepaintVideo()` |
-| 11 | Open output folder | New `sbbOpenOutputFolder()` — reads output dir from `sbb-output-dir` or first settled row's parent dir → calls `api.file.openFolder(dir)` (existing preload IPC) |
-| 12 | Videos per scene = 1 | In `sbbAutoFill()` / `sbbSyncFromScenes()`: replace `sbbReadVariantCount('sbb-videos-per-scene', 2)` with literal `1` |
-
-### Key Architecture Notes
-
-- `config.videoLength` path is **already wired end-to-end**: renderer → IPC → `I2VService.buildI2VBody()` / `VideoService.buildVideoBody()` → Grok API. Default: `I2V_CONFIG.videoLength = 6`, `VIDEO_CONFIG.videoLength = 10`.
-- `file:openFolder` IPC handler **already exists** in `main.js` (line 502) + `preload.js` (line 10).
-- `sbbRetryRow(kind, rowId)` **already exists** (line 3146) — `sbbRetryFailed` just wraps it for bulk.
+> Last updated: 2026-05-02 (post HF-4/5/6/7 sprint, PR-48 → PR-72)
+> Main HEAD: `0beba4b` — `docs: update CHECKPOINT post PR-48–PR-72 + HF-4..6 sprint`
+> Last code commit on main: `9f95c26` — `fix(sidecar): real TCP bind probe in waitForPortFree (PR-72) (#72)`
 
 ---
 
 ## Status
 
-| Metric                              | Value                                                                                                                                                                                                                                         |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Strict pytest bucket (CI must-pass) | **213 passed** (was 209 in pre-PR-57 checkpoint; +4 from PR-60 voices filter / unknown provider / case-insensitive)                                                                                                                           |
-| `test_pixelle_visual_dna.py`        | **30 passed** (run from `research/` due to `core` import path)                                                                                                                                                                                |
-| `test_pixelle_tts_timing.py`        | **7 passed** (was 4; +3 from PR-57 v6/v7/helper boundary branches)                                                                                                                                                                            |
-| Desktop offline tests               | **25/25 files PASS** (was 20 pre-PR-57; +4 from PR-60 voice picker + PR-61 video/i2v/refimg `_processOneBatchItem` tests, +1 from PR-59 keys store; PR-63 added 9 net assertions to the existing fetch-python-runtime + sidecar-lookup files) |
-| `test_storyboard_batch_helpers.js`  | 103 / 103 (unchanged since PR-54)                                                                                                                                                                                                             |
-| Ruff lint                           | clean                                                                                                                                                                                                                                         |
-| Live E2E (backend)                  | ✅ Verified 2026-05-02 — `/producer/audio` (now `caption_source = word_boundaries` post-PR-57), `/producer/voices` provider filter, multi-account work-stealing across video batch                                                            |
-| Open PRs                            | **0** — all P2 + P3 backlog items from HF-4 are now merged                                                                                                                                                                                    |
-
-## PR History (post-HF-4)
-
-| PR    | Feature                                                                   | Status                                                                                                        |
-| ----- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| PR-43 | Fix `duration_s` → report video stream duration not container             | ✅ Merged                                                                                                     |
-| PR-44 | Burn-in subtitles (`caption_mode='burn'`)                                 | ✅ Merged (PR-32 in HF-4 checkpoint)                                                                          |
-| PR-45 | `testing-app` SKILL.md                                                    | ✅ Merged                                                                                                     |
-| PR-46 | Storyboard UX polish                                                      | ✅ Merged                                                                                                     |
-| PR-47 | Multi-account fan-out (image only)                                        | ✅ Merged                                                                                                     |
-| PR-48 | Image↔Video variant continuity + Pro mode toggle                          | ✅ Merged                                                                                                     |
-| PR-49 | Scene_breakdown speed-up + progress UI                                    | ✅ Merged                                                                                                     |
-| PR-50 | I2V gate + auto-scroll                                                    | ✅ Merged (rebased on top of #48 to resolve additive test conflict)                                           |
-| PR-51 | Testing skill update for HF-3                                             | ✅ Merged                                                                                                     |
-| PR-52 | P3 — IPC fan-out stats + console log mirroring                            | ✅ Merged (live-tested 5/5 assertions)                                                                        |
-| PR-53 | Hotfix — split image / video variant call counters in visual DNA test     | ✅ Merged                                                                                                     |
-| PR-54 | Source column on video batch table (paired hero image preview)            | ✅ Merged (live-tested 5/5 assertions via DevTools harness)                                                   |
-| PR-56 | docs(checkpoint): post-PR-54 → post-PR-61 refresh                         | ✅ Merged                                                                                                     |
-| PR-57 | edge-tts v7.x WordBoundary fix (pass `boundary="WordBoundary"`)           | ✅ Merged (live-tested 8/8 assertions; flipped `caption_source` from `sentence_fallback` → `word_boundaries`) |
-| PR-58 | CI sentinel workflow — open issue when CI on `main` goes red              | ✅ Merged (dormant on feature branches by GitHub design; live-arms on next main-branch CI run)                |
-| PR-59 | Persistent API-keys store + ⚙ Settings dialog (auto-open on first launch) | ✅ Merged (12-case `test_keys_store.js` PASS; HF-1 promoted to persistent)                                    |
-| PR-60 | TTS provider-tagged voices + Compose voice-picker filter                  | ✅ Merged (live-tested 10/10 assertions: 5 sidecar API + 5 UI Electron)                                       |
-| PR-61 | Phase 2 multi-account fan-out (`video` / `i2v` / `refimg`)                | ✅ Merged (live-tested 7/8 assertions with 2 Grok accounts; A4 verified transitively)                         |
-| PR-63 | Bundle Python runtime for macOS + Linux installers (Phase 2 of PR-19)     | ✅ Merged (mac DMG + linux AppImage now ship the bundled cpython interpreter; offline tests +9 assertions)    |
-
-PR-55 / PR-62 reserved (PR-62 is the internal label this CHECKPOINT uses for the work merged via PR-63's branch).
+| Metric | Value |
+| --- | --- |
+| **CI strict pytest bucket** | **213 passed** (research/tests/test_api_*.py + test_video_probe + test_pixelle_tts_providers + test_assembler) |
+| **Desktop offline test files** | **28 / 28 PASS** (deterministic on 3 re-runs) |
+| `ruff check research` | clean |
+| `node --check` (Electron entry points) | clean |
+| Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
 
 ---
 
-## What changed since post-PR-54 checkpoint
+## Sprint History (PR-48 → PR-72)
 
-### PR-63 — Bundle Python runtime for macOS + Linux installers (P3, closes Phase 2 of PR-19)
+### HF-4 — Storyboard / Variant / Fan-out (PR-47 … PR-61)
 
-- Pinned `darwin-x64` + `darwin-arm64` in `scripts/python-runtime.config.json` using SHA256s from the same python-build-standalone `20250918` release as the existing win/linux pins.
-- Dropped the "darwin out of scope" throw in `platformKey()`; added `prefetch:python:mac:x64` / `prefetch:python:mac:arm64` / `prefetch:python:mac` npm scripts and chained the prefetch step into `dist:mac` + `dist:linux` (mirrors `dist:win`).
-- New `mac.extraResources` + `linux.extraResources` blocks in `desktop/electron-builder.yml`. The mac block uses electron-builder's `${arch}` substitution so a single config produces both Intel x64 and Apple Silicon arm64 DMGs from per-arch trees.
-- Refactored `resolvePythonExecutable`'s dev-mode lookup gate into a new exported helper `isDevModeBundleSupported(platform, arch)` whose truth-table is asserted directly in tests (covers `win32-x64`, `linux-x64`, `darwin-x64`, `darwin-arm64`).
-- Tests: `test_fetch_python_runtime.js` 18 → 23 cases (darwin platformKey + config + URL); `test_research_sidecar_lookup.js` 17 → 21 cases (darwin packaged + dev x64/arm64, unsupported platform fallthrough, isDevModeBundleSupported truth-table). Total 25/25 desktop offline files PASS.
-- Not live-verified on a real mac host (Devin VM is linux); offline tests + URL composition smoke (`--offline-cache-only`) are the verification surface this pass. Real `dist:mac` end-to-end requires an actual macOS host because `prefetch:python:mac` runs `pip install -r research/requirements.txt` against the bundled mac binaries.
+| PR | Title | Notes |
+|---|---|---|
+| #47 | Work-stealing multi-account fan-out for `image:generate` | Phase 1 of the multi-account scheduler. |
+| #48 | Image ↔ Video variant continuity + Pro mode toggle | Variant rows carry over from image batch to video batch. |
+| #49 | `scene_breakdown` speed-up + progress UI | Streaming progress while LLM splits the script. |
+| #50 | Gate I2V "Generate videos" behind settled images + auto-scroll | Renderer-side guard against running video before images exist. |
+| #51 | Testing skill update | Storyboard progress UI / I2V gate testing notes. |
+| #52 | Observability | Mirror `sendLog` to console + return fan-out stats from `image:generate`. |
+| #53 | Test split | Distinguish image vs video variant LLM calls in visual DNA test. |
+| #54 | Paired hero image in video batch table | Storyboard UI clarity. |
+| #56 | docs(checkpoint) refresh for post-PR-61 state | Previous checkpoint snapshot. |
+| #57 | fix(tts): pass `boundary="WordBoundary"` to edge-tts v7.x | Compatibility with newer edge-tts. |
+| #58 | ci(sentinel): open issue when CI on main goes red | Auto-triage. |
+| #59 | feat(keys): persistent API-keys store + ⚙ Settings dialog | API keys saved per-user, applied via sidecar restart. |
+| #60 | feat(tts): voices tagged with provider + voice-picker filter | Compose UI shows only the selected engine's voices. |
+| #61 | Phase 2 of PR-47: scheduler now covers `video` / `i2v` / `refimg` | Multi-account fan-out generalised. |
 
-### PR-57 — edge-tts v7.x WordBoundary fix (P3)
+### HF-5 — Batch Panel Overhaul (PR-63, PR-69)
 
-- Root cause: edge-tts v7.0+ added a `boundary` param to `Communicate.__init__` defaulting to `"SentenceBoundary"`. Pre-v7 code worked because v6.x emitted WordBoundary by default; v7.2.8 silently dropped to sentence chunks → `_run_with_timing` fell back to `fallback_captions_from_text`.
-- Fix: `EdgeTTSAdapter._run_with_timing` introspects `inspect.signature(edge_tts.Communicate)`; if `boundary` is a recognised parameter, pass `boundary="WordBoundary"` explicitly. Backwards-compatible with v6.x (parameter absent → branch skipped).
-- 3 new test cases in `test_pixelle_tts_timing.py` (v7 path / v6 path / direct helper).
-- Live verified post-merge on `/producer/audio`: same 3-sentence script flipped from 3 sentence captions (avg 4.2s) to 10 word-grouped captions (avg 1.066s). Caption_source now reads `word_boundaries`.
+| PR | Title | Notes |
+|---|---|---|
+| #63 | feat(packaging): bundle Python runtime for macOS + Linux installers (PR-62) | electron-builder copies `python-build-standalone` into `extraResources`. |
+| #69 | feat(desktop): HF-5 Batch Panel Overhaul — streamline production UI | Compact `Batch Image + Video` panel. Hides `Video mode` / `Images per scene` / `Videos per scene` / `Pro mode`. Adds `Duration` dropdown (6s/10s). Output folder collapsed to icon-only `📁`. Each section header gains progress badge + `🔄 Retry failed` + `📂 Open folder`. `runSceneBreakdown()` auto-clears the batch table. |
 
-### PR-58 — CI sentinel workflow (P3)
+### HF-6 + HF-7 — Sidecar restart hardening (PR-65 → PR-72)
 
-- New `.github/workflows/sentinel.yml` listens to `workflow_run` on the `CI` workflow (default branch only). When CI on `main` concludes `failure` / `timed_out` / `cancelled`, opens or comments on a `sentinel-failure`-tagged issue with the failing run URL + commit SHA.
-- De-dupes by reusing an open issue if one already exists.
-- `workflow_dispatch` fallback for manual dry-run.
-- Closes the "Lessons learned" P3 below (option 2 — post-merge sentinel).
-- Now armed: lives on `main` and will fire automatically the next time CI on `main` concludes red. Manual dry-run via `workflow_dispatch` is still available from the Actions tab.
+A chain of seven follow-up fixes triggered by users hitting `sidecar restart failed` on the API-keys Save flow.
 
-### PR-59 — Persistent API-keys store + ⚙ Settings dialog (HF-1 follow-up)
+| PR | Title | Root cause it fixed |
+|---|---|---|
+| #65 | force fresh spawn on `restart()` so saved API keys reach uvicorn | Previously `start()`'s probe-and-reuse short-circuit was skipping the new `extraEnv`. |
+| #66 | kill-by-port fallback when stale pre-PR-65 sidecar 404s `/admin/shutdown` | Older sidecar builds didn't expose `/admin/shutdown`. |
+| #67 | always run `killByPort` fallback when `waitForPortFree` times out (PR-66 follow-up) | The fallback only ran in the `externalReuse` branch; spawned-mode could also leak the port. |
+| #68 | tree-kill child on Windows + extensive restart logging (PR-67 follow-up) | Windows `child.kill('SIGTERM')` only terminates the immediate PID, leaving uvicorn descendants alive. Fixed via `taskkill /F /T /PID`. |
+| #71 | bump healthz wait to 30s → 90s + 5s progress logs + surface stderr tail (HF-6) | Cold-start of bundled `python-build-standalone` + AV scanning on Windows can take ~70s. The prior 30s budget timed out and gave no clue why. New env override: `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS`. |
+| #72 | **real TCP bind probe in `waitForPortFree`** (HF-7) | Pre-PR-72 `waitForPortFree` checked `/healthz` (HTTP). `/healthz` goes silent the moment the python process dies, but on Windows the kernel can hold the listening socket in `TIME_WAIT` for several more seconds — leading to `WinError 10048: error while attempting to bind on address ('127.0.0.1', 5050)` from the new uvicorn spawn. Replaced HTTP probe with `net.createServer().listen(port)` — kernel-truth answer. |
 
-- ⚙ button in `creator-forge.html` header opens an API-keys modal whitelisting 5 keys: `DEEPSEEK`, `YOUTUBE`, `GOOGLE`, `GEMINI`, `RUNNINGHUB`.
-- Persists at `app.getPath('userData')/api-keys.json` (file mode 0600).
-- Auto-opens on first launch when no keys present (carries forward HF-1 behaviour).
-- Save → bounces sidecar via `researchSidecar.restart({ extraEnv })` so uvicorn picks up the new env without a full app relaunch.
-- 12 new unit tests (`test_keys_store.js`).
-
-### PR-60 — TTS provider-tagged voices + Compose picker filter
-
-- `Voice` dataclass in `research/core/pixelle/voices.py` gains `provider` field. 6 piper-tts voices added alongside existing edge-tts.
-- `/producer/voices` accepts `?provider=` query param; response includes `provider` / `providers` / `warnings`.
-- Renderer ships `desktop/dist/compose_voice_picker_helpers.js` (UMD) — flips `ps-tts-provider` repaints `ps-voice` filtered by provider, auto-picks default (preserve current → sidecar default → first option). Empty state renders `no voices for <provider>`.
-- `/producer/short` + `/producer/audio` validation now scoped to selected provider's allow-list (no more silent Piper-id-as-Edge-id mismatches at runtime).
-- Strict pytest +4, desktop offline +1 (`test_compose_voice_picker_helpers.js` 13 cases).
-- Live tested 10/10 (5 sidecar API + 5 UI Electron).
-
-### PR-61 — Phase 2 multi-account fan-out (video / i2v / refimg)
-
-- Extended `MultiAccountFanOut` work-stealing scheduler from PR-47 (image-only) to `video:generate` / `i2v:generate` / `refimg:generate`.
-- Each Service grew a `_processOneBatchItem(item, session, config, onProgress, myIdx, globalNum, totalForLog, outputFolder?)` helper extracted from `generateBatch`. `generateBatch` now delegates → single-account path bytes-identical.
-- IPC handlers in `desktop/electron/main.js` build a `runFanOut({ items, sessions, processOne, workerStaggerMs, onProgress })` call instead of looping a single-account batch.
-- IPC return shape extended with `stats: fanOut.stats` (per-session: `accIdx`, `taken`, `ok`, `failed`, `quarantined`) — mirrors PR-52's pattern for image.
-- Per-session log line replaces `(K per acc)`: `Generating N videos across M account(s) — work-stealing queue, up to C/account = up to M*C parallel...` and `Video generation complete: N/M successful | Acc1=N/M Acc2=N/M`.
-- 17 new offline test cases across `test_video_service_process_one.js` (6) / `test_i2v_service_process_one.js` (5) / `test_refimg_service_process_one.js` (6). Wired into `ci.yml`.
-- Live tested with 2 Grok accounts on a 4-prompt T2V batch: 4/4 success, log lines confirmed work-stealing pivot, stats field verified transitively from end-log construction.
+PR-72 is the fix that unblocked Windows users on the API-keys Save flow. PR-71 + PR-72 are both required: PR-71 buys the time budget the slow Windows cold-start needs; PR-72 ensures the spawn can actually bind once the old sidecar's socket releases.
 
 ---
 
-## Live E2E status (verified 2026-05-02 on `9e3f204`)
+## Test Inventory
 
-| Test | Endpoint / Surface                                                 | Result                                                                          |
-| ---- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| 1    | `GET /healthz`                                                     | `{"ok":true,"service":"creator-forge.research"}` ✅                             |
-| 2    | `POST /producer/audio` (edge-tts)                                  | `voice.mp3` (~10s) + SRT now with `caption_source = word_boundaries` (PR-57) ✅ |
-| 3    | `POST /producer/assemble`                                          | `final.mp4` with h264 + aac + mov_text ✅ (carry-over)                          |
-| 4    | `GET /producer/voices?provider=edge-tts`                           | 12 entries, default `en-US-AriaNeural` ✅ (PR-60)                               |
-| 5    | `GET /producer/voices?provider=piper-tts`                          | 6 entries, default `vi_VN-vais1000-medium` ✅ (PR-60)                           |
-| 6    | Compose UI provider × voice picker (Full short + Audio only modes) | 5/5 UI assertions ✅ (PR-60)                                                    |
-| 7    | `video:generate` IPC with 2 Grok accounts × 4 prompts              | 4/4 mp4 generated, work-stealing queue confirmed ✅ (PR-61)                     |
-| 8    | App boot + sidecar pill green                                      | Electron renders, sidecar pill `sidecar ready` ✅                               |
+### Strict CI bucket (213 passed)
 
-UI panels NOT re-tested live this pass (renderer code unchanged):
+`research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py`, `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`.
 
-- Storyboard scene_breakdown progress UI — covered by PR-49's `test_storyboard_progress_helpers.js`
-- Video Assembly autofill — covered by `pullFromVideoBatch` + `useLatestProducerAudio` unit tests
-- Source column render path (PR-54) — verified 2026-05-01 via DevTools harness, 5/5 assertions
+### Desktop offline tests (28 files, all PASS)
 
-### Findings
-
-1. **Cloudflare turnstile blocks Auto-login on Devin VMs.** Programmatic Puppeteer login hits "Verify you are human" checkpoint (per-account, every fresh session). Workaround: manually click the turnstile checkbox in the headful browser when it appears — Puppeteer continues from there. Documented in `.agents/skills/testing-app/SKILL.md` updates suggested during PR-61 testing. Not specific to fan-out — affects any Grok login flow without a persisted session.
-
-2. **DevTools shortcut not bound on this Electron build.** F12 / Ctrl+Shift+I do not open DevTools, leaving no obvious way to programmatically inspect IPC return shapes during testing. Workaround: verify return shapes transitively via log lines that mechanically construct from the field (e.g. PR-61's per-session log line is built from `stats.perSession.map(...)`). Documented in SKILL.md updates.
-
-3. **Mutagen + edge-tts not in CI strict bucket.** Status unchanged since post-PR-54: heavy stack deliberately omitted to keep CI fast. Adapters monkey-patched in tests so CI does not need real edge-tts. Status: **expected**, not a bug. Env config suggestion approved 2026-05-02 to install `edge-tts` + `mutagen` in maintenance step for future Devin sessions.
-
----
-
-## Backlog (post-PR-63)
-
-The HF-4 → post-PR-61 backlog dropped 4 items (PR-57/58/60/61). PR-63 closes the remaining two installer-parity items. The carry-over "Devin Review informational findings cleanup" row is dropped — none of the 5 most recent merged PRs (57/58/59/60/61/63) had Devin Review comments to address. Remaining items, ranked:
-
-| Priority | Item                             | Size   | Source / Notes                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------- | -------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **P3**   | macOS / Windows code-signing     | Medium | `electron-builder.yml` has `identity: null` for macOS (Gatekeeper warning on first launch). Future PR can wire `CSC_LINK` / `CSC_KEY_PASSWORD` for mac and `CSC_LINK` / signtool for Windows. Requires the user to provide an Apple developer cert + a Windows code-signing cert (out of scope for any session that doesn't have them).                                                                         |
-| **P3**   | Real-host installer verification | Small  | PR-63 ships per-arch macOS + Linux bundling but it has only been smoke-tested on a Linux Devin VM (offline tests + `--offline-cache-only` URL flow). Run `npm run dist:mac` on a real mac and `npm run dist:linux` on a real linux box, install the resulting DMG / AppImage, launch the app, confirm the bundled interpreter resolves at `<resourcesPath>/python/bin/python3` and the sidecar pill goes green. |
-| **P3**   | Auto-update channel              | Medium | `electron-updater` is wired in `autoUpdater.js` but `publish: null` in `electron-builder.yml` — no actual update channel exists. PR can wire `publish: github` once we decide on the release cadence.                                                                                                                                                                                                           |
-
----
-
-## Lessons learned (carried forward)
-
-### PR-48 × PR-49 collision (now mitigated by PR-58)
-
-Two PRs each green on their own branches but red after both land. Root cause: CI tests each branch against `origin/main` at the time of push; if two PRs touch overlapping invariants and merge in quick succession, neither CI run sees the other's changes.
-
-**Resolution:** PR-58 sentinel workflow (option 2 from prior recommendation) — runs the full suite on `main` after every push and opens an issue if it goes red. Awaits merge as of 2026-05-02.
-
-### Multi-account live testing requires creds (PR-61 carry-forward)
-
-Phase 2 fan-out's value is only observable with ≥2 Grok accounts. With balanced latency the work-stealing pattern still appears in the per-session log line (`Acc1=2/2 Acc2=2/2`) but no imbalance is visible; with throttled accounts the imbalance becomes the proof. Document this expectation in any future fan-out testing playbooks.
-
----
-
-## Architecture (unchanged from HF-4 checkpoint, condensed)
-
-**Desktop (Electron):** `desktop/dist/creator-forge.{html,js}` (renderer) → `desktop/electron/preload.js` → `desktop/electron/main.js` → `researchSidecar.js` (manages uvicorn child) + IPC routes in `researchIPC.js`. Bridges: `ResearchBridge`, `StudioBridge`, `StoryboardBridge`. Services: `Image`/`RefImage`/`Video`/`I2V` (Puppeteer Grok), `Auth`/`Account`. **Multi-account fan-out:** `MultiAccountFanOut` work-stealing scheduler in `multi_account_fan_out.js` — covers `image:generate` (PR-47) + `video:generate` / `i2v:generate` / `refimg:generate` (PR-61).
-
-**Sidecar (Python FastAPI):** `research/api/main.py` on `:5050`. Routes in `research/api/routes/{studio,producer,research,cloner,keywords,outlier}.py`. Core in `research/core/llm.py` + `research/core/pixelle/{scene_breakdown,composer,tts,subtitles,video_probe,assembler,voices}.py`.
-
-### API Endpoints
-
-| Endpoint                                                    | Method | Function                                                         |
-| ----------------------------------------------------------- | ------ | ---------------------------------------------------------------- |
-| `/healthz`                                                  | GET    | Health check                                                     |
-| `/studio/topics` `/titles` `/outline` `/script` `/humanize` | POST   | Studio pipeline                                                  |
-| `/producer/scene_breakdown`                                 | POST   | Script → N scenes + Visual DNA + per-image-variant video prompts |
-| `/producer/variant_prompts`                                 | POST   | Re-roll image variant prompts                                    |
-| `/producer/short`                                           | POST   | Compose 9:16 MP4 (TTS + captions + ffmpeg single-shot)           |
-| `/producer/audio`                                           | POST   | TTS-only → MP3/WAV + SRT (PR-57: word-boundary captions)         |
-| `/producer/assemble`                                        | POST   | Concat scenes + audio + soft/burn subs → final.mp4               |
-| `/producer/voices`                                          | GET    | Capability listing — accepts `?provider=` filter (PR-60)         |
-| `/producer/providers`                                       | GET    | List supported TTS providers                                     |
-| `/research/niche` `/keywords` `/outlier` `/cloner`          | POST   | Research toolkit                                                 |
-
----
-
-## Environment
-
-| Variable                                                   | Purpose                                   | Required for                                                       |
-| ---------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------ |
-| `DEEPSEEK_API_KEY`                                         | LLM calls                                 | Research / Studio / scene_breakdown / variant_prompts / Visual DNA |
-| `YOUTUBE_API_KEY`                                          | YouTube research                          | `/research/niche` `/research/outlier`                              |
-| `GROK_PROFILE_DIR`                                         | Persistent Grok session                   | Image / I2V / Video / RefImg generation                            |
-| `CREATOR_FORGE_ACCOUNTS_FILE`                              | Override accounts.json path               | optional                                                           |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `RUNNINGHUB_API_KEY` | Reserved for future provider integrations | Whitelisted by PR-59 keys-store but not yet wired                  |
-
-`/producer/short`, `/producer/audio`, `/producer/assemble` need **no** API keys — TTS + ffmpeg only. After PR-59 lands, the ⚙ Settings dialog persists keys at `userData/api-keys.json` (mode 0600); on launch they are merged into the sidecar's env via `researchSidecar.start({ extraEnv })`.
-
----
-
-## Quickstart (verified 2026-05-02)
-
-```bash
-# Sidecar — from REPO ROOT (not from research/)
-cd /path/to/creator-forge
-pip install edge-tts mutagen   # required for /producer/audio with captions
-uvicorn research.api.main:app --host 127.0.0.1 --port 5050
-
-# Desktop — separate terminal
-cd desktop && npm install && npm start
-
-# Tests
-ruff check research                                    # lint
-pytest research/tests/test_api_*.py \
-       research/tests/test_assembler.py \
-       research/tests/test_pixelle_tts_providers.py \
-       research/tests/test_video_probe.py -q          # 213 strict pytest
-(cd research && pytest tests/test_pixelle_visual_dna.py -q)  # +30 visual DNA
-pytest research/tests/test_pixelle_tts_timing.py -q   # +7 edge-tts timing (PR-57)
-for t in desktop/tests/test_*.js; do node "$t"; done   # 25 desktop offline files
+```
+test_account_service_path.js              test_research_sidecar_health_timeout.js
+test_auth_service_keep_alive.js           test_research_sidecar_lookup.js
+test_auth_service_relogin_path.js         test_research_sidecar_port_bind.js   ← PR-72 NEW (9 tests)
+test_auth_session_status.js               test_research_sidecar_restart.js
+test_compose_voice_picker_helpers.js      test_storyboard_account_manager_helpers.js
+test_e2e_compose_script.js                test_storyboard_assemble_helpers.js
+test_fetch_python_runtime.js              test_storyboard_batch_helpers.js
+test_grok_profile_dir.js                  test_storyboard_bridge.js
+test_i2v_service_process_one.js           test_storyboard_compose_helpers.js
+test_image_service_config.js              test_storyboard_compose_table_helpers.js
+test_keys_store.js                        test_storyboard_login_banner_helpers.js
+test_multi_account_fan_out.js             test_storyboard_progress_helpers.js
+test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.js
+                                          test_video_service_process_one.js
+                                          test_video_validation_helpers.js
 ```
 
+### Sidecar test files (4)
+
+| File | Tests | What it covers |
+|---|---|---|
+| `test_research_sidecar_lookup.js` | repo-root walk, packaged-resources lookup, python executable resolution | path resolution |
+| `test_research_sidecar_restart.js` | `sendShutdown`, `waitForPortFree`, `restart()` flow, `killByPort`, Windows tree-kill | restart hot path (PR-65 → PR-68) |
+| `test_research_sidecar_health_timeout.js` | `healthTimeoutMs()` env override, periodic progress log, stderr-tail surfacing | PR-71 |
+| `test_research_sidecar_port_bind.js` | `canBindPort` returns kernel-truth, `waitForPortFree` non-HTTP regression | PR-72 |
+
 ---
 
-## Hotfixes still in effect (carried forward)
+## Known caveats / not yet covered
 
-- `researchIPC.js`: LLM-heavy endpoints (`scene_breakdown`, `visual_dna`, `variant_prompts`, `script`, `humanize`) timeout = 300s; `scene_breakdown` + `variant_prompts` extended to 600s for parallel expansion.
-- Sidecar must be started with env vars BEFORE Electron, otherwise Electron reuses a stale sidecar without keys. PR-59 mitigates this for users by adding `researchSidecar.restart({ extraEnv })` on Save.
-- README's `cd research && python -m api.main` form **does not work** — always run uvicorn from repo root (route imports use absolute `research.api...` prefix).
-- HF-4 — Pro mode always-on, T2V removed, videos/scene fixed at 1, duration picker (6s / 10s) — all still in effect.
-- HF-3 — Scene breakdown progress UI (5 phase texts in Vietnamese + elapsed counter) + I2V gate on Generate-videos button — still in effect.
-- HF-2 — Per-channel IPC timeouts + `ThreadPoolExecutor(max_workers=8)` for parallel scene expansion — still in effect.
-- HF-1 — API Keys setup dialog auto-opens if keys missing + ⚙ button in header — promoted from in-memory to persistent (`userData/api-keys.json`) by PR-59.
+* **Pixelle heavy-import tests** (moviepy / edge-tts / mutagen / piper-tts) are NOT in the strict CI bucket — they run best-effort only. The full `pytest research/tests` count of 213+30+7+... seen in older checkpoints requires those deps installed locally.
+* **Windows-specific bugs** cannot be reproduced on the Linux Devin VM. Both PR-71 (cold-start >30s) and PR-72 (`WinError 10048`) were diagnosed from user logs on Windows; the offline test suite simulates the regressions through bind-probe / health-probe stubs.
+
+---
+
+## File-level architecture pointers
+
+| Concern | Files |
+|---|---|
+| Sidecar lifecycle (start/stop/restart/healthz) | `desktop/electron/researchSidecar.js` |
+| API-keys save → sidecar restart | `desktop/electron/main.js` (IPC handler) → `desktop/electron/keysStore.js` → `researchSidecar.restart({ extraEnv })` |
+| Renderer Settings ⚙ dialog | `desktop/dist/creator-forge.js` (search `keys.save`) |
+| Batch Image+Video panel (HF-5) | `desktop/dist/creator-forge.html` (sbb-* IDs) + `desktop/dist/creator-forge.js` (`sbb*` functions) |
+| Multi-account fan-out scheduler | `desktop/src/services/multiAccountFanOut.js` |
+| Python sidecar entry | `research/api/main.py` |
+| Bundled python runtime locator | `desktop/electron/researchSidecar.js::resolvePythonExecutable` |
+
+---
+
+## Running locally (verified 2026-05-02)
+
+```bash
+# Sidecar — terminal 1, from REPO ROOT
+pip install edge-tts mutagen   # required for /producer/audio
+uvicorn research.api.main:app --host 127.0.0.1 --port 5050
+
+# Desktop — terminal 2
+cd desktop && npm install && npm start
+```
+
+API keys are persisted per-user via the ⚙ Settings dialog at `userData/api-keys.json`. After Save, `researchSidecar.restart({ extraEnv })` fires and re-spawns uvicorn with the new env.
+
+| Key | Required for |
+|---|---|
+| `DEEPSEEK_API_KEY` | Studio (topics/titles/outline/script) + scene_breakdown + variant_prompts |
+| `GROK_ACCOUNTS_JSON` | Image / I2V / Video / RefImg generation |
+| `YOUTUBE_API_KEY` | Research / niche / outlier |
+| `GOOGLE` / `GEMINI` / `RUNNINGHUB` | Reserved (not yet wired) |
+
+`/producer/short`, `/producer/audio`, `/producer/assemble` work without any API key — only `edge-tts` + `ffmpeg`.
+
+---
+
+## Quick guidance for the next sprint
+
+* The sidecar restart hot path is now well-tested (28 desktop offline files, including 4 dedicated to sidecar). New work touching `researchSidecar.js` should add cases to one of `test_research_sidecar_{restart,health_timeout,port_bind,lookup}.js`.
+* `electron-builder.yml` copies `research/` into `extraResources` so the packaged app finds it via `process.resourcesPath`. Don't break that — `desktop/tests/test_research_sidecar_lookup.js` will catch most regressions.
+* `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS` is the per-machine env knob for users whose Windows cold-start is exceptionally slow (>90s). 180000 (3 min) is a safe upper bound to suggest.
