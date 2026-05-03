@@ -1,3 +1,8 @@
+---
+name: testing-app
+description: Recipes for testing creator-forge end-to-end (Electron + Python sidecar + ffmpeg) including how to skip Grok auth, how to verify caption modes, the post-PR-75 Compose audio auto-fit flow, and the long list of common gotchas.
+---
+
 # Testing creator-forge (Electron + Python sidecar + ffmpeg)
 
 This skill documents the testing recipes for the creator-forge
@@ -43,7 +48,7 @@ least one of these. If the user wants to skip auth setup, prefer
 testing Compose Audio (`/producer/audio` uses edge-tts which is
 free) and `/producer/assemble` (which only needs ffmpeg) — those
 two cover the most recently merged load-bearing changes (PR-30,
-PR-31, PR-32).
+PR-31, PR-32, PR-75).
 
 ## Setting up a temporary accounts.json for Grok testing
 
@@ -100,6 +105,56 @@ curl -s -X POST http://127.0.0.1:5050/producer/audio \
 
 Returns `audio_path` (mp3) + `srt_path` (3 caption blocks for a
 3-sentence script) + `output_dir` (`~/.creator-forge/output/audio-<ts>/`).
+
+## Testing Compose audio's auto-fit SRT (PR-75)
+
+PR-75 added two optional knobs to `/producer/audio` so the SRT
+lines up with the assembled video duration:
+
+- `scene_videos: list[str]` — absolute paths to per-scene mp4 /
+  mov / m4v / webm / mkv. Sidecar ffprobes each, sums the video
+  stream durations, and treats the sum as the auto-fit target.
+- `target_duration_s: float | None` — explicit override. Wins over
+  the ffprobe sum.
+
+Response adds `target_duration_s` (resolved) and `captions_scaled`
+(bool). Captions are linearly stretched/compressed so the last
+block's `end` lands at exactly the target.
+
+**The decisive assertion** is the SRT last-end timestamp on disk
+(parse the .srt directly — don't trust just the response field).
+With the 4s+3s+3s synth scenes (sum 10.000s):
+
+```bash
+# A) ffprobe-driven (no target override) — expect SRT last-end = 10.000s
+curl -s -X POST http://127.0.0.1:5050/producer/audio \
+  -H 'Content-Type: application/json' \
+  -d '{"script":"...","scene_videos":["/tmp/cf-scenes/shot1.mp4","/tmp/cf-scenes/shot2.mp4","/tmp/cf-scenes/shot3.mp4"]}'
+
+# B) explicit override wins — expect SRT last-end = 30.000s
+curl -s -X POST http://127.0.0.1:5050/producer/audio \
+  -H 'Content-Type: application/json' \
+  -d '{"script":"...","scene_videos":["/tmp/cf-scenes/shot1.mp4","/tmp/cf-scenes/shot2.mp4","/tmp/cf-scenes/shot3.mp4"],"target_duration_s":30}'
+```
+
+A broken implementation in case A leaves `captions_scaled=false`
+or SRT last-end at the native narration duration (e.g. 10.5s for
+the 3-sentence script). In case B, a broken explicit-override
+produces 10.0s instead of 30.0s.
+
+**Without writing curl** — in the renderer, type a number into the
+Compose panel's `TARGET DURATION OVERRIDE (S)` input and click
+*Compose audio*. The stats row will read
+`SRT timing: auto-fit · 30.00s` when scaling occurred, or
+`SRT timing: native TTS timing` when not. This is also the
+cleanest UI test — it doesn't need the Storyboard batch / Grok
+auth at all.
+
+**Auto-fill assertion** — after Compose audio finishes, the Video
+Assembly form's `Narration audio` and `Captions (.srt)` inputs
+below are auto-populated with the new `voice.mp3` / `captions.srt`
+paths. If they're still empty after a successful run, the
+`paAutoFillFromAudioResult` hook regressed.
 
 ## Testing /producer/assemble — the three caption modes
 
@@ -263,6 +318,18 @@ think burn is broken.
 Maximize the Electron window before recording any screen test.
 `xdotool search --name 'Creator Forge' windowsize 1600 1140` works
 on the standard VM. The default 800x600 hides several panels.
+`wmctrl -r 'Creator Forge' -b add,maximized_vert,maximized_horz`
+is an alternative that works after the window is open.
+
+### computer(action="console") doesn't work for Electron
+
+The `computer(action="console")` action is Chrome-foreground only.
+It returns *"Chrome is not in the foreground"* when the Electron
+renderer is the active window, even though the renderer is
+essentially Chromium. For DOM inspection inside the Electron app,
+take a screenshot (the rendered DOM is captured alongside it for
+you to read off `devinid` attributes), or open Electron's own
+DevTools with `Ctrl+Shift+I`.
 
 ### IPC client timeout on long LLM calls (and the 300s claim)
 
