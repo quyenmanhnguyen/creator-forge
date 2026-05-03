@@ -197,6 +197,15 @@
      * file into the I2V batch. Video rows are unaffected (they don't
      * carry `bytes` in practice, and their broken-output detection is
      * already handled by the gen-video path).
+     *
+     * The gate only fires when ``bytes > 0`` is reported — legacy
+     * IPC paths that don't surface file size are passed through
+     * unchanged. The renderer is expected to call
+     * ``enrichBatchRowsWithFileBytes`` between ``mapBatchResponse``
+     * and this helper so the gate receives a real on-disk size for
+     * every settled image (ImageService / RefImageService return
+     * ``savedFiles`` as a ``string[]`` and therefore land here with
+     * ``bytes === 0`` if the renderer skips the enrichment step).
      */
     function applyBatchResult(rows, key, result) {
         // PR-23: same row_id-vs-scene_id matching contract as
@@ -234,6 +243,66 @@
                 reason,
             });
         });
+    }
+
+    /**
+     * Stat each settled image row's file on disk so ``bytes`` reaches
+     * the ``MIN_OK_IMAGE_BYTES`` gate in ``applyBatchResult``.
+     *
+     * Why this exists: ``ImageService._processOneBatchItem`` and
+     * ``RefImageService.processOne`` return ``savedFiles`` as a
+     * ``string[]`` (just paths). ``mapBatchResponse`` therefore lands
+     * the row at ``bytes === 0`` even when the file on disk is fine,
+     * which silently no-ops the size gate and lets a ~50–150 KB Grok
+     * error page through as ``generated``. We close the loop in the
+     * renderer by stat'ing the file via ``electronAPI.statBytes``
+     * before we hand the row to ``applyBatchResult``.
+     *
+     * Pure helper — never throws, swallows ``statBytesFn`` failures
+     * so a transient ``EBUSY`` / ``ENOENT`` doesn't poison the whole
+     * batch. Rows already carrying ``bytes > 0`` are passed through
+     * untouched (the trusted path; the IPC layer surfaced size).
+     *
+     * @param {Array<Object>} mappedRows
+     * @param {Function} statBytesFn - ``(path) => Promise<{ exists, size }>``
+     *                                 (matching electron's ``file:statBytes``
+     *                                 IPC contract). A bare ``Promise<number>``
+     *                                 is also accepted for unit-test ergonomics.
+     * @returns {Promise<Array<Object>>}
+     */
+    async function enrichBatchRowsWithFileBytes(mappedRows, statBytesFn) {
+        if (!Array.isArray(mappedRows)) return [];
+        if (typeof statBytesFn !== "function") return mappedRows;
+        const out = [];
+        for (const row of mappedRows) {
+            if (!row || typeof row !== "object") {
+                out.push(row);
+                continue;
+            }
+            const hasPath = typeof row.image_path === "string" && row.image_path.trim().length > 0;
+            const alreadyKnown = typeof row.bytes === "number" && row.bytes > 0;
+            const isImageGenerated =
+                row.status === "generated" || row.status === "retried";
+            if (!hasPath || alreadyKnown || !isImageGenerated) {
+                out.push(row);
+                continue;
+            }
+            let bytes = 0;
+            try {
+                const stat = await statBytesFn(row.image_path);
+                if (typeof stat === "number") {
+                    bytes = stat;
+                } else if (stat && typeof stat === "object") {
+                    if (typeof stat.size === "number") bytes = stat.size;
+                    else if (typeof stat.bytes === "number") bytes = stat.bytes;
+                }
+            } catch (err) {
+                bytes = 0;
+            }
+            if (typeof bytes !== "number" || bytes < 0) bytes = 0;
+            out.push(Object.assign({}, row, { bytes }));
+        }
+        return out;
     }
 
     /**
@@ -941,6 +1010,7 @@
         startBatchPhase,
         applyBatchProgress,
         applyBatchResult,
+        enrichBatchRowsWithFileBytes,
         pairImagePathsForI2V,
         planImageGenerate,
         planVideoGenerate,

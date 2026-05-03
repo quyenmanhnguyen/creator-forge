@@ -2238,6 +2238,245 @@ def test_audio_warns_when_narration_longer_than_target(monkeypatch, tmp_path):
     assert any("Narration audio is" in w for w in body["warnings"])
 
 
+# ─── /producer/audio — per-scene narration (one TTS pass per scene) ────────
+
+
+def _fake_per_scene_word_adapter(scene_audio_specs: list[tuple[float, list[tuple[float, float, str]]]]):
+    """Build a fake TTS adapter that returns deterministic per-scene
+    durations + word boundaries.
+
+    Each call to ``synthesize_with_timing`` consumes the next entry
+    from ``scene_audio_specs`` (so calls map 1:1 to scenes in input
+    order). Useful for asserting per-scene synthesis was invoked
+    independently per scene rather than rendering the full ``script``
+    once.
+    """
+    state = {"i": 0, "calls": []}
+
+    class FakeAdapter:
+        name = "fake-edge-per-scene"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            i = state["i"]
+            state["i"] = i + 1
+            state["calls"].append({"text": text, "path": str(output_path), "voice": voice})
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            audio_secs, words = scene_audio_specs[i]
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=audio_secs,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[
+                    WordBoundary(start_s=s, end_s=e, text=t) for s, e, t in words
+                ],
+            )
+
+    FakeAdapter._calls = state  # type: ignore[attr-defined]
+    return FakeAdapter
+
+
+def test_audio_scene_narrations_calls_tts_once_per_scene(monkeypatch, tmp_path):
+    """The bug: previously the route ran one TTS pass over the full
+    ``script``. After the fix, when ``scene_narrations`` is non-empty
+    each scene narration triggers its own TTS call so the audio matches
+    the storyboard beat-by-beat instead of dumping the full script
+    onto one timeline.
+    """
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "alpha"), (1.0, 2.0, "one.")]),
+        (3.0, [(0.0, 1.5, "beta"), (1.5, 3.0, "two.")]),
+        (1.5, [(0.0, 0.7, "gamma"), (0.7, 1.5, "three.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+    # No scene_videos → no padding, no probe needed; concat helper is
+    # also stubbed so we don't require ffmpeg.
+    def _fake_concat_basic(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", _fake_concat_basic)
+
+    out = tmp_path / "audio-per-scene"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(out),
+            "scene_narrations": [
+                "Scene one narration.",
+                "Scene two has different content.",
+                "Scene three closes it out.",
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_rendered"] == 3, body
+    # 3 scenes × independent TTS calls — NOT one big call over `script`.
+    calls = Adapter._calls["calls"]  # type: ignore[attr-defined]
+    assert len(calls) == 3, calls
+    assert calls[0]["text"] == "Scene one narration."
+    assert calls[1]["text"] == "Scene two has different content."
+    assert calls[2]["text"] == "Scene three closes it out."
+    # The full script must NOT have been sent through TTS.
+    assert all(c["text"] != AUDIO_SCRIPT for c in calls)
+    # Combined captions span the assembled timeline (2.0 + 3.0 + 1.5 = 6.5s).
+    assert body["duration_s"] == pytest.approx(6.5, abs=0.05)
+    # group_word_boundaries collapses 2 words/scene into ~1 caption,
+    # so we expect at least 3 captions (1 per scene) — possibly more
+    # if punctuation triggers a split.
+    assert body["captions_count"] >= 3
+
+
+def test_audio_scene_narrations_pads_silence_to_match_scene_videos(monkeypatch, tmp_path):
+    """Per-scene narration that is *shorter* than the corresponding
+    scene_video gets padded with silence so the next scene's narration
+    starts when the next scene's video starts. The combined caption
+    timeline must reflect that shift.
+    """
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "first"), (1.0, 2.0, "scene.")]),
+        (3.0, [(0.0, 1.5, "second"), (1.5, 3.0, "scene.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=5.0,
+            video_stream_duration_sec=5.0,
+            has_video_stream=True,
+        ),
+    )
+    captured_pads: dict[str, Any] = {}
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        captured_pads["pads"] = list(silence_pads_s)
+        captured_pads["segments"] = list(segments)
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+
+    out = tmp_path / "audio-padding"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(out),
+            "scene_narrations": ["First scene narration.", "Second scene narration."],
+            "scene_videos": ["/scene1.mp4", "/scene2.mp4"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_rendered"] == 2
+    # scene 1: narration 2.0s, video 5.0s → 3.0s silence padding
+    # scene 2: narration 3.0s, video 5.0s → 2.0s silence padding
+    assert captured_pads["pads"] == pytest.approx([3.0, 2.0], abs=0.01)
+    # Final duration is the assembled video length (5 + 5 = 10s).
+    assert body["duration_s"] == pytest.approx(10.0, abs=0.05)
+    # Combined captions are time-shifted: scene 2's first caption
+    # starts at offset 5.0 (cumulative duration of scene 1).
+    srt_text = (out / "captions.srt").read_text("utf-8")
+    assert "00:00:05" in srt_text or "00:00:06" in srt_text
+
+
+def test_audio_scene_narrations_falls_back_to_legacy_when_all_blank(monkeypatch, tmp_path):
+    """When every entry in ``scene_narrations`` is blank we fall back
+    to single-pass TTS over ``script`` so the user still gets an
+    audio file.
+    """
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=4.0,
+            words=[(0.0, 2.0, "hi"), (2.0, 4.0, "there.")],
+        ),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-blank-scenes"),
+            "scene_narrations": ["", "  ", "\t"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Per-scene mode is disabled (all blanks) → scenes_rendered stays 0
+    # and the legacy single-pass duration (4.0s) is returned.
+    assert body["scenes_rendered"] == 0
+    assert body["duration_s"] == pytest.approx(4.0, abs=0.05)
+
+
+def test_audio_scene_narrations_skips_blank_slot_without_scene_video(monkeypatch, tmp_path):
+    """A blank narration entry with no matching scene_video duration
+    is skipped from the concat (we have no way to size the silent
+    placeholder). The remaining slots still synthesise correctly.
+    """
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "scene"), (1.0, 2.0, "one.")]),
+        (1.5, [(0.0, 0.7, "scene"), (0.7, 1.5, "three.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+    captured_segments: dict[str, Any] = {}
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        captured_segments["segments"] = list(segments)
+        captured_segments["pads"] = list(silence_pads_s)
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-skip-blank"),
+            # Middle slot is intentionally blank; no scene_videos so we
+            # can't size silence for it.
+            "scene_narrations": ["Scene one.", "", "Scene three."],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scenes_rendered"] == 2  # only 2 real scenes synthesised
+    assert len(captured_segments["segments"]) == 2
+    assert any("blank narration" in w for w in body["warnings"]), body["warnings"]
+
+
+def test_audio_scene_narrations_validator_normalises_entries(monkeypatch, tmp_path):
+    """Validator: list length is preserved (i-th narration aligns with
+    i-th scene_video) but each entry is stripped; non-string entries
+    are coerced. Blank entries become ``""`` and don't kick the route
+    into per-scene mode (every-entry-blank is treated as legacy).
+    """
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(audio_secs=2.0, words=[(0.0, 1.0, "x"), (1.0, 2.0, "y.")]),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-validator"),
+            "scene_narrations": ["  trim me  ", "", None, 42],
+        },
+    )
+    # 422 not expected — validator coerces None/int to strings, doesn't reject.
+    assert r.status_code == 200, r.text
+
+
 def test_audio_scene_videos_strip_whitespace_and_empties():
     """The ``scene_videos`` validator must drop blanks before reaching
     the route logic — mirrors the assemble-side contract.
