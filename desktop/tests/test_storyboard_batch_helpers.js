@@ -1584,6 +1584,41 @@ test("pairImagePathsForI2V: does not pair fallback rows into video batch", () =>
     assert.strictEqual(videoRows[0].image_path, null, "fallback image must NOT pair into I2V");
 });
 
+// ── Enhanced reject reason coverage ──────────────────────────────
+
+test("applyBatchResult: 24 KB image gets CDN moderation reason", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 24 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback");
+    assert.match(rows[0].reason, /24 KB/, "names the actual size");
+    assert.match(rows[0].reason, /CDN moderation/, "identifies likely cause for very small images");
+});
+
+test("applyBatchResult: 45 KB image gets incomplete download reason", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 45 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback");
+    assert.match(rows[0].reason, /45 KB/);
+    assert.match(rows[0].reason, /incomplete download|preview frame/, "identifies likely cause for mid-range small images");
+});
+
+test("applyBatchResult: 80 KB image gets generic too-small reason", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 80 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback");
+    assert.match(rows[0].reason, /80 KB/);
+    assert.match(rows[0].reason, /too small to be a real generation/, "generic reason for borderline images");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {

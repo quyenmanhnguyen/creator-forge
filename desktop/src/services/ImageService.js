@@ -1454,11 +1454,28 @@ class ImageService {
                 } catch (_) {}
             }
             if (bestSavedSize > 0 && bestSavedSize < MIN_OK_IMAGE_BYTES) {
-                console.log(`[ImageService] [${label}] Best image is ${bestSavedSize}b (< ${MIN_OK_IMAGE_BYTES}b), retrying (${retryAttempt + 1}/${SERVICE_IMAGE_RETRIES})...`);
+                console.log(`[ImageService] [${label}] Best image is ${bestSavedSize}b (< ${MIN_OK_IMAGE_BYTES}b), retrying with boosted count (${retryAttempt + 1}/${SERVICE_IMAGE_RETRIES})...`);
                 await new Promise(r => setTimeout(r, 2000));
-                const retryConfig = Object.assign({}, config, { _imageRetryAttempt: retryAttempt + 1 });
+                // Boost imageGenerationCount on retry so Grok produces
+                // multiple candidates — we keep the largest file.
+                const retryConfig = Object.assign({}, config, {
+                    _imageRetryAttempt: retryAttempt + 1,
+                    imageGenerationCount: Math.max(config.imageGenerationCount || 1, 4),
+                });
                 return this._processOneBatchItem(prompt, session, retryConfig, onProgress, myIdx, globalNum, totalForLog, outputFolder);
             }
+        }
+
+        // When multiple images were saved (boosted retry or multi-output),
+        // sort by file size descending so savedFiles[0] / outputPath is
+        // the largest (highest quality) candidate. The renderer's gate
+        // will still check the file and reject anything below 100 KB.
+        if (savedFiles.length > 1) {
+            savedFiles.sort((a, b) => {
+                try {
+                    return fs.statSync(b).size - fs.statSync(a).size;
+                } catch (_) { return 0; }
+            });
         }
 
         const jobResult = {

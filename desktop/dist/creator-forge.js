@@ -3350,7 +3350,15 @@
         ];
         sbbRepaintImage();
 
-        const config = { imageGenerationCount: 1 };
+        // Detect whether this batch contains rows that already failed
+        // at least once. When retrying, boost imageGenerationCount so
+        // Grok produces multiple candidates — the service picks the
+        // largest and the renderer gates out anything below 100 KB.
+        // Pro mode forces count=1 so the boost is skipped there.
+        const hasRetryRows = sbbState.imageRows.some(
+            (r) => subsetIds.has(String(r.row_id)) && (r.attempts || 0) > 1
+        );
+        const config = { imageGenerationCount: hasRetryRows ? 4 : 1 };
         const aspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
         if (aspect) config.aspectRatio = aspect;
         // PR-48 — Pro mode flips Grok's Quality model on; ImageService
