@@ -86,7 +86,7 @@ test("applyBatchProgress: settled rows ignore late events (incl. skipped)", () =
 
     // Settled (generated) row should not regress.
     rows = helpers.startBatchPhase(rows);
-    rows = helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/img1.png", bytes: 80_000 });
+    rows = helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/img1.png", bytes: 250_000 });
     rows = helpers.applyBatchProgress(rows, 1, { progress: 50 });
     assert.strictEqual(rows[0].status, "generated");
     assert.strictEqual(rows[0].progress, 100, "settled image stays at 100");
@@ -96,11 +96,11 @@ test("applyBatchResult: writes image_path/video_path/bytes and flips progress to
     let rows = helpers.initImageRowsFromScenes(SCENES);
     rows = helpers.startBatchPhase(rows);
     rows = helpers.applyBatchResult(rows, 1, {
-        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 90_000,
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 250_000,
     });
     assert.strictEqual(rows[0].status, "generated");
     assert.strictEqual(rows[0].image_path, "/p1.png");
-    assert.strictEqual(rows[0].bytes, 90_000);
+    assert.strictEqual(rows[0].bytes, 250_000);
     assert.strictEqual(rows[0].progress, 100);
 
     rows = helpers.applyBatchResult(rows, 2, {
@@ -110,11 +110,69 @@ test("applyBatchResult: writes image_path/video_path/bytes and flips progress to
     assert.match(rows[1].reason, /blur/);
 });
 
+// PR-B regression coverage: small image files (< 200 KB) almost
+// always indicate a Grok error page / blank placeholder rather than
+// a real generation. ``applyBatchResult`` must demote them to
+// fallback so they do NOT pair into the I2V batch.
+
+test("applyBatchResult: demotes 'generated' image with bytes < 200 KB to fallback", () => {
+    assert.strictEqual(helpers.MIN_OK_IMAGE_BYTES, 200 * 1024, "constant exported for callers");
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 100 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback", "100 KB image must NOT count as generated");
+    assert.match(rows[0].reason, /100 KB/, "reason names the actual size for the user");
+    assert.match(rows[0].reason, /below 200 KB/, "reason names the threshold");
+    // bytes is preserved so the row still shows the size next to the
+    // (now red) thumbnail in the table.
+    assert.strictEqual(rows[0].bytes, 100 * 1024);
+});
+
+test("applyBatchResult: keeps 'generated' image with bytes >= 200 KB", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 200 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "generated", "200 KB image is right at threshold and must pass");
+    rows = helpers.applyBatchResult(rows, 2, {
+        status: "generated", attempts: 1, image_path: "/p2.png", bytes: 5 * 1024 * 1024,
+    });
+    assert.strictEqual(rows[1].status, "generated");
+});
+
+test("applyBatchResult: video result with no bytes is unaffected by image-size gate", () => {
+    let rows = helpers.initVideoRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    // No image_path → image-size gate cannot fire even if bytes is
+    // small (video bytes have a different distribution and the
+    // gate's threshold is image-specific).
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, video_path: "/v1.mp4",
+    });
+    assert.strictEqual(rows[0].status, "generated");
+    assert.strictEqual(rows[0].video_path, "/v1.mp4");
+});
+
+test("applyBatchResult: 'generated' image with no bytes reported is left alone (gate is opt-in)", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    // ImageService used to omit ``bytes`` on legacy paths; the gate
+    // requires a positive byte count to fire so those legacy rows
+    // don't get spuriously demoted.
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png",
+    });
+    assert.strictEqual(rows[0].status, "generated", "no bytes field → gate is a no-op");
+});
+
 test("pairImagePathsForI2V: copies path only for settled image rows", () => {
     let imageRows = helpers.initImageRowsFromScenes(SCENES);
     imageRows = helpers.startBatchPhase(imageRows);
     imageRows = helpers.applyBatchResult(imageRows, 1, {
-        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 90_000,
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 250_000,
     });
     imageRows = helpers.applyBatchResult(imageRows, 4, {
         status: "fallback", attempts: 1, reason: "no usable image",
@@ -144,7 +202,7 @@ test("planVideoGenerate t2v: every row with a prompt is eligible (no image requi
 test("planVideoGenerate i2v: rows without paired image_path are skipped with a clear reason", () => {
     let imageRows = helpers.initImageRowsFromScenes(SCENES);
     imageRows = helpers.applyBatchResult(imageRows, 1, {
-        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 90_000,
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 250_000,
     });
     imageRows = helpers.applyBatchResult(imageRows, 2, {
         status: "fallback", attempts: 1, reason: "blur",
@@ -208,7 +266,7 @@ test("mapBatchResponse: missing/short results array fills fallback for every sce
 test("summarizeRows: aggregates per-status counts", () => {
     let rows = helpers.initImageRowsFromScenes(SCENES);
     rows = helpers.startBatchPhase(rows);
-    rows = helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/p1.png", bytes: 80000 });
+    rows = helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/p1.png", bytes: 250000 });
     rows = helpers.applyBatchResult(rows, 4, { status: "fallback", attempts: 2, reason: "blur" });
     const sum = helpers.summarizeRows(rows);
     assert.strictEqual(sum.total, 4);
@@ -233,7 +291,7 @@ test("immutability: helpers never mutate input arrays/objects", () => {
     const snap = JSON.stringify(rows);
     helpers.startBatchPhase(rows);
     helpers.applyBatchProgress(rows, 1, { progress: 50 });
-    helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/p1.png", bytes: 80000 });
+    helpers.applyBatchResult(rows, 1, { status: "generated", attempts: 1, image_path: "/p1.png", bytes: 250000 });
     helpers.pairImagePathsForI2V(helpers.initVideoRowsFromScenes(SCENES), rows);
     assert.strictEqual(JSON.stringify(rows), snap, "input rows must not be mutated");
 });

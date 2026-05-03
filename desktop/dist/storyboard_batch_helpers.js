@@ -176,10 +176,27 @@
         });
     }
 
+    // PR-B — minimum file size for an image to count as "really
+    // generated". Anything smaller is almost certainly a Grok error
+    // page / blank placeholder / Cloudflare interstitial that the
+    // upstream service still attached the URL of. Using 200 KB as the
+    // threshold matches the user-reported observation that broken
+    // images come in well below this and that a real 720×1280 jpeg
+    // from Grok always weighs at least ~250 KB.
+    const MIN_OK_IMAGE_BYTES = 200 * 1024;
+
     /**
      * Settle a row with the final result for the image phase. The
      * row's `bytes` is honored if non-zero so the renderer can show
      * file size next to the thumbnail.
+     *
+     * PR-B — when the IPC layer reports a "generated" image but the
+     * file is suspiciously small (< MIN_OK_IMAGE_BYTES), demote it to
+     * `fallback` with a human-readable reason so the renderer marks
+     * the row red and `pairImagePathsForI2V` won't promote a broken
+     * file into the I2V batch. Video rows are unaffected (they don't
+     * carry `bytes` in practice, and their broken-output detection is
+     * already handled by the gen-video path).
      */
     function applyBatchResult(rows, key, result) {
         // PR-23: same row_id-vs-scene_id matching contract as
@@ -193,15 +210,28 @@
             const matchById = row.row_id != null && String(row.row_id) === target;
             const matchByScene = !anyRowIdMatch && String(row.scene_id) === target;
             if (!matchById && !matchByScene) return row;
-            const status = (result && result.status) || "fallback";
+            let status = (result && result.status) || "fallback";
+            let reason = (result && result.reason != null) ? result.reason : row.reason;
+            const bytes = (result && typeof result.bytes === "number" && result.bytes > 0) ? result.bytes : row.bytes;
+            const hasImageOutput = !!(result && result.image_path);
+            if (
+                hasImageOutput
+                && (status === "generated" || status === "retried")
+                && typeof bytes === "number"
+                && bytes > 0
+                && bytes < MIN_OK_IMAGE_BYTES
+            ) {
+                status = "fallback";
+                reason = `image is ${Math.round(bytes / 1024)} KB — below 200 KB minimum, treated as failed`;
+            }
             return Object.assign({}, row, {
                 status,
                 progress: status === "generated" || status === "retried" ? 100 : row.progress,
                 attempts: (result && result.attempts != null) ? result.attempts : row.attempts,
                 image_path: (result && result.image_path != null) ? result.image_path : row.image_path,
                 video_path: (result && result.video_path != null) ? result.video_path : row.video_path,
-                bytes: (result && typeof result.bytes === "number" && result.bytes > 0) ? result.bytes : row.bytes,
-                reason: (result && result.reason != null) ? result.reason : row.reason,
+                bytes,
+                reason,
             });
         });
     }
@@ -905,6 +935,7 @@
     }
 
     const api = {
+        MIN_OK_IMAGE_BYTES,
         initImageRowsFromScenes,
         initVideoRowsFromScenes,
         startBatchPhase,

@@ -83,6 +83,56 @@ test("pullScenePathsFromBatch: extension match is case-insensitive", () => {
     assert.strictEqual(out.length, 2);
 });
 
+// PR-B regression coverage: real-flow batch rows carry the path on
+// ``video_path`` (set by ``applyBatchResult``), not ``savedFile``;
+// status comes through as ``generated`` / ``retried``, not the
+// legacy ``settled``. Before PR-B the helper looked at the wrong
+// field and produced an empty list, breaking the Video Assembly
+// auto-fill in real flow.
+
+test("pullScenePathsFromBatch: real-flow video_path + status='generated' is kept", () => {
+    const rows = [
+        { scene_id: 1, video_path: "/tmp/v1.mp4", status: "generated" },
+        { scene_id: 2, video_path: "/tmp/v2.mp4", status: "retried" },
+        { scene_id: 3, video_path: "/tmp/v3.mp4", status: "generated" },
+    ];
+    const out = helpers.pullScenePathsFromBatch(rows);
+    assert.deepStrictEqual(out, ["/tmp/v1.mp4", "/tmp/v2.mp4", "/tmp/v3.mp4"]);
+});
+
+test("pullScenePathsFromBatch: status='generating'/'pending'/'failed'/'skipped' rows are dropped", () => {
+    const rows = [
+        { scene_id: 1, video_path: "/tmp/v1.mp4", status: "generated" },
+        { scene_id: 2, video_path: "/tmp/v2.mp4", status: "generating" },
+        { scene_id: 3, video_path: "/tmp/v3.mp4", status: "pending" },
+        { scene_id: 4, video_path: "/tmp/v4.mp4", status: "failed" },
+        { scene_id: 5, video_path: "/tmp/v5.mp4", status: "skipped" },
+        { scene_id: 6, video_path: "/tmp/v6.mp4", status: "fallback" },
+    ];
+    const out = helpers.pullScenePathsFromBatch(rows);
+    assert.deepStrictEqual(out, ["/tmp/v1.mp4", "/tmp/v6.mp4"]);
+});
+
+test("pullScenePathsFromBatch: prefers video_path over savedFile when both present", () => {
+    const rows = [
+        // Real flow shouldn't ever set both, but if upstream copies
+        // the IPC ``savedFile`` AND the renderer fills in ``video_path``
+        // we want the renderer-side (canonical) value to win.
+        { scene_id: 1, video_path: "/tmp/canonical.mp4", savedFile: "/tmp/legacy.mp4", status: "generated" },
+    ];
+    const out = helpers.pullScenePathsFromBatch(rows);
+    assert.deepStrictEqual(out, ["/tmp/canonical.mp4"]);
+});
+
+test("pullScenePathsFromBatch: legacy savedFile-only rows still work without status (back-compat)", () => {
+    const rows = [
+        { scene_id: 1, savedFile: "/tmp/a.mp4" },
+        { scene_id: 2, savedFile: "/tmp/b.mp4" },
+    ];
+    const out = helpers.pullScenePathsFromBatch(rows);
+    assert.deepStrictEqual(out, ["/tmp/a.mp4", "/tmp/b.mp4"]);
+});
+
 // ─── buildAssemblePayload ──────────────────────────────────────────────────
 
 test("buildAssemblePayload: blank strings become null, defaults applied", () => {

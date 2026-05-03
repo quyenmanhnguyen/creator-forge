@@ -60,15 +60,27 @@
         return out;
     }
 
+    // Statuses that count as "this row has a usable output file".
+    // ``settled`` is the legacy IPC-layer status, ``generated`` /
+    // ``retried`` are the real renderer-state statuses set by
+    // ``applyBatchResult``, and ``fallback`` covers rows the user
+    // manually rescued. ``generating`` / ``pending`` / ``failed`` /
+    // ``skipped`` must NOT be promoted — those rows either don't have
+    // a file yet or had their generation aborted.
+    const SETTLED_STATUSES = new Set(['generated', 'retried', 'settled', 'fallback']);
+
     /**
-     * Pick the savedFile from each settled video row and return them
-     * in scene_id order, ready to drop into the scene-videos
-     * textarea.
+     * Pull the local video file path from each settled video row and
+     * return them in scene_id order, ready to drop into the
+     * scene-videos textarea.
      *
      * Rows are kept only when they have:
-     *   - status === 'settled' (or 'fallback' with savedFile present
-     *     — the user may have manually fixed the failure)
-     *   - a non-empty savedFile string
+     *   - status in SETTLED_STATUSES (or status absent — back-compat
+     *     for older fixtures that omitted the field entirely; the
+     *     extension + path checks below still gate them)
+     *   - a non-empty file path on either ``video_path`` (real
+     *     renderer state — populated by ``applyBatchResult``) or
+     *     ``savedFile`` (legacy IPC contract / unit-test fixtures)
      *   - an extension in SUPPORTED_VIDEO_EXTS
      *
      * @param {Array<object>} videoRows
@@ -76,11 +88,23 @@
      */
     function pullScenePathsFromBatch(videoRows) {
         if (!Array.isArray(videoRows)) return [];
+        const pickPath = (r) => {
+            const candidates = [r.video_path, r.savedFile];
+            for (const c of candidates) {
+                if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+            }
+            return '';
+        };
         const sortable = videoRows
             .filter((r) => r && typeof r === 'object')
-            .filter((r) => typeof r.savedFile === 'string' && r.savedFile.trim().length > 0)
             .filter((r) => {
-                const lower = String(r.savedFile).toLowerCase();
+                if (r.status == null) return true;
+                return SETTLED_STATUSES.has(String(r.status));
+            })
+            .map((r) => Object.assign({}, r, { __path: pickPath(r) }))
+            .filter((r) => r.__path.length > 0)
+            .filter((r) => {
+                const lower = r.__path.toLowerCase();
                 return SUPPORTED_VIDEO_EXTS.some((ext) => lower.endsWith(ext));
             });
 
@@ -92,7 +116,7 @@
             return ai - bi;
         });
 
-        return sortable.map((r) => String(r.savedFile).trim());
+        return sortable.map((r) => r.__path);
     }
 
     // Whitelist of caption modes the backend's AssembleRequest will

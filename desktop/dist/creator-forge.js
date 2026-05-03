@@ -1274,6 +1274,32 @@
     // the flag and re-pulls.
     let paScenesUserEdited = false;
 
+    // PR-B — same idea for the Compose panel's narration script
+    // textarea. The Storyboard's ``sb-script`` is the canonical source
+    // (Studio's "Send script → Storyboard" lands there). We mirror it
+    // into ``ps-script`` automatically until the user types into
+    // ``ps-script`` themselves, at which point the mirror stops so we
+    // never clobber a hand-edit. ``Copy script from above`` resets
+    // the flag in ``copyScriptFromStoryboard``.
+    let psScriptUserEdited = false;
+
+    /**
+     * Mirror ``#sb-script`` into ``#ps-script`` when the latter is
+     * still in its default state (empty or never user-edited). No-op
+     * when the user has typed into ``#ps-script`` so a hand-edit is
+     * never overwritten. Call from cold paint and from the
+     * ``#sb-script`` ``input`` event so the Compose panel always has
+     * a script ready when the user clicks Compose audio.
+     */
+    function psSyncScriptFromStoryboard() {
+        if (psScriptUserEdited) return;
+        const sb = $('sb-script');
+        const ps = $('ps-script');
+        if (!sb || !ps) return;
+        const next = (typeof sb.value === 'string') ? sb.value : '';
+        if (ps.value !== next) ps.value = next;
+    }
+
     /**
      * Repaint the scene-videos textarea from the current ``videoRows``
      * unless the user has hand-edited the box. Called from
@@ -3504,6 +3530,11 @@
             return;
         }
         $('ps-script').value = script;
+        // PR-B — manual copy re-arms the auto-mirror so subsequent
+        // edits to the Storyboard script keep flowing through. The
+        // user explicitly asked for the Storyboard's value, so any
+        // prior hand-edit was theirs to discard.
+        psScriptUserEdited = false;
     }
 
     // ─── Studio reset & cross-tab handoff ──────────────────────────────────
@@ -3527,6 +3558,11 @@
             return;
         }
         $('sb-script').value = script;
+        // PR-B — programmatic ``.value =`` doesn't fire ``input``, so
+        // mirror into the Compose panel's script box manually. The
+        // mirror is a no-op when the user has already hand-edited the
+        // Compose script.
+        psSyncScriptFromStoryboard();
         // Switch to storyboard tab.
         const sbBtn = document.querySelector('nav.tabs button[data-tab="storyboard"]');
         if (sbBtn) sbBtn.click();
@@ -3656,6 +3692,20 @@
         const paScenesTa = $('pa-scene-videos');
         if (paScenesTa) {
             paScenesTa.addEventListener('input', () => { paScenesUserEdited = true; });
+        }
+        // PR-B — auto-mirror Storyboard's script into Compose's script
+        // box on cold paint and on every Storyboard edit. We flip the
+        // user-edited flag the first time anyone types into Compose's
+        // box so subsequent Storyboard edits don't clobber a manual
+        // tweak. ``Copy script from above`` re-arms the mirror.
+        psSyncScriptFromStoryboard();
+        const sbScriptTa = $('sb-script');
+        if (sbScriptTa) {
+            sbScriptTa.addEventListener('input', psSyncScriptFromStoryboard);
+        }
+        const psScriptTa = $('ps-script');
+        if (psScriptTa) {
+            psScriptTa.addEventListener('input', () => { psScriptUserEdited = true; });
         }
         // P2 — TTS provider × Voice picker coupling. When the user
         // flips the provider dropdown, repaint the voice <select>

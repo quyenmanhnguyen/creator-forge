@@ -133,6 +133,26 @@ def test_system_prompt_skips_process_block_when_empty() -> None:
     assert "PROCESS NOTES" not in prompt
 
 
+def test_system_prompt_carries_scene_to_scene_diversity_rule() -> None:
+    """PR-B regression: every breakdown must instruct the LLM to vary
+    the opening clause across scenes, even when the location and
+    subject are shared. Without this rule DeepSeek tends to emit
+    multiple scenes that begin with the same boilerplate noun phrase
+    (e.g. several scenes opening with "A sunlit bedroom..."),
+    producing a visually monotonous storyboard."""
+    cinematic = SCENE_TEMPLATES["cinematic"]
+    prompt = build_breakdown_system_prompt(cinematic, n_scenes=6)
+    assert "SCENE-TO-SCENE DIVERSITY" in prompt
+    assert "no two IMAGE PROMPTs may open with the" in prompt
+    # Mentions the actual variation axes so the LLM has concrete options.
+    for axis in ("composition", "camera angle", "detail focus"):
+        assert axis in prompt.lower()
+    # Mentions the FLOW VIDEO PROMPT side of the rule too — the user's
+    # screenshots showed multiple scenes all starting with "A slow
+    # dolly push-in".
+    assert "FLOW VIDEO PROMPT openings" in prompt
+
+
 def test_user_prompt_strips_and_wraps_script() -> None:
     user = build_breakdown_user_prompt("   hello world.  \n\n")
     assert user.startswith("SCRIPT:\n")
