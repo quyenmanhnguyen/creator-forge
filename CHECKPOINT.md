@@ -1,8 +1,8 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-03 (post HF-9 sprint — image gate hardening + per-scene audio + LLM refine + thumbnail sharpness)
-> Main HEAD: `e71553a` — `feat(audio,thumbs): LLM Refine-script + sharper storyboard thumbnails (#81)`
-> Last sprint code commits: `53d2d43` (PR-79) → `9385554` (PR-80) → `e71553a` (PR-81)
+> Last updated: 2026-05-03 (post HF-10 sprint — audio caption enhancements + image retry improvements)
+> Main HEAD: `c84dd17` — `feat(image): boost output count on retry + enhanced reject reasons (#83)`
+> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → HF-10 in-progress on branch `devin/1777811026-audio-caption-enhancements`
 
 ---
 
@@ -10,17 +10,45 @@
 
 | Metric | Value |
 | --- | --- |
-| **CI strict pytest bucket** | **246 passed** (`test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler` + `test_llm_helpers`) — +26 from HF-9 additions (PR-79 +11 audio-scene, PR-80 +5 adaptive-audio/gate, PR-81 +10 refine-script/fallback) |
-| **Full pytest (local, all deps)** | **644 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap) |
-| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **116 / 116** (+9 from HF-9: image gate 100 KB, PR-79 enrichBatchRowsWithFileBytes, PR-81 thumbnail CSS); `test_storyboard_assemble_helpers.js`: **21 / 21** |
+| **CI strict pytest bucket** | **265 passed** (`test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler` + `test_llm_helpers`) — +19 from HF-10 additions (PR-82/83 image retry, HF-10 +14 assembler burn-style + +5 producer caption/rate) |
+| **Full pytest (local, all deps)** | **663 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap) |
+| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **123 / 123** (+7 from PR-82/83: auto-retry, tiered reject); `test_storyboard_assemble_helpers.js`: **33 / 33** (+12 from HF-10: caption style/font/position constants + burn payload fields) |
 | `ruff check research` | clean |
 | `node --check` (Electron entry points + dist) | clean |
 | Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
-| Live E2E verification | **PR-79: 13/13 assertions** (per-scene audio + image gate, with negative controls) · **PR-80: 12/12** (100 KB gate + adaptive audio via sidecar) · **PR-81: 28/28** (real-LLM refine + fallback + thumbnail CSS) |
+| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) |
 
 ---
 
-## Sprint History (PR-48 → PR-81)
+## Sprint History (PR-47 → PR-83 + HF-10 WIP)
+
+### HF-10 — Audio caption enhancements + voice expansion (WIP, branch `devin/1777811026-audio-caption-enhancements`)
+
+User feedback after HF-9 / PR-82 / PR-83: "Audio quality and SRT/caption appearance can be improved. Want professional caption styling, more voice options, speed control, configurable burn-in captions."
+
+**Implemented (code complete, pre-PR):**
+
+| Feature | What it ships |
+| --- | --- |
+| **A. Burn caption styling** | 4 presets via ffmpeg `force_style` parameter: **Modern** (bold white + black outline, YouTube Shorts style), **Cinematic** (italic + shadow, movie subs), **TikTok Bold** (large bold + heavy outline), **Minimal** (thin white + subtle shadow). `build_force_style()` helper in `assembler.py` generates the ASS style string. |
+| **B. Caption mode UI** | Video Assembly panel gains: caption mode dropdown (Soft / Burn / None), style preset selector (shows only when Burn selected), font size picker (Small 16pt / Medium 22pt / Large 28pt), position picker (Bottom / Middle / Top). Show/hide logic wired via DOMContentLoaded. |
+| **C. Audio speed control** | Speech rate slider (-50% to +100%) in Compose Audio panel. `rate` field added to `AudioOnlyRequest`; passed to `EdgeTTSAdapter.rate` on both per-scene and single-pass TTS paths. Slider label syncs in real-time. |
+| **D. Voice expansion** | Voice picker expanded from 12 → 22 edge-tts voices. Added: Sara, Davis, Amber (en-US), Sonia, Ryan (en-GB), Yunxi (zh-CN), Denise (fr-FR), Katja (de-DE), Francisca (pt-BR), Premwadee (th-TH), Gadis (id-ID). HTML voice picker reorganised into `<optgroup>` by language. |
+| **E. Font size + position** | `caption_font_size` (small/medium/large) and `caption_position` (bottom/middle/top) fields in `AssembleRequest`. Override the preset's FontSize and ASS Alignment/MarginV respectively. |
+
+**Tests added (HF-10):**
+- +14 assembler tests: `build_force_style` (all 4 presets, font size override, position override, combined, unknown preset fallback, invalid size/position) + `_build_ffmpeg_args` with/without force_style
+- +5 producer tests: `caption_style` pass-through to helper, defaults, unknown style 422, `AudioOnlyRequest.rate` acceptance + defaults
+- +12 JS assemble helper tests: `CAPTION_STYLES`/`FONT_SIZES`/`POSITIONS` constants, burn payload includes style fields, soft/none omits them, invalid style/size/position handling
+
+### PR-82, PR-83 — Image retry hardening (merged)
+
+User feedback: "Small Grok images (24 KB) still slip through. Retry shows stale preview. Want to know WHY images are rejected."
+
+| PR | Title | What it ships |
+| --- | --- | --- |
+| #82 | fix(image): auto-retry small images + fix stale thumbnail on Retry | **(1)** Clears `url`/`image_path`/`bytes` when row transitions to `generating` so `sbbResolveUrls` re-resolves after retry. **(2)** Renderer-side auto-retry: rows gate-rejected at 100 KB get automatic retry (max 3 attempts, 3s delay, progress banner). **(3)** Service-level retry: `_processOneBatchItem` checks file size post-save, retries up to 2× with 2s backoff. |
+| #83 | feat(image): boost output count on retry + enhanced reject reasons | **(1)** Retry requests 4 images instead of 1 (`retryBoostCount`), sorts by size, picks largest. **(2)** Tiered reject reasons: <30 KB → "CDN moderation placeholder", 30–59 KB → "incomplete download or preview frame", 60–99 KB → "image too small to be a real generation". |
 
 ### HF-9 — Image gate hardening + Per-scene audio + LLM Refine-script (PR-79, PR-80, PR-81)
 
@@ -86,6 +114,23 @@ A chain of seven follow-up fixes triggered by users hitting `sidecar restart fai
 
 ## Architectural deltas
 
+### HF-10 additions (WIP)
+
+- **Burn caption style presets.** `CAPTION_STYLE_PRESETS` dict in `assembler.py` — four entries (`modern`, `cinematic`, `tiktok`, `minimal`), each a `dict[str, str]` of ASS style parameters. `build_force_style(caption_style, font_size, position)` merges preset + overrides into a single ffmpeg `force_style` string.
+- **Caption styling pipeline.** `assemble_final_mp4()` gains `caption_style`, `caption_font_size`, `caption_position` keyword args. When `caption_mode="burn"`, `build_force_style()` is called and the resulting string is injected into the ffmpeg `-vf` chain as `subtitles=_subs.srt:force_style='...'`.
+- **`AssembleRequest` expansion.** Three new fields: `caption_style: Literal["modern", "cinematic", "tiktok", "minimal"]` (default `"modern"`), `caption_font_size: Literal["small", "medium", "large"] | None`, `caption_position: Literal["bottom", "middle", "top"] | None`. Route passes all three through to the assembler helper.
+- **TTS speech rate.** `AudioOnlyRequest.rate` field (default `"+0%"`). After `_resolve_tts_adapter()` creates the adapter, the route sets `adapter.rate = req.rate` on both per-scene and single-pass code paths. UI slider maps -50…+100 integer to edge-tts rate string format.
+- **Voice expansion.** `VOICES` tuple in `voices.py` grew from 12 → 22 edge-tts entries. New voices: Sara, Davis, Amber (en-US), Sonia, Ryan (en-GB), Yunxi (zh-CN), Denise (fr-FR), Katja (de-DE), Francisca (pt-BR), Premwadee (th-TH), Gadis (id-ID). HTML voice picker restructured into `<optgroup>` by language family.
+- **Caption mode UI.** Video Assembly panel gains `<select id="pa-caption-mode">` (soft/burn/none), with conditional show/hide of style/font/position controls when burn is selected. JS event listener on `change` toggles visibility of `#pa-caption-style-label`, `#pa-caption-font-size-label`, `#pa-caption-position-label`.
+- **Payload builder expansion.** `storyboard_assemble_helpers.js` exports `CAPTION_STYLES`, `DEFAULT_CAPTION_STYLE`, `CAPTION_FONT_SIZES`, `CAPTION_POSITIONS`. `buildAssemblePayload()` includes `caption_style`, `caption_font_size`, `caption_position` only when `caption_mode === 'burn'`.
+
+### PR-82 / PR-83 additions
+
+- **Stale preview fix.** `sbbResolveUrls` re-resolves after retry because `url`/`image_path`/`bytes` are cleared when row enters `generating` state.
+- **Auto-retry gate-rejected images.** Renderer-side: rows with bytes < 100 KB auto-retry up to 3 times (3s delay). Service-side: `_processOneBatchItem` retries up to 2× with 2s backoff when saved file < 100 KB.
+- **Retry boost.** Retry requests `n_images=4` (was 1). Saved files sorted by size descending; largest picked.
+- **Tiered reject reasons.** Three buckets based on file size: <30 KB (CDN moderation), 30–59 KB (incomplete download), 60–99 KB (too small).
+
 ### HF-9 additions
 
 - **Image size gate (lowered).** `MIN_OK_IMAGE_BYTES = 100 * 1024` (was 200 KB in PR-77; calibrated down in PR-80). Single source of truth in `desktop/dist/storyboard_batch_helpers.js`.
@@ -109,7 +154,7 @@ A chain of seven follow-up fixes triggered by users hitting `sidecar restart fai
 
 ## Test Inventory
 
-### Strict CI bucket (246 passed)
+### Strict CI bucket (265 passed)
 
 `research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py`, `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`, **`test_llm_helpers.py`** (new — PR-81).
 
@@ -117,6 +162,8 @@ Key additions since PR-75:
 - +11 producer tests (PR-79): per-scene narration, padding, blank-slot skip, validator normalisation, legacy fallback, negative control
 - +5 producer tests (PR-80): `humanize_per_scene` real call + fallback + wrong-shape + skip-when-false + scene_image_prompts validator
 - +10 producer tests (PR-81): refine_script happy path, banned-token strip, grounding, target_words, fallback no-key, blank-script 422, `test_llm_helpers.py` (8 cases for `call_deepseek`)
+- +5 producer tests (HF-10): caption_style pass-through, defaults, unknown style 422, AudioOnlyRequest.rate acceptance + defaults
+- +14 assembler tests (HF-10): build_force_style (all 4 presets, font size override, position override, combined, unknown preset, invalid size/position) + _build_ffmpeg_args with/without force_style
 
 ### Desktop offline tests (28 files, all PASS)
 
@@ -126,8 +173,8 @@ test_auth_service_keep_alive.js           test_research_sidecar_lookup.js
 test_auth_service_relogin_path.js         test_research_sidecar_port_bind.js   ← PR-72 NEW (9 tests)
 test_auth_session_status.js               test_research_sidecar_restart.js
 test_compose_voice_picker_helpers.js      test_storyboard_account_manager_helpers.js
-test_e2e_compose_script.js                test_storyboard_assemble_helpers.js
-test_fetch_python_runtime.js              test_storyboard_batch_helpers.js     ← 116 tests (was 107)
+test_e2e_compose_script.js                test_storyboard_assemble_helpers.js  ← 33 tests (was 21)
+test_fetch_python_runtime.js              test_storyboard_batch_helpers.js     ← 123 tests (was 116)
 test_grok_profile_dir.js                  test_storyboard_bridge.js
 test_i2v_service_process_one.js           test_storyboard_compose_helpers.js
 test_image_service_config.js              test_storyboard_compose_table_helpers.js
@@ -149,7 +196,7 @@ test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.
 
 ### Known failures (non-regression)
 
-`test_pixelle_grok_browser.py` — 7 tests require Playwright Chromium binary installed locally. Not in strict CI bucket; pre-existing env gap on Linux VM. All other 644 tests pass.
+`test_pixelle_grok_browser.py` — 7 tests require Playwright Chromium binary installed locally. Not in strict CI bucket; pre-existing env gap on Linux VM. All other tests pass.
 
 ---
 
@@ -164,14 +211,18 @@ test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.
 | Multi-account fan-out scheduler | `desktop/src/services/multiAccountFanOut.js` |
 | Python sidecar entry | `research/api/main.py` |
 | Bundled python runtime locator | `desktop/electron/researchSidecar.js::resolvePythonExecutable` |
-| Compose / Video Assembly UX (HF-8) | `desktop/dist/creator-forge.html` (Compose `ps-*` IDs, Video Assembly `pa-*` IDs) + `desktop/dist/creator-forge.js` (`psSyncScriptFromStoryboard`, `paAutoFillScenesFromBatch`, `psComposeAudio` request builder) |
-| Renderer pure helpers (HF-8) | `desktop/dist/storyboard_assemble_helpers.js` (`pullScenePathsFromBatch`, `validateAssembleForm`) + `desktop/dist/storyboard_batch_helpers.js` (`applyBatchResult`, `pairImagePathsForI2V`, `MIN_OK_IMAGE_BYTES`) |
-| `/producer/audio` auto-fit SRT + per-scene (PR-75 + PR-79) | `research/api/routes/producer.py` (`_resolve_target_duration`, `_render_scene_narrations`) |
+| Compose / Video Assembly UX (HF-8 + HF-10) | `desktop/dist/creator-forge.html` (Compose `ps-*` IDs, Video Assembly `pa-*` IDs) + `desktop/dist/creator-forge.js` (`psSyncScriptFromStoryboard`, `paAutoFillScenesFromBatch`, `psComposeAudio` request builder, `_paToggleBurnOpts`) |
+| Renderer pure helpers (HF-8 + HF-10) | `desktop/dist/storyboard_assemble_helpers.js` (`pullScenePathsFromBatch`, `validateAssembleForm`, `buildAssemblePayload` with burn caption fields) + `desktop/dist/storyboard_batch_helpers.js` (`applyBatchResult`, `pairImagePathsForI2V`, `MIN_OK_IMAGE_BYTES`) |
+| `/producer/audio` auto-fit SRT + per-scene + rate (PR-75 + PR-79 + HF-10) | `research/api/routes/producer.py` (`_resolve_target_duration`, `_render_scene_narrations`, `AudioOnlyRequest.rate`) |
+| `/producer/assemble` burn captions + styling (PR-32 + HF-10) | `research/api/routes/producer.py` (`AssembleRequest.caption_style/font_size/position`) → `research/core/pixelle/assembler.py` (`build_force_style`, `CAPTION_STYLE_PRESETS`) |
 | `/producer/refine_script` (PR-81) | `research/api/routes/producer.py` (`refine_script` endpoint) |
 | DeepSeek LLM helper | `research/core/llm.py` (`call_deepseek`) |
 | Storyboard thumbnails (PR-81) | `desktop/dist/creator-forge.js` (`.thumb-cell` style) + `desktop/dist/creator-forge.html` |
 | Scene breakdown LLM prompt (PR-77) | `research/core/pixelle/scene_breakdown.py::build_breakdown_system_prompt` (Hard rule #6) |
 | Image size gate | `desktop/dist/storyboard_batch_helpers.js` → `MIN_OK_IMAGE_BYTES = 100 * 1024` |
+| Image retry boost + tiered reject (PR-82/83) | `desktop/dist/storyboard_batch_helpers.js` (auto-retry, reject reasons) + `desktop/src/services/ImageService.js` (service-level retry, boost count) |
+| Voice registry (HF-10) | `research/core/pixelle/voices.py` → `VOICES` tuple (22 edge-tts + 6 piper-tts voices) |
+| Burn caption presets (HF-10) | `research/core/pixelle/assembler.py` → `CAPTION_STYLE_PRESETS`, `CAPTION_FONT_SIZES`, `CAPTION_POSITIONS`, `build_force_style()` |
 
 ---
 
@@ -209,3 +260,6 @@ API keys are persisted per-user via the ⚙ Settings dialog at `userData/api-key
 - **LLM diversity rule** (Hard rule #6) only ensures the prompt ships — adherence is non-deterministic. Next escalation: similarity-score first-N-words across `IMAGE PROMPT`s and reroll outliers in a post-processing pass.
 - **CDP-driven testing recipe** (HF-8): launch Electron with `--remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222`, drive `window.StoryboardAssembleHelpers` / `window.StoryboardBatchHelpers` from a CDP client. Use before reaching for full E2E with credentials.
 - `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS` env knob for slow Windows cold-start. 180000 (3 min) is a safe upper bound.
+- **Burn caption styling** (HF-10): presets live in `assembler.py:CAPTION_STYLE_PRESETS`. To add a new preset, add a key to the dict, add the value to `CaptionStyle` Literal in both `assembler.py` and `producer.py:AssembleRequest.caption_style`, and add the option to `desktop/dist/creator-forge.html` (`pa-caption-style` select). Test via `test_assembler.py::test_build_force_style_*`.
+- **Voice list** (HF-10): 22 edge-tts voices in `voices.py:VOICES`. To add more, append a `Voice(...)` entry and add a matching `<option>` to `desktop/dist/creator-forge.html` (`ps-voice` select). Edge-tts voices are validated by name on the backend; unknown names get a warning but still pass through.
+- **TTS rate** (HF-10): `AudioOnlyRequest.rate` accepts edge-tts format strings like `"+20%"`, `"-10%"`. The UI slider maps integer -50…+100 to this format. Rate only affects edge-tts; Piper-tts ignores it silently.
