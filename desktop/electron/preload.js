@@ -135,6 +135,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
         composeShort: (params) => ipcRenderer.invoke('producer:composeShort', params),
         // PR-30: TTS-only render (mp3/wav + optional srt), no mp4.
         composeAudio: (params) => ipcRenderer.invoke('producer:composeAudio', params),
+        // PR: LLM clean-up of the Compose-audio script textarea
+        // before TTS. Strips prompt JSON / bracketed lists; sizes
+        // the output to scene_videos duration via ffprobe-sum.
+        refineScript: (params) => ipcRenderer.invoke('producer:refineScript', params),
         // PR-31: stitch scene mp4s + narration mp3 into a single final mp4.
         assemble: (params) => ipcRenderer.invoke('producer:assemble', params),
         // PR-31: discover the most recent /producer/audio render so the

@@ -423,21 +423,29 @@
             opacity: 0.85;
         }
         .swc-table .thumb-cell {
-            width: 76px;
+            width: 112px;
         }
         .swc-table .thumb-cell img,
         .swc-table .thumb-cell video {
-            width: 64px;
-            height: 64px;
+            width: 96px;
+            height: 132px;
             object-fit: cover;
             border-radius: 4px;
             background: var(--bg-0);
             border: 1px solid var(--border);
             display: block;
+            /* PR-X — sharper downscale for portrait 9:16 storyboard
+               thumbnails. The legacy ``-webkit-optimize-contrast`` hint
+               is still honoured by Chromium / Electron and switches
+               from a soft bilinear filter to a contrast-preserving
+               filter when shrinking large source images (e.g. 1280x720
+               Grok output) into the table preview. The visible source
+               file is unchanged; only the in-table render is sharper. */
+            image-rendering: -webkit-optimize-contrast;
         }
         .swc-table .thumb-placeholder {
-            width: 64px;
-            height: 64px;
+            width: 96px;
+            height: 132px;
             border-radius: 4px;
             background: var(--bg-0);
             border: 1px dashed var(--border);
@@ -1615,6 +1623,7 @@
                 <div class="actions">
                     <button class="ghost" data-action="copy-script-from-storyboard">Copy script from above</button>
                     <button class="ghost" data-run="compose-refresh-reference" title="Re-pull settled scene video paths from the Video batch above into the auto-fit target.">Refresh from Video batch</button>
+                    <button class="ghost" data-run="refine-script" title="Ask DeepSeek to clean the script: strips JSON / bracketed lists / prompt syntax, matches narration to image prompts, sizes output to scene_videos duration. Replaces the Script textarea below on success.">Refine script (LLM)</button>
                     <button class="primary" id="ps-run-btn" data-run="compose-short">Compose audio</button>
                 </div>
                 <div class="result" id="ps-result"></div>

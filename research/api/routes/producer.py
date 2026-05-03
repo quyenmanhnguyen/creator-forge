@@ -1946,6 +1946,214 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     )
 
 
+# --- /producer/refine_script -- LLM clean-up of dirty narration script ---
+
+# When the user pastes upstream content (Studio output, JSON image-prompt
+# blob, or a draft full of bracketed lists) into the Compose-audio script
+# textarea, TTS reads the prompt syntax verbatim -- "negative_prompt nsfw
+# fully nude" gets spoken aloud, the audio is unintelligible, and the
+# user's only fix today is hand-editing the box. This route lets the
+# Compose panel offer a "Refine script" button that calls DeepSeek to
+# (a) extract the underlying storyline from whatever syntax surrounds it,
+# (b) match the narration to the storyboard's image_prompts so the audio
+# describes what's on screen, and (c) size the output to a target
+# duration (sum of scene_videos via ffprobe, or an explicit override).
+#
+# Robust-failure: missing DEEPSEEK_API_KEY or any LLM error returns 200
+# with the original script unchanged + a warning. Renderer surfaces the
+# warning and keeps the textarea as-is.
+
+
+class RefineScriptRequest(BaseModel):
+    script: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Raw input script -- may be storyline text, JSON image-prompt"
+            " blob, draft with bracketed lists, or anything else the user"
+            " pasted in. Will be cleaned into a single flowing narration."
+        ),
+    )
+    scene_image_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-scene image prompts (one per scene, in playback"
+            " order). The LLM uses these to anchor the cleaned narration"
+            " to what's on screen during each scene."
+        ),
+    )
+    scene_videos: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional absolute paths to per-scene mp4/mov/m4v/webm clips."
+            " When non-empty (and ``target_duration_s`` is unset) the route"
+            " runs ffprobe on each file and sums the video-stream"
+            " durations to set the narration word budget."
+        ),
+    )
+    target_duration_s: float | None = Field(
+        None,
+        ge=0.0,
+        description=(
+            "Explicit override for narration length budgeting (seconds)."
+            " When > 0 the LLM sizes the output to fit roughly this"
+            " duration at a natural TTS cadence. When unset / 0 falls back"
+            " to the summed duration of ``scene_videos`` (if any), or no"
+            " budget hint at all (LLM picks short)."
+        ),
+    )
+    language: str = Field(
+        "English",
+        description=(
+            "Human-readable language label passed to the LLM rewrite"
+            ' (e.g. "English", "Vietnamese").'
+        ),
+    )
+
+    _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+    @field_validator("scene_image_prompts", mode="before")
+    @classmethod
+    def _strip_scene_image_prompts(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                cleaned.append(item.strip())
+            elif item is None:
+                cleaned.append("")
+            else:
+                cleaned.append(str(item).strip())
+        return cleaned
+
+    @field_validator("scene_videos", mode="before")
+    @classmethod
+    def _strip_scene_videos(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    cleaned.append(stripped)
+            elif item is not None:
+                cleaned.append(str(item))
+        return cleaned
+
+
+class RefineScriptResponse(BaseModel):
+    refined_script: str
+    original_length: int = 0
+    refined_length: int = 0
+    target_duration_s: float = 0.0
+    target_words: int = 0
+    used_llm: bool = False
+    warnings: list[str] = []
+
+
+@router.post("/refine_script", response_model=RefineScriptResponse)
+def refine_script(req: RefineScriptRequest) -> RefineScriptResponse:
+    """Clean a raw input script into a TTS-ready narration via DeepSeek.
+
+    Two responsibilities:
+
+    1. **Sanitise**: extract the underlying storyline from whatever syntax
+       surrounds it (JSON, prompt fragments, lists). Strip prompt-syntax
+       tokens (``negative_prompt``, ``avoid``, comma-separated keyword
+       lists, NSFW filter words) so TTS doesn't speak them aloud.
+    2. **Size**: budget word count to ride the assembled video. The route
+       computes target seconds from (a) explicit ``target_duration_s``,
+       falling back to (b) summed ffprobe duration of ``scene_videos``.
+
+    Robust-failure: missing ``DEEPSEEK_API_KEY`` and any LLM error are
+    surfaced as warnings; the route returns the original script unchanged
+    and ``used_llm=False`` so the renderer can present a clear status.
+    """
+    raw_script = req.script.strip()
+    warnings: list[str] = []
+    original_length = len(raw_script)
+
+    target_duration_s = 0.0
+    if req.target_duration_s is not None and req.target_duration_s > 0:
+        target_duration_s = float(req.target_duration_s)
+    elif req.scene_videos:
+        target_duration_s = _sum_scene_video_duration(
+            req.scene_videos, warnings=warnings
+        )
+
+    target_words = (
+        max(20, int(round(target_duration_s * 2.5))) if target_duration_s > 0 else 0
+    )
+
+    try:
+        refined = llm.refine_script_for_narration(
+            raw_script=raw_script,
+            scene_image_prompts=req.scene_image_prompts,
+            target_duration_s=target_duration_s if target_duration_s > 0 else None,
+            language=req.language or "English",
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg == llm.ERR_NO_DEEPSEEK_KEY:
+            warnings.append(
+                "Refine-script skipped: DEEPSEEK_API_KEY not set -- script"
+                " unchanged. Set the key in your environment to enable LLM"
+                " clean-up."
+            )
+        else:
+            warnings.append(f"Refine-script LLM error: {msg}")
+        return RefineScriptResponse(
+            refined_script=raw_script,
+            original_length=original_length,
+            refined_length=original_length,
+            target_duration_s=round(target_duration_s, 3),
+            target_words=target_words,
+            used_llm=False,
+            warnings=warnings,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never let the route 500.
+        warnings.append(
+            f"Refine-script failed: {type(exc).__name__}: {exc} --"
+            " script unchanged."
+        )
+        return RefineScriptResponse(
+            refined_script=raw_script,
+            original_length=original_length,
+            refined_length=original_length,
+            target_duration_s=round(target_duration_s, 3),
+            target_words=target_words,
+            used_llm=False,
+            warnings=warnings,
+        )
+
+    refined_clean = (refined or "").strip()
+    if not refined_clean:
+        warnings.append(
+            "Refine-script returned empty output -- keeping original script."
+        )
+        return RefineScriptResponse(
+            refined_script=raw_script,
+            original_length=original_length,
+            refined_length=original_length,
+            target_duration_s=round(target_duration_s, 3),
+            target_words=target_words,
+            used_llm=False,
+            warnings=warnings,
+        )
+
+    return RefineScriptResponse(
+        refined_script=refined_clean,
+        original_length=original_length,
+        refined_length=len(refined_clean),
+        target_duration_s=round(target_duration_s, 3),
+        target_words=target_words,
+        used_llm=True,
+        warnings=warnings,
+    )
+
+
 # ─── /producer/assemble — concat scene videos + replace audio + soft subs ───
 
 # PR-31 — Video Assembly. Once the user has narration mp3 (from
