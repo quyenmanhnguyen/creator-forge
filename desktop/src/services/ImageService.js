@@ -4,6 +4,11 @@ const { API_ENDPOINTS, MODEL_CONFIG, IMAGE_CONFIG, PROCESSING_CONFIG, PATHS } = 
 const FileService = require('./FileService');
 const AuthService = require('./AuthService');
 const path = require('path');
+const fs = require('fs');
+
+// Matches the renderer gate in storyboard_batch_helpers.js.
+const MIN_OK_IMAGE_BYTES = 100 * 1024;
+const SERVICE_IMAGE_RETRIES = 2;
 
 class ImageService {
     constructor() {
@@ -1432,6 +1437,28 @@ class ImageService {
             }
         } else if (bestBase64Size >= 50000) {
             console.log(`[ImageService] [${label}] Skipping URL downloads — already have good base64 (${bestBase64Size}b)`);
+        }
+
+        // Service-level retry: when saved images are all below the
+        // renderer's MIN_OK_IMAGE_BYTES gate, the renderer would demote
+        // them to fallback anyway. Retry the generation here first so
+        // the user sees a successful result without needing a manual
+        // Retry click. Uses config._imageRetryAttempt to track depth.
+        const retryAttempt = config._imageRetryAttempt || 0;
+        if (savedFiles.length > 0 && retryAttempt < SERVICE_IMAGE_RETRIES) {
+            let bestSavedSize = 0;
+            for (const f of savedFiles) {
+                try {
+                    const stat = fs.statSync(f);
+                    if (stat.size > bestSavedSize) bestSavedSize = stat.size;
+                } catch (_) {}
+            }
+            if (bestSavedSize > 0 && bestSavedSize < MIN_OK_IMAGE_BYTES) {
+                console.log(`[ImageService] [${label}] Best image is ${bestSavedSize}b (< ${MIN_OK_IMAGE_BYTES}b), retrying (${retryAttempt + 1}/${SERVICE_IMAGE_RETRIES})...`);
+                await new Promise(r => setTimeout(r, 2000));
+                const retryConfig = Object.assign({}, config, { _imageRetryAttempt: retryAttempt + 1 });
+                return this._processOneBatchItem(prompt, session, retryConfig, onProgress, myIdx, globalNum, totalForLog, outputFolder);
+            }
         }
 
         const jobResult = {

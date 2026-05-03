@@ -3339,7 +3339,7 @@
         sbbState.imageRows = sbbState.imageRows.map((row) => {
             if (!subsetIds.has(String(row.row_id))) return row;
             if (row.status === 'skipped') return row;
-            return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
+            return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1, url: null, image_path: null, bytes: 0 });
         });
         // currentImageBatch* covers BOTH plans so progress events for
         // either IPC channel route through the same row mapping.
@@ -3421,6 +3421,33 @@
         if (settledNow > 0) {
             const videoSection = document.getElementById('sbb-video-section');
             if (videoSection) scrollResultIntoView(videoSection);
+        }
+
+        // Auto-retry rows that were demoted to fallback by the image
+        // size gate (< 100 KB). Grok occasionally returns small
+        // placeholder / moderated images on first attempt but succeeds
+        // on a subsequent try with the same prompt and session. Cap at
+        // SBB_MAX_AUTO_RETRIES total attempts per row so we don't spin
+        // forever on genuinely un-generatable prompts.
+        const SBB_MAX_AUTO_RETRIES = 3;
+        const autoRetryIds = new Set();
+        for (const row of sbbState.imageRows) {
+            if (
+                rowIds.has(String(row.row_id))
+                && row.status === 'fallback'
+                && (row.attempts || 0) < SBB_MAX_AUTO_RETRIES
+            ) {
+                autoRetryIds.add(String(row.row_id));
+            }
+        }
+        if (autoRetryIds.size > 0) {
+            const nextAttempt = (sbbState.imageRows.find((r) => autoRetryIds.has(String(r.row_id))) || {}).attempts || 1;
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                `<div class="info">Auto-retrying ${autoRetryIds.size} failed row(s)… (attempt ${nextAttempt + 1}/${SBB_MAX_AUTO_RETRIES})</div>`,
+            );
+            await new Promise((r) => setTimeout(r, 3000));
+            return sbbRunImageBatchForRowIds(autoRetryIds);
         }
     }
 
@@ -3525,7 +3552,7 @@
             if (!subsetIds.has(rid)) return row;
             const eligible = plan.rowIds ? eligibleRowIdSet.has(rid) : eligibleSceneSet.has(sid);
             if (eligible) {
-                return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1 });
+                return Object.assign({}, row, { status: 'generating', progress: 0, attempts: (row.attempts || 0) + 1, url: null, video_path: null });
             }
             if (skippedRowMap.has(rid)) {
                 return Object.assign({}, row, { status: 'skipped', reason: skippedRowMap.get(rid) });

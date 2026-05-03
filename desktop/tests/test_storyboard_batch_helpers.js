@@ -1515,6 +1515,75 @@ test("source_image_url: clears stale url when image_path drops to null", () => {
     assert.strictEqual(paired[0].source_image_url, null, "stale source_image_url cleared too");
 });
 
+// ── Retry-clears-stale-url coverage ──────────────────────────────
+// When the renderer sets a row to 'generating' for a retry, it now
+// clears url / image_path / bytes so the thumbnail refreshes with
+// the new file after applyBatchResult re-settles the row. These
+// tests verify the helpers cooperate correctly with that contract.
+
+test("applyBatchResult: re-settles row after url/image_path cleared for retry", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    // First generation — 24 KB error image → fallback.
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/old.jpg", bytes: 24 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback", "first gen demoted to fallback");
+    // Renderer clears url/image_path/bytes on retry (simulate).
+    rows = rows.map((r) => r.scene_id === 1
+        ? Object.assign({}, r, { status: "generating", url: null, image_path: null, bytes: 0 })
+        : r);
+    // Second generation — 250 KB valid image.
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 2, image_path: "/new.jpg", bytes: 250 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "generated", "second gen accepted");
+    assert.strictEqual(rows[0].image_path, "/new.jpg", "new path set");
+    assert.strictEqual(rows[0].bytes, 250 * 1024, "new bytes set");
+});
+
+test("applyBatchResult: retry with cleared row does not inherit stale image_path", () => {
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/stale.jpg", bytes: 200 * 1024,
+    });
+    assert.strictEqual(rows[0].image_path, "/stale.jpg");
+    // Simulate retry clearing.
+    rows = rows.map((r) => r.scene_id === 1
+        ? Object.assign({}, r, { status: "generating", url: null, image_path: null, bytes: 0 })
+        : r);
+    assert.strictEqual(rows[0].image_path, null, "image_path cleared for retry");
+    assert.strictEqual(rows[0].url, null, "url cleared for retry");
+    // New result with different path.
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 2, image_path: "/fresh.jpg", bytes: 300 * 1024,
+    });
+    assert.strictEqual(rows[0].image_path, "/fresh.jpg", "fresh path from new generation");
+});
+
+test("enrichBatchRowsWithFileBytes: re-enriches after retry (bytes was 0 again)", async () => {
+    const stat = async (p) => ({ exists: true, size: p === "/retry.jpg" ? 350 * 1024 : 0 });
+    const mapped = [
+        { scene_id: 1, status: "generated", image_path: "/retry.jpg", bytes: 0 },
+    ];
+    const enriched = await helpers.enrichBatchRowsWithFileBytes(mapped, stat);
+    assert.strictEqual(enriched[0].bytes, 350 * 1024, "re-enrichment picks up new size");
+});
+
+test("pairImagePathsForI2V: does not pair fallback rows into video batch", () => {
+    let imageRows = helpers.initImageRowsFromScenes(SCENES.slice(0, 1));
+    imageRows = helpers.startBatchPhase(imageRows);
+    imageRows = helpers.applyBatchResult(imageRows, 1, {
+        status: "generated", attempts: 1, image_path: "/small.jpg", bytes: 24 * 1024,
+    });
+    // The gate demotes to fallback.
+    assert.strictEqual(imageRows[0].status, "fallback");
+    let videoRows = helpers.initVideoRowsFromScenes(SCENES.slice(0, 1));
+    videoRows = helpers.pairImagePathsForI2V(videoRows, imageRows);
+    assert.strictEqual(videoRows[0].image_path, null, "fallback image must NOT pair into I2V");
+});
+
 let pass = 0;
 let fail = 0;
 (async () => {
