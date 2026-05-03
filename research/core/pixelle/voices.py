@@ -44,7 +44,14 @@ VOICES: tuple[Voice, ...] = (
     Voice("en-US-AriaNeural",      "English (US) · Aria · F",      "en-US", "F", "edge-tts"),
     Voice("en-US-GuyNeural",       "English (US) · Guy · M",       "en-US", "M", "edge-tts"),
     Voice("en-US-JennyNeural",     "English (US) · Jenny · F",     "en-US", "F", "edge-tts"),
+    # HF-10: en-US expansion (Sara, Davis, Amber).
+    Voice("en-US-SaraNeural",      "English (US) · Sara · F",      "en-US", "F", "edge-tts"),
+    Voice("en-US-DavisNeural",     "English (US) · Davis · M",     "en-US", "M", "edge-tts"),
+    Voice("en-US-AmberNeural",     "English (US) · Amber · F",     "en-US", "F", "edge-tts"),
     Voice("en-GB-LibbyNeural",     "English (UK) · Libby · F",     "en-GB", "F", "edge-tts"),
+    # HF-10: en-GB expansion (Sonia, Ryan).
+    Voice("en-GB-SoniaNeural",     "English (UK) · Sonia · F",     "en-GB", "F", "edge-tts"),
+    Voice("en-GB-RyanNeural",      "English (UK) · Ryan · M",      "en-GB", "M", "edge-tts"),
     Voice("ko-KR-SunHiNeural",     "한국어 · 선희 · F",            "ko-KR", "F", "edge-tts"),
     Voice("ko-KR-InJoonNeural",    "한국어 · 인준 · M",            "ko-KR", "M", "edge-tts"),
     Voice("ja-JP-NanamiNeural",    "日本語 · ナナミ · F",          "ja-JP", "F", "edge-tts"),
@@ -52,7 +59,15 @@ VOICES: tuple[Voice, ...] = (
     Voice("vi-VN-HoaiMyNeural",    "Tiếng Việt · Hoài My · F",     "vi-VN", "F", "edge-tts"),
     Voice("vi-VN-NamMinhNeural",   "Tiếng Việt · Nam Minh · M",    "vi-VN", "M", "edge-tts"),
     Voice("zh-CN-XiaoxiaoNeural",  "中文 · 晓晓 · F",              "zh-CN", "F", "edge-tts"),
+    # HF-10: zh-CN expansion (Yunxi).
+    Voice("zh-CN-YunxiNeural",     "中文 · 云希 · M",              "zh-CN", "M", "edge-tts"),
     Voice("es-ES-ElviraNeural",    "Español · Elvira · F",         "es-ES", "F", "edge-tts"),
+    # HF-10: extra languages (fr, de, pt, th, id).
+    Voice("fr-FR-DeniseNeural",    "Français · Denise · F",        "fr-FR", "F", "edge-tts"),
+    Voice("de-DE-KatjaNeural",     "Deutsch · Katja · F",          "de-DE", "F", "edge-tts"),
+    Voice("pt-BR-FranciscaNeural", "Português (BR) · Francisca · F", "pt-BR", "F", "edge-tts"),
+    Voice("th-TH-PremwadeeNeural", "ไทย · เปรมวดี · F",            "th-TH", "F", "edge-tts"),
+    Voice("id-ID-GadisNeural",     "Bahasa Indonesia · Gadis · F", "id-ID", "F", "edge-tts"),
 
     # ── Piper TTS (offline) ──────────────────────────────────────────
     # Voice ids resolve via piper.PiperVoice.load(short_name) ↦

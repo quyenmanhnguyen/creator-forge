@@ -385,9 +385,18 @@ def test_assemble_burn_path_stages_srt_passes_cwd_and_cleans_up(tmp_path, monkey
     assert all("falling back to soft" not in w for w in r.warnings)
 
     # Args contain the relative subtitles filter, not the absolute SRT.
+    # HF-10 — the chain now also gets a ``:force_style='...'`` payload
+    # for the default ``modern`` caption preset so the subtitles
+    # render with the YouTube-Shorts-style outline instead of libass's
+    # ugly defaults. We don't pin the exact force_style here (the
+    # preset content is exercised by the build_force_style tests
+    # below); instead we assert the structural shape: the ``subtitles=``
+    # filter resolves to the staged relative name, and force_style
+    # follows it as an additional filter argument.
     cmd = captured["cmd"]
     vf_chain = cmd[cmd.index("-vf") + 1]
-    assert vf_chain.endswith(",subtitles=_subs.srt")
+    assert ",subtitles=_subs.srt" in vf_chain
+    assert ":force_style='" in vf_chain
     assert str(srt) not in cmd
     # No mov_text codec for burn.
     assert "-c:s" not in cmd
@@ -694,3 +703,272 @@ def test_sum_video_durations_skips_unprobeable(tmp_path, monkeypatch):
     total, warnings = assembler._sum_video_durations([good, bad], runner=runner)
     assert total == pytest.approx(4.0)
     assert any("Could not probe duration" in w for w in warnings)
+
+
+# ─── HF-10: build_force_style + _build_ffmpeg_args force_style injection ───
+#
+# The four presets in ``CAPTION_STYLE_PRESETS`` are the source of truth
+# for ffmpeg's ``subtitles=...:force_style='...'`` argument. These
+# tests exercise:
+#   * Each preset round-trips its FontName / FontSize / Alignment
+#     intact through ``build_force_style``.
+#   * ``font_size`` and ``position`` overrides replace the preset's
+#     ``FontSize`` / ``Alignment`` + ``MarginV``.
+#   * Unknown values fall back gracefully (no exceptions, no missing
+#     keys) so a stale renderer can never crash the route.
+#   * ``_build_ffmpeg_args`` injects the resulting string as
+#     ``:force_style='...'`` (with comma-escape) only in burn mode,
+#     and skips it cleanly when force_style is None.
+
+
+def test_build_force_style_modern_default_preset_round_trips():
+    """Default call returns the ``modern`` preset's full param set in
+    ``Key=Value,...`` order."""
+    out = assembler.build_force_style()
+    # Modern is the documented default — bold white sans-serif.
+    assert "FontName=Arial" in out
+    assert "FontSize=22" in out
+    assert "Bold=1" in out
+    assert "Outline=2" in out
+    assert "Alignment=2" in out
+    # Comma-separated and contains every preset key (no silent drops).
+    pairs = out.split(",")
+    keys = [p.split("=", 1)[0] for p in pairs]
+    for must_have in (
+        "FontName", "FontSize", "PrimaryColour", "OutlineColour",
+        "BackColour", "Bold", "Italic", "Outline", "Shadow",
+        "Alignment", "MarginV",
+    ):
+        assert must_have in keys, f"modern preset missing {must_have!r} in: {out}"
+
+
+def test_build_force_style_cinematic_uses_serif_italic_with_shadow():
+    out = assembler.build_force_style("cinematic")
+    assert "FontName=Georgia" in out
+    assert "Italic=1" in out
+    assert "Shadow=2" in out
+    # Cinematic has a thinner outline than modern (1 vs 2).
+    assert "Outline=1" in out
+
+
+def test_build_force_style_tiktok_uses_impact_with_heavy_outline():
+    out = assembler.build_force_style("tiktok")
+    assert "FontName=Impact" in out
+    assert "FontSize=28" in out
+    assert "Bold=1" in out
+    # Heavier outline than modern so the text pops on busy bg.
+    assert "Outline=4" in out
+    # TikTok preset sits a bit higher than the bottom-default 40.
+    assert "MarginV=60" in out
+
+
+def test_build_force_style_minimal_drops_outline_keeps_subtle_shadow():
+    out = assembler.build_force_style("minimal")
+    assert "FontName=Arial" in out
+    assert "FontSize=18" in out
+    assert "Outline=0" in out
+    assert "Shadow=1" in out
+    assert "Bold=0" in out
+
+
+def test_build_force_style_unknown_preset_falls_back_to_modern():
+    """A stale renderer that ships an unknown preset key must NOT
+    raise — the helper falls back to ``DEFAULT_CAPTION_STYLE`` so the
+    ffmpeg call still runs."""
+    out_unknown = assembler.build_force_style("ferrari-red")
+    out_default = assembler.build_force_style(assembler.DEFAULT_CAPTION_STYLE)
+    assert out_unknown == out_default
+
+
+def test_build_force_style_font_size_override_replaces_preset_value():
+    """Each named font-size bucket overrides the preset's FontSize."""
+    for name, expected_pt in (("small", 16), ("medium", 22), ("large", 28)):
+        out = assembler.build_force_style("modern", font_size=name)
+        assert f"FontSize={expected_pt}" in out, (
+            f"font_size={name!r} should set FontSize={expected_pt} but got: {out}"
+        )
+
+
+def test_build_force_style_invalid_font_size_keeps_preset_default():
+    """An unknown font-size string is silently dropped — preset wins."""
+    out = assembler.build_force_style("modern", font_size="huge")
+    # modern's preset FontSize is 22.
+    assert "FontSize=22" in out
+
+
+def test_build_force_style_position_override_replaces_alignment_and_marginv():
+    """Each named position override replaces the preset's Alignment +
+    MarginV with the documented numpad/MarginV combo."""
+    cases = (
+        ("bottom", "Alignment=2", "MarginV=40"),
+        ("middle", "Alignment=5", "MarginV=0"),
+        ("top",    "Alignment=8", "MarginV=40"),
+    )
+    for name, expected_align, expected_margin in cases:
+        out = assembler.build_force_style("modern", position=name)
+        assert expected_align in out, (
+            f"position={name!r} should set {expected_align} but got: {out}"
+        )
+        assert expected_margin in out
+
+
+def test_build_force_style_invalid_position_keeps_preset_default():
+    out = assembler.build_force_style("modern", position="diagonal")
+    # Modern's preset values: Alignment=2, MarginV=40.
+    assert "Alignment=2" in out
+    assert "MarginV=40" in out
+
+
+def test_build_force_style_combined_overrides_apply_together():
+    """Setting both font_size and position overrides at once must
+    update both — neither override should clobber the other."""
+    out = assembler.build_force_style(
+        "tiktok", font_size="small", position="top",
+    )
+    # font_size override wins over preset (was 28).
+    assert "FontSize=16" in out
+    # position override wins over preset (was 2/60).
+    assert "Alignment=8" in out
+    assert "MarginV=40" in out
+    # Preset's other params still flow through (Impact font, Bold=1).
+    assert "FontName=Impact" in out
+    assert "Bold=1" in out
+
+
+def test_args_caption_burn_with_force_style_is_appended_with_escaped_commas(tmp_path):
+    """When ``force_style`` is set with burn mode, the -vf chain ends
+    with ``subtitles=<srt>:force_style='<escaped>'`` and inner commas
+    are replaced with ``\\,`` so the lavfi parser doesn't split them
+    as filter separators."""
+    list_p = tmp_path / "list.txt"
+    audio_p = _make_audio_file(tmp_path)
+    srt_p = _make_srt_file(tmp_path)
+    out_p = tmp_path / "final.mp4"
+
+    args = assembler._build_ffmpeg_args(
+        list_path=list_p, output_path=out_p,
+        audio=audio_p, srt=srt_p,
+        audio_mode="replace", caption_mode="burn",
+        trim_to="video", video_total_s=10.0,
+        burn_srt_relname="_subs.srt",
+        force_style="FontName=Arial,FontSize=22,Bold=1",
+    )
+
+    vf_idx = args.index("-vf")
+    vf_chain = args[vf_idx + 1]
+    # Filter ends with the styled subtitles part, and commas inside the
+    # force_style payload are escaped so the outer chain parser keeps
+    # the rest of the styling together.
+    assert "subtitles=_subs.srt:force_style=" in vf_chain
+    assert r"FontName=Arial\,FontSize=22\,Bold=1" in vf_chain
+    # Single-quoted so an older ffmpeg's lavfi parser can use that as
+    # an extra hint — belt-and-suspenders.
+    assert ":force_style='" in vf_chain
+    assert vf_chain.endswith("'"), vf_chain
+
+
+def test_args_caption_burn_without_force_style_keeps_plain_subtitles_filter(tmp_path):
+    """When ``force_style`` is omitted, the -vf chain ends in
+    ``subtitles=<srt>`` with no ``:force_style=`` suffix — preserves
+    the pre-HF-10 behaviour for callers that didn't opt in."""
+    list_p = tmp_path / "list.txt"
+    audio_p = _make_audio_file(tmp_path)
+    srt_p = _make_srt_file(tmp_path)
+    out_p = tmp_path / "final.mp4"
+
+    args = assembler._build_ffmpeg_args(
+        list_path=list_p, output_path=out_p,
+        audio=audio_p, srt=srt_p,
+        audio_mode="replace", caption_mode="burn",
+        trim_to="video", video_total_s=10.0,
+        burn_srt_relname="_subs.srt",
+    )
+
+    vf_idx = args.index("-vf")
+    vf_chain = args[vf_idx + 1]
+    assert vf_chain.endswith(",subtitles=_subs.srt")
+    assert "force_style" not in vf_chain
+
+
+def test_args_caption_soft_ignores_force_style_kwarg(tmp_path):
+    """Even if a stale caller passes ``force_style`` with
+    ``caption_mode='soft'``, the args builder must NOT inject the
+    subtitles filter — the SRT goes in as a mov_text stream and the
+    style argument is irrelevant."""
+    list_p = tmp_path / "list.txt"
+    audio_p = _make_audio_file(tmp_path)
+    srt_p = _make_srt_file(tmp_path)
+    out_p = tmp_path / "final.mp4"
+
+    args = assembler._build_ffmpeg_args(
+        list_path=list_p, output_path=out_p,
+        audio=audio_p, srt=srt_p,
+        audio_mode="replace", caption_mode="soft",
+        trim_to="video", video_total_s=10.0,
+        force_style="FontSize=99,Bold=1",
+    )
+
+    vf_idx = args.index("-vf")
+    vf_chain = args[vf_idx + 1]
+    # No subtitles filter at all — and certainly no force_style.
+    assert "subtitles=" not in vf_chain
+    assert "force_style" not in vf_chain
+    # mov_text codec confirms the soft-sub path.
+    assert args[args.index("-c:s") + 1] == "mov_text"
+
+
+def test_assemble_burn_path_passes_force_style_into_ffmpeg(tmp_path, monkeypatch):
+    """End-to-end via ``assemble_final_mp4``: caption_style + overrides
+    flow through to the ffmpeg argv as a force_style payload."""
+    monkeypatch.setattr(
+        "research.core.pixelle.video_probe._resolve_ffprobe",
+        lambda: "/fake/ffprobe",
+    )
+    monkeypatch.setattr(assembler, "_resolve_ffmpeg", lambda: "/fake/ffmpeg")
+
+    scene = _make_scene_file(tmp_path, "scene_001.mp4")
+    audio = _make_audio_file(tmp_path)
+    srt = _make_srt_file(tmp_path)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    captured: list[list[str]] = []
+
+    def runner(cmd, **kwargs):
+        captured.append(list(cmd))
+        if cmd[0].endswith("ffprobe"):
+            return _Proc(returncode=0, stdout=_ffprobe_stdout(4.0), stderr="")
+        # Pretend ffmpeg succeeded and wrote final.mp4 — pad past the
+        # MIN_USABLE_VIDEO_BYTES threshold so the post-run validator
+        # accepts it (a smaller payload looks like a truncated download
+        # to the size sentinel).
+        (output_dir / "final.mp4").write_bytes(b"y" * 50_000)
+        return _Proc(returncode=0, stdout="", stderr="")
+
+    result = assembler.assemble_final_mp4(
+        scene_videos=[str(scene)],
+        audio_path=str(audio),
+        srt_path=str(srt),
+        output_dir=output_dir,
+        audio_mode="replace",
+        trim_to="video",
+        caption_mode="burn",
+        caption_style="tiktok",
+        caption_font_size="large",
+        caption_position="top",
+        runner=runner,
+    )
+
+    assert result.final_path
+    # Find the ffmpeg call (not ffprobe) and inspect its -vf arg.
+    ffmpeg_calls = [c for c in captured if c[0].endswith("ffmpeg")]
+    assert ffmpeg_calls, "expected at least one ffmpeg invocation"
+    args = ffmpeg_calls[-1]
+    vf_idx = args.index("-vf")
+    vf_chain = args[vf_idx + 1]
+    # tiktok preset font (Impact) + large size override (28pt) + top
+    # position override (Alignment=8) all reach the wire payload.
+    assert "force_style=" in vf_chain
+    assert r"FontName=Impact" in vf_chain
+    assert r"FontSize=28" in vf_chain
+    assert r"Alignment=8" in vf_chain

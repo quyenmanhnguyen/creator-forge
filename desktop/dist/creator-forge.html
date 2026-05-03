@@ -1596,10 +1596,54 @@
                     </label>
                     <label title="Voice id. For edge-tts: short name like en-US-AriaNeural. For piper-tts: short name like vi_VN-vais1000-medium (resolves to ~/.creator-forge/piper-voices/&lt;name&gt;.onnx) or absolute path to an .onnx file.">Voice
                         <select id="ps-voice">
-                            <option value="en-US-AriaNeural">en-US-AriaNeural · Aria · F (edge-tts)</option>
-                            <option value="vi-VN-HoaiMyNeural">vi-VN-HoaiMyNeural · Hoài My · F (edge-tts)</option>
-                            <option value="vi_VN-vais1000-medium">vi_VN-vais1000-medium (piper-tts)</option>
+                            <optgroup label="English (US)">
+                                <option value="en-US-AriaNeural">Aria · F (edge-tts)</option>
+                                <option value="en-US-GuyNeural">Guy · M (edge-tts)</option>
+                                <option value="en-US-JennyNeural">Jenny · F (edge-tts)</option>
+                                <option value="en-US-SaraNeural">Sara · F (edge-tts)</option>
+                                <option value="en-US-DavisNeural">Davis · M (edge-tts)</option>
+                                <option value="en-US-AmberNeural">Amber · F (edge-tts)</option>
+                            </optgroup>
+                            <optgroup label="English (UK)">
+                                <option value="en-GB-LibbyNeural">Libby · F (edge-tts)</option>
+                                <option value="en-GB-SoniaNeural">Sonia · F (edge-tts)</option>
+                                <option value="en-GB-RyanNeural">Ryan · M (edge-tts)</option>
+                            </optgroup>
+                            <optgroup label="Tiếng Việt">
+                                <option value="vi-VN-HoaiMyNeural">Hoài My · F (edge-tts)</option>
+                                <option value="vi-VN-NamMinhNeural">Nam Minh · M (edge-tts)</option>
+                                <option value="vi_VN-vais1000-medium">VAIS-1000 · M (piper-tts)</option>
+                            </optgroup>
+                            <optgroup label="한국어">
+                                <option value="ko-KR-SunHiNeural">선희 · F (edge-tts)</option>
+                                <option value="ko-KR-InJoonNeural">인준 · M (edge-tts)</option>
+                            </optgroup>
+                            <optgroup label="日本語">
+                                <option value="ja-JP-NanamiNeural">ナナミ · F (edge-tts)</option>
+                                <option value="ja-JP-KeitaNeural">圭太 · M (edge-tts)</option>
+                            </optgroup>
+                            <optgroup label="中文">
+                                <option value="zh-CN-XiaoxiaoNeural">晓晓 · F (edge-tts)</option>
+                                <option value="zh-CN-YunxiNeural">云希 · M (edge-tts)</option>
+                            </optgroup>
+                            <optgroup label="Other languages">
+                                <option value="es-ES-ElviraNeural">Español · Elvira · F (edge-tts)</option>
+                                <option value="fr-FR-DeniseNeural">Français · Denise · F (edge-tts)</option>
+                                <option value="de-DE-KatjaNeural">Deutsch · Katja · F (edge-tts)</option>
+                                <option value="pt-BR-FranciscaNeural">Português (BR) · Francisca · F (edge-tts)</option>
+                                <option value="th-TH-PremwadeeNeural">ไทย · เปรมวดี · F (edge-tts)</option>
+                                <option value="id-ID-GadisNeural">Bahasa Indonesia · Gadis · F (edge-tts)</option>
+                            </optgroup>
                         </select>
+                    </label>
+                    <!-- HF-10 — speech rate slider. Maps -50…+100 integer to
+                         the edge-tts ``rate`` string format ("+0%", "+20%",
+                         "-30%"). The label syncs to the slider value via
+                         the JS handler in creator-forge.js so the user
+                         sees "+0%" / "+20%" / etc. live. Piper-tts ignores
+                         this; the route still accepts it for back-compat. -->
+                    <label title="Speech rate for edge-tts. -50% = half speed, 0% = native cadence, +100% = double speed. Piper-tts ignores this slider.">Speech rate <span id="ps-rate-label">+0%</span>
+                        <input id="ps-rate" type="range" min="-50" max="100" step="5" value="0" />
                     </label>
                     <label title="Where to save voice.mp3 / captions.srt. Leave blank to auto-create ~/.creator-forge/output/audio-<timestamp>/ on your machine.">Output folder (optional)
                         <span class="dir-picker-row">
@@ -1668,6 +1712,49 @@
                             <button type="button" class="secondary" data-run="assemble-pick-output">Browse…</button>
                         </span>
                     </label>
+                    <!-- HF-10 — caption mode + burn-only styling. The mode
+                         picker is always visible; the styling row beneath
+                         only renders when ``burn`` is selected (toggled by
+                         the ``pa-caption-mode`` change handler in
+                         creator-forge.js). ``soft`` (default) attaches the
+                         srt as a mov_text track; ``burn`` renders captions
+                         into the visible video stream via ffmpeg's
+                         subtitles filter; ``none`` drops the srt entirely. -->
+                    <label title="Soft = mov_text track (player-toggleable). Burn = renders captions into the visible video stream so every player sees them (slower, requires a usable font). None = drop the srt entirely.">Caption mode
+                        <select id="pa-caption-mode">
+                            <option value="soft" selected>soft (player-toggleable, default)</option>
+                            <option value="burn">burn (rendered into video)</option>
+                            <option value="none">none (drop captions)</option>
+                        </select>
+                    </label>
+                    <div id="pa-burn-style-row" class="form-row-full" style="display: none;">
+                        <div class="form-grid form-grid-3">
+                            <label title="Caption preset. Modern = bold white sans-serif with thick black outline (YouTube Shorts default). Cinematic = italic serif with soft shadow. TikTok = large bold Impact-style with heavy outline. Minimal = thin white sans-serif with subtle shadow.">Caption style
+                                <select id="pa-caption-style">
+                                    <option value="modern" selected>Modern (Shorts-style, bold white)</option>
+                                    <option value="cinematic">Cinematic (Netflix-style, italic serif)</option>
+                                    <option value="tiktok">TikTok (large Impact-style, bold)</option>
+                                    <option value="minimal">Minimal (thin sans-serif, subtle)</option>
+                                </select>
+                            </label>
+                            <label title="Override the preset's font size. Small = 16pt, Medium = 22pt (most presets), Large = 28pt. Leave on 'preset default' to use the preset's built-in size.">Font size
+                                <select id="pa-caption-font-size">
+                                    <option value="" selected>preset default</option>
+                                    <option value="small">Small (16pt)</option>
+                                    <option value="medium">Medium (22pt)</option>
+                                    <option value="large">Large (28pt)</option>
+                                </select>
+                            </label>
+                            <label title="Override the preset's vertical position. Bottom = near the bottom edge (every preset's default). Middle = centred over the video. Top = near the top edge — useful when the bottom third has on-screen graphics.">Position
+                                <select id="pa-caption-position">
+                                    <option value="" selected>preset default (bottom)</option>
+                                    <option value="bottom">Bottom</option>
+                                    <option value="middle">Middle</option>
+                                    <option value="top">Top</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
                 </div>
                 <div class="actions">
                     <button class="ghost" data-run="assemble-pull-from-batch" title="Re-pull the scene videos textarea with all settled rows from the Video batch above, in scene order. Useful after editing rows or re-running a single scene.">Refresh from Video batch</button>

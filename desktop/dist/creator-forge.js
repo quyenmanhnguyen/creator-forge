@@ -1163,6 +1163,11 @@
             tts_provider: ($('ps-tts-provider') && $('ps-tts-provider').value) || 'edge-tts',
             voice: $('ps-voice').value || 'en-US-AriaNeural',
             write_srt: !!$('ps-write-srt').checked,
+            // HF-10 — speech rate slider value. Edge-tts honours it
+            // ("+0%" / "+20%" / "-30%"); Piper-tts ignores it. The
+            // route's AudioOnlyRequest defaults to "+0%" so omitting
+            // a stale slider is safe.
+            rate: psReadRate(),
         };
         const outDir = asNonEmpty($('ps-output-dir').value);
         if (outDir) params.output_dir = outDir;
@@ -1292,18 +1297,26 @@
     // Read every form input into a single object so the helpers can
     // build the POST body (and the validator can mirror it).
     //
-    // PR-A — the ``Audio mode`` / ``Trim to`` / ``Caption mode``
-    // dropdowns were removed from the UI: ``replace`` + ``video`` +
-    // ``soft`` cover ~100% of the supported workflow and are pinned
-    // here so the renderer always sends the documented defaults.
-    // Power users can still hit /producer/assemble directly with the
-    // other values via the wire API.
+    // PR-A — the ``Audio mode`` / ``Trim to`` dropdowns were removed
+    // from the UI: ``replace`` + ``video`` cover ~100% of the
+    // supported workflow and are pinned here so the renderer always
+    // sends the documented defaults. Power users can still hit
+    // /producer/assemble directly with the other values via the wire
+    // API.
+    //
+    // HF-10 — caption mode + burn styling are now user-controlled
+    // again (the burn-styling row is conditionally shown only when
+    // mode === 'burn'; see the change handler in DOMContentLoaded).
     function paReadForm() {
         const sceneText = ($('pa-scene-videos') && $('pa-scene-videos').value) || '';
         const helpers = paHelpers();
         const scenePaths = helpers
             ? helpers.parseSceneVideoPaths(sceneText)
             : sceneText.split('\n').map((l) => l.trim()).filter(Boolean);
+        const modeEl = $('pa-caption-mode');
+        const styleEl = $('pa-caption-style');
+        const fontEl = $('pa-caption-font-size');
+        const posEl = $('pa-caption-position');
         return {
             scenePaths,
             audioPath: ($('pa-audio-path') && $('pa-audio-path').value) || '',
@@ -1311,8 +1324,52 @@
             outputDir: ($('pa-output-dir') && $('pa-output-dir').value) || '',
             audioMode: 'replace',
             trimTo: 'video',
-            captionMode: 'soft',
+            captionMode: (modeEl && modeEl.value) || 'soft',
+            captionStyle: (styleEl && styleEl.value) || 'modern',
+            captionFontSize: (fontEl && fontEl.value) || '',
+            captionPosition: (posEl && posEl.value) || '',
         };
+    }
+
+    /**
+     * HF-10 — show / hide the burn-only styling row based on the
+     * caption-mode dropdown. Soft / none modes don't use a force_style
+     * preset (the player or the SRT pixels win), so collapsing the
+     * row keeps the form clean. Idempotent — safe to call from cold
+     * paint and from the change event listener.
+     */
+    function paUpdateBurnStyleVisibility() {
+        const modeEl = $('pa-caption-mode');
+        const row = $('pa-burn-style-row');
+        if (!modeEl || !row) return;
+        const isBurn = modeEl.value === 'burn';
+        row.style.display = isBurn ? '' : 'none';
+    }
+
+    /**
+     * HF-10 — sync the speech-rate label with the slider value so the
+     * user sees "+0%" / "+20%" / "-30%" live as they drag. The label
+     * uses ``+`` for non-negative values to match edge-tts's wire
+     * format (the route accepts "+0%" but rejects "0%" / "-0%").
+     */
+    function psUpdateRateLabel() {
+        const slider = $('ps-rate');
+        const label = $('ps-rate-label');
+        if (!slider || !label) return;
+        const n = parseInt(slider.value, 10) || 0;
+        label.textContent = (n >= 0 ? '+' : '') + n + '%';
+    }
+
+    /**
+     * HF-10 — read the slider and return the edge-tts wire string
+     * ("+0%" / "+20%" / "-30%"). Returns the default "+0%" when the
+     * slider isn't on the page (e.g. older HTML cache during dev).
+     */
+    function psReadRate() {
+        const slider = $('ps-rate');
+        if (!slider) return '+0%';
+        const n = parseInt(slider.value, 10) || 0;
+        return (n >= 0 ? '+' : '') + n + '%';
     }
 
     // PR-A — track whether the user manually edited the scene-videos
@@ -3869,6 +3926,22 @@
         if (paScenesTa) {
             paScenesTa.addEventListener('input', () => { paScenesUserEdited = true; });
         }
+        // HF-10 — caption-mode change toggles the burn-only styling
+        // row + paint cold-start state so the row is hidden on first
+        // load (default = soft).
+        const paCaptionModeSel = $('pa-caption-mode');
+        if (paCaptionModeSel) {
+            paCaptionModeSel.addEventListener('change', paUpdateBurnStyleVisibility);
+        }
+        paUpdateBurnStyleVisibility();
+        // HF-10 — speech-rate slider live label sync. Paint cold-start
+        // value too so a non-zero default ever shipped via HTML
+        // attribute renders correctly.
+        const psRateSlider = $('ps-rate');
+        if (psRateSlider) {
+            psRateSlider.addEventListener('input', psUpdateRateLabel);
+        }
+        psUpdateRateLabel();
         // PR-B — auto-mirror Storyboard's script into Compose's script
         // box on cold paint and on every Storyboard edit. We flip the
         // user-edited flag the first time anyone types into Compose's
