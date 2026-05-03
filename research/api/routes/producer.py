@@ -1163,6 +1163,25 @@ class AudioOnlyRequest(BaseModel):
             "``humanize_per_scene`` is true."
         ),
     )
+    # HF-10 — speech rate control for edge-tts. Format mirrors the
+    # ``rate`` parameter on ``edge_tts.Communicate``: ``"+0%"`` is
+    # native cadence, ``"+20%"`` is 20% faster, ``"-30%"`` is 30%
+    # slower. The renderer maps a slider (-50…+100 integer) to this
+    # string format. Piper-tts ignores the rate (its synthesis tempo
+    # is baked into the .onnx model). When the value can't be parsed
+    # by edge-tts it surfaces as a warning rather than failing the
+    # whole call.
+    rate: str = Field(
+        "+0%",
+        description=(
+            "Edge-TTS speech rate as a signed percentage string "
+            "(e.g. '+0%', '+20%', '-30%'). Default '+0%' is the "
+            "voice's native cadence. Piper-tts ignores this field. "
+            "Stored on the adapter and passed to "
+            "``edge_tts.Communicate(rate=...)`` for both per-scene "
+            "and single-pass synthesis paths."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
@@ -1764,6 +1783,13 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         try:
             adapter = _resolve_tts_adapter(req.tts_provider)
             engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+            # HF-10 — apply speech rate. Only edge-tts honours it
+            # (Piper's tempo is baked into the .onnx model). We set
+            # the attribute defensively via ``setattr`` so a swapped
+            # adapter (e.g. test double) without a ``rate`` slot
+            # doesn't crash the call.
+            if req.rate and hasattr(adapter, "rate"):
+                adapter.rate = req.rate
             per_scene_results, combined_captions = _synthesize_per_scene_audio(
                 effective_scene_narrations,
                 adapter=adapter,
@@ -1837,6 +1863,11 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         try:
             adapter = _resolve_tts_adapter(req.tts_provider)
             engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
+            # HF-10 — apply speech rate to the single-pass adapter.
+            # Same attribute-set guard as the per-scene path so
+            # unconventional adapters (Piper / tests) don't crash.
+            if req.rate and hasattr(adapter, "rate"):
+                adapter.rate = req.rate
             tts_result = adapter.synthesize_with_timing(
                 script, output_path=audio_path, voice=req.voice
             )
@@ -2247,6 +2278,46 @@ class AssembleRequest(BaseModel):
             "staged for burn (read-only output dir)."
         ),
     )
+    # HF-10 — burn caption styling. Only used when ``caption_mode='burn'``;
+    # ignored for ``soft`` / ``none``. The four presets live in
+    # ``research.core.pixelle.assembler.CAPTION_STYLE_PRESETS`` and map
+    # to ASS ``force_style`` parameters that override libass's ugly
+    # defaults (Arial 16pt, no outline). ``caption_font_size`` and
+    # ``caption_position`` are optional overrides on top of the preset
+    # — leave them ``null`` to use the preset's defaults. Adding a new
+    # preset requires bumping the ``CaptionStyle`` Literal here AND in
+    # ``assembler.py`` + the renderer's ``CAPTION_STYLES`` whitelist.
+    caption_style: Literal["modern", "cinematic", "tiktok", "minimal"] = Field(
+        "modern",
+        description=(
+            "HF-10 burn caption preset. 'modern' = bold white sans-serif "
+            "with thick black outline (YouTube Shorts default). "
+            "'cinematic' = italic serif with soft shadow (Netflix style). "
+            "'tiktok' = large bold Impact-style with heavy outline. "
+            "'minimal' = thin white sans-serif with subtle shadow. Only "
+            "applied when ``caption_mode='burn'``; ignored otherwise."
+        ),
+    )
+    caption_font_size: Literal["small", "medium", "large"] | None = Field(
+        None,
+        description=(
+            "HF-10 burn caption font-size override. 'small' = 16pt, "
+            "'medium' = 22pt, 'large' = 28pt. ``null`` (default) uses "
+            "the active ``caption_style`` preset's built-in size. Only "
+            "applied when ``caption_mode='burn'``."
+        ),
+    )
+    caption_position: Literal["bottom", "middle", "top"] | None = Field(
+        None,
+        description=(
+            "HF-10 burn caption vertical position. 'bottom' (default in "
+            "every preset), 'middle' (centred over the video), 'top' "
+            "(near the top edge — useful when the bottom third of the "
+            "frame has on-screen graphics). ``null`` uses the active "
+            "``caption_style`` preset's built-in position. Only applied "
+            "when ``caption_mode='burn'``."
+        ),
+    )
 
     _strip_audio = field_validator("audio_path", mode="before")(
         classmethod(lambda cls, v: _strip(v) if v is not None else v)
@@ -2303,6 +2374,9 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         audio_mode=req.audio_mode,
         trim_to=req.trim_to,
         caption_mode=req.caption_mode,
+        caption_style=req.caption_style,
+        caption_font_size=req.caption_font_size,
+        caption_position=req.caption_position,
     )
 
     return AssembleResponse(

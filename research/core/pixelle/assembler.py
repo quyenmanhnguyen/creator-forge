@@ -75,6 +75,9 @@ FFMPEG_TIMEOUT_SEC = 600  # 10 min — long enough for ~10 min of source
 AudioMode = Literal["replace", "none"]
 TrimMode = Literal["video", "audio"]
 CaptionMode = Literal["soft", "none", "burn"]
+CaptionStyle = Literal["modern", "cinematic", "tiktok", "minimal"]
+CaptionFontSize = Literal["small", "medium", "large"]
+CaptionPosition = Literal["bottom", "middle", "top"]
 
 # Filename used when staging the SRT for ``caption_mode="burn"``. Lives
 # in ``output_dir`` next to ``final.mp4`` and is cleaned up after
@@ -82,6 +85,156 @@ CaptionMode = Literal["soft", "none", "burn"]
 # ``_concat_list.txt`` so a ``ls`` of the output dir cleanly groups the
 # transient files.
 BURN_SRT_STAGED_NAME = "_subs.srt"
+
+
+# ─── HF-10: Burn caption styling presets ────────────────────────────────────
+#
+# When ``caption_mode="burn"`` we render the SRT into the visible video
+# stream via ffmpeg's ``subtitles`` filter. Without ``force_style`` the
+# subs render in libass's ugly default (Arial 16pt, no outline, gray
+# shadow) which is fine for previews but wrong for every published
+# format. The four presets below cover the common YouTube Shorts /
+# TikTok / cinematic / minimal styles so the renderer can offer the
+# user a one-click choice.
+#
+# Each preset is a ``dict[str, str]`` of ASS style parameters that map
+# 1:1 to the ``force_style=Key1=Value1,Key2=Value2,...`` argument of
+# the subtitles filter. ASS uses BGR hex with ``&H<hex>&`` format for
+# colours; the trailing ``&`` is convention but not required by libass.
+# ``Alignment`` follows the libass numpad (1=BL, 2=BC default, 3=BR,
+# 4=ML, 5=MC, 6=MR, 7=TL, 8=TC, 9=TR). ``MarginV`` is in pixels from
+# the bottom (or top, when ``Alignment`` is in 7/8/9).
+#
+# Adding a new preset: extend the dict, add the key to ``CaptionStyle``
+# Literal in this file AND in ``producer.py:AssembleRequest``, add the
+# ``<option>`` to ``creator-forge.html`` (``pa-caption-style`` select),
+# and bump ``CAPTION_STYLES`` in ``storyboard_assemble_helpers.js``.
+
+CAPTION_STYLE_PRESETS: dict[str, dict[str, str]] = {
+    # YouTube Shorts standard — bold white sans-serif with thick black
+    # outline. Reads cleanly on any background. Default for HF-10.
+    "modern": {
+        "FontName": "Arial",
+        "FontSize": "22",
+        "PrimaryColour": "&Hffffff&",
+        "OutlineColour": "&H000000&",
+        "BackColour": "&H000000&",
+        "Bold": "1",
+        "Italic": "0",
+        "Outline": "2",
+        "Shadow": "0",
+        "Alignment": "2",
+        "MarginV": "40",
+    },
+    # Movie subtitle style — italic serif with soft shadow, no thick
+    # outline. Looks like the Netflix / Criterion default.
+    "cinematic": {
+        "FontName": "Georgia",
+        "FontSize": "20",
+        "PrimaryColour": "&Heeeeee&",
+        "OutlineColour": "&H000000&",
+        "BackColour": "&H000000&",
+        "Bold": "0",
+        "Italic": "1",
+        "Outline": "1",
+        "Shadow": "2",
+        "Alignment": "2",
+        "MarginV": "40",
+    },
+    # TikTok bold — large Impact-style font with heavy outline so it
+    # pops on busy backgrounds. Reads as ALL CAPS in TikTok native
+    # captions but we don't transform the text here — the SRT content
+    # wins.
+    "tiktok": {
+        "FontName": "Impact",
+        "FontSize": "28",
+        "PrimaryColour": "&Hffffff&",
+        "OutlineColour": "&H000000&",
+        "BackColour": "&H000000&",
+        "Bold": "1",
+        "Italic": "0",
+        "Outline": "4",
+        "Shadow": "0",
+        "Alignment": "2",
+        "MarginV": "60",
+    },
+    # Minimal — thin white sans-serif with a subtle shadow, no outline.
+    # Best for clean / luxe brands where the modern preset is too loud.
+    "minimal": {
+        "FontName": "Arial",
+        "FontSize": "18",
+        "PrimaryColour": "&Hffffff&",
+        "OutlineColour": "&H000000&",
+        "BackColour": "&H000000&",
+        "Bold": "0",
+        "Italic": "0",
+        "Outline": "0",
+        "Shadow": "1",
+        "Alignment": "2",
+        "MarginV": "40",
+    },
+}
+
+DEFAULT_CAPTION_STYLE: CaptionStyle = "modern"
+
+# Font-size override applied on top of a preset's ``FontSize``. Three
+# buckets keep the UI tractable; users who want a specific pt value
+# can edit the SRT or hit /producer/assemble with a custom request.
+CAPTION_FONT_SIZES: dict[str, int] = {
+    "small": 16,
+    "medium": 22,
+    "large": 28,
+}
+
+# Position presets — each maps to an ASS ``Alignment`` (libass numpad)
+# + a ``MarginV`` (pixels from the relevant edge). Bottom-centre is
+# the default for every preset; switching to ``middle`` / ``top``
+# overrides the alignment of the active preset.
+CAPTION_POSITIONS: dict[str, tuple[int, int]] = {
+    "bottom": (2, 40),  # 2 = bottom-centre, 40px from bottom edge
+    "middle": (5, 0),   # 5 = middle-centre, no vertical offset
+    "top": (8, 40),     # 8 = top-centre, 40px from top edge
+}
+
+
+def build_force_style(
+    caption_style: str = DEFAULT_CAPTION_STYLE,
+    font_size: str | None = None,
+    position: str | None = None,
+) -> str:
+    """Return the ffmpeg ``force_style`` argument for a burn-caption preset.
+
+    ``caption_style`` selects a preset from :data:`CAPTION_STYLE_PRESETS`
+    (unknown values fall back to :data:`DEFAULT_CAPTION_STYLE` so a
+    stale renderer never produces an invalid ffmpeg call). ``font_size``
+    and ``position`` are optional overrides — when set they replace the
+    preset's ``FontSize`` and ``Alignment`` / ``MarginV`` respectively.
+    Unknown override values are dropped (the preset's value wins) so
+    the renderer can ship the strings verbatim and trust the helper
+    to clamp.
+
+    The return value is a comma-separated ``Key=Value`` string ready
+    to drop into ``subtitles=<file>:force_style='<...>'``. Callers
+    that inject it into a multi-filter ``-vf`` chain must escape the
+    inner commas (``,`` → ``\\,``) so the lavfi parser doesn't split
+    them as filter separators — :func:`_build_ffmpeg_args` does this.
+
+    Tests live in ``research/tests/test_assembler.py``.
+    """
+    preset = CAPTION_STYLE_PRESETS.get(caption_style)
+    if preset is None:
+        preset = CAPTION_STYLE_PRESETS[DEFAULT_CAPTION_STYLE]
+    style: dict[str, str] = dict(preset)
+
+    if font_size and font_size in CAPTION_FONT_SIZES:
+        style["FontSize"] = str(CAPTION_FONT_SIZES[font_size])
+
+    if position and position in CAPTION_POSITIONS:
+        align, margin_v = CAPTION_POSITIONS[position]
+        style["Alignment"] = str(align)
+        style["MarginV"] = str(margin_v)
+
+    return ",".join(f"{k}={v}" for k, v in style.items())
 
 
 # ─── Public result ──────────────────────────────────────────────────────────
@@ -246,6 +399,7 @@ def _build_ffmpeg_args(
     trim_to: TrimMode,
     video_total_s: float,
     burn_srt_relname: str | None = None,
+    force_style: str | None = None,
 ) -> list[str]:
     """Construct the single-pass ffmpeg command.
 
@@ -256,6 +410,13 @@ def _build_ffmpeg_args(
     caller is responsible for staging the SRT there before invoking
     ffmpeg with that ``cwd``. This separation keeps the args builder
     pure (no copying).
+
+    ``force_style`` (HF-10) is the comma-separated ``Key=Value`` ASS
+    style string returned by :func:`build_force_style`. When set with
+    ``caption_mode="burn"`` it's appended as
+    ``:force_style='<escaped>'`` after the ``subtitles=`` filename.
+    Inner commas are escaped with ``\\,`` so the lavfi parser doesn't
+    split them as filter separators. Ignored in non-burn modes.
     """
     args: list[str] = ["-y", "-fflags", "+genpts"]
     args += ["-f", "concat", "-safe", "0", "-i", str(list_path)]
@@ -305,7 +466,16 @@ def _build_ffmpeg_args(
         # and runs ffmpeg with ``cwd=output_dir`` so this relative
         # filename works on every OS — no path-colon / quote / brace
         # escaping needed for user-supplied source paths.
-        vf_chain += f",subtitles={burn_srt_relname}"
+        subs_part = f"subtitles={burn_srt_relname}"
+        # HF-10: optional force_style preset. Escape inner commas with
+        # ``\,`` so the outer lavfi parser doesn't split them as
+        # filter separators, and wrap the value in single quotes for
+        # belt-and-suspenders compat across older ffmpeg builds whose
+        # filter parsers handle escaping inconsistently.
+        if force_style:
+            escaped_style = force_style.replace(",", r"\,")
+            subs_part += f":force_style='{escaped_style}'"
+        vf_chain += f",{subs_part}"
     args += [
         "-vf",
         vf_chain,
@@ -397,6 +567,9 @@ def assemble_final_mp4(
     audio_mode: AudioMode = "replace",
     trim_to: TrimMode = "video",
     caption_mode: CaptionMode = "soft",
+    caption_style: str = DEFAULT_CAPTION_STYLE,
+    caption_font_size: str | None = None,
+    caption_position: str | None = None,
     runner: Callable | None = None,
 ) -> AssembleResult:
     """Concat scene videos, attach audio + soft subs, write ``final.mp4``.
@@ -404,6 +577,15 @@ def assemble_final_mp4(
     See module docstring for the contract. ``runner`` is injected into
     both ffprobe (via :func:`probe_video_file`) and ffmpeg, so a single
     test fixture can stub the whole stack.
+
+    HF-10: ``caption_style`` selects one of the four burn presets in
+    :data:`CAPTION_STYLE_PRESETS` (only used when ``caption_mode='burn'``;
+    ignored otherwise). ``caption_font_size`` (``small`` / ``medium`` /
+    ``large``) and ``caption_position`` (``bottom`` / ``middle`` /
+    ``top``) are optional overrides that replace the preset's
+    ``FontSize`` and ``Alignment`` / ``MarginV`` respectively. Unknown
+    values fall back to the preset defaults so a stale renderer never
+    breaks the ffmpeg call.
 
     Returns an :class:`AssembleResult`. ``final_path`` is empty on any
     fatal error, with structured warnings explaining why.
@@ -493,6 +675,18 @@ def assemble_final_mp4(
                 staged_srt_path = None
                 burn_srt_relname = None
 
+    # HF-10: build the ASS force_style only when burning. ``soft`` /
+    # ``none`` use the player's native style and the SRT pixel data,
+    # so the preset has no effect — passing it would just bloat the
+    # ffmpeg argv with a no-op.
+    force_style: str | None = None
+    if effective_caption_mode == "burn":
+        force_style = build_force_style(
+            caption_style=caption_style,
+            font_size=caption_font_size,
+            position=caption_position,
+        )
+
     args = _build_ffmpeg_args(
         list_path=list_path,
         output_path=output_path,
@@ -503,6 +697,7 @@ def assemble_final_mp4(
         trim_to=trim_to,
         video_total_s=video_total_s,
         burn_srt_relname=burn_srt_relname,
+        force_style=force_style,
     )
 
     # Burn-in needs cwd=output_dir so the ``subtitles`` filter

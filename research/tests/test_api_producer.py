@@ -3162,3 +3162,181 @@ def test_assemble_route_passes_warnings_through(monkeypatch, tmp_path):
     assert body["video_path"] == ""
     assert any("moov atom not found" in w for w in body["warnings"])
     assert any("audio_path not on disk" in w for w in body["warnings"])
+
+
+# ─── HF-10 — burn caption styling pass-through + AudioOnlyRequest.rate ────
+
+
+def test_assemble_forwards_caption_style_overrides_to_helper(monkeypatch, tmp_path):
+    """The route must forward ``caption_style`` / ``caption_font_size`` /
+    ``caption_position`` verbatim to ``assemble_final_mp4``. Validates
+    the schema → helper bridge so a UI change can't silently drop a
+    field on the floor."""
+    from research.core.pixelle import assembler as assembler_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembler_mod.AssembleResult(
+            final_path=str(kwargs["output_dir"] / "final.mp4"),
+            duration_s=8.0,
+            scene_count=len(kwargs["scene_videos"]),
+            audio_attached=False,
+            captions_attached=True,
+            output_dir=str(kwargs["output_dir"]),
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+
+    out = tmp_path / "out"
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "srt_path": "/tmp/captions.srt",
+            "output_dir": str(out),
+            "caption_mode": "burn",
+            "caption_style": "tiktok",
+            "caption_font_size": "large",
+            "caption_position": "top",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["caption_style"] == "tiktok"
+    assert captured["caption_font_size"] == "large"
+    assert captured["caption_position"] == "top"
+
+
+def test_assemble_caption_style_defaults_when_unset(monkeypatch, tmp_path):
+    """Omitting the HF-10 fields lands on the documented defaults
+    (``modern`` preset, no font / position override). Catches
+    schema-default drift between renderer and backend."""
+    from research.core.pixelle import assembler as assembler_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembler_mod.AssembleResult(
+            final_path=str(kwargs["output_dir"] / "final.mp4"),
+            duration_s=4.0,
+            scene_count=1,
+            audio_attached=False,
+            captions_attached=False,
+            output_dir=str(kwargs["output_dir"]),
+        )
+
+    monkeypatch.setattr(assembler_mod, "assemble_final_mp4", fake_assemble)
+
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "output_dir": str(tmp_path / "out"),
+            # No caption_* fields — exercising the schema defaults.
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["caption_style"] == "modern"
+    assert captured["caption_font_size"] is None
+    assert captured["caption_position"] is None
+
+
+def test_assemble_rejects_unknown_caption_style():
+    """Defence-in-depth — an out-of-band style value must 422.
+    Mirrors the existing unknown-caption_mode coverage so the four
+    presets are the contract."""
+    r = client.post(
+        "/producer/assemble",
+        json={
+            "scene_videos": ["/tmp/a.mp4"],
+            "caption_mode": "burn",
+            "caption_style": "ferrari-red",  # not in the Literal whitelist
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_audio_accepts_rate_and_applies_it_on_adapter(monkeypatch, tmp_path):
+    """HF-10 — ``rate`` flows from the request into the adapter's
+    ``rate`` attribute on both the per-scene and single-pass paths.
+    This test exercises the single-pass path (no scene_narrations);
+    the per-scene path is exercised by /producer/audio's
+    scene_narrations integration tests."""
+    captured: dict[str, Any] = {}
+
+    class FakeRateAdapter:
+        name = "fake-edge-rate"
+        rate = "+0%"
+        volume = "+0%"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["rate_at_synth"] = self.rate
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=2.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[WordBoundary(start_s=0.0, end_s=1.0, text="ok")],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeRateAdapter)
+
+    out = tmp_path / "audio-out-rate"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "voice": "en-US-AriaNeural",
+            "output_dir": str(out),
+            "rate": "+25%",
+        },
+    )
+    assert r.status_code == 200, r.text
+    # The route set the adapter's ``rate`` attribute BEFORE calling
+    # synthesize_with_timing, so the captured value reflects what
+    # edge-tts would actually use at synthesis time.
+    assert captured["rate_at_synth"] == "+25%"
+
+
+def test_audio_rate_defaults_to_plus_zero_percent_when_omitted(monkeypatch, tmp_path):
+    """Omitting ``rate`` must NOT crash and must leave the adapter's
+    own default in place (the schema's documented default is "+0%",
+    matching edge-tts's native cadence)."""
+    captured: dict[str, Any] = {}
+
+    class FakeRateAdapter:
+        name = "fake-edge-default-rate"
+        rate = "+0%"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["rate_at_synth"] = self.rate
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=2.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[WordBoundary(start_s=0.0, end_s=1.0, text="ok")],
+            )
+
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", FakeRateAdapter)
+
+    out = tmp_path / "audio-out-default-rate"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "voice": "en-US-AriaNeural",
+            "output_dir": str(out),
+            # No rate field — exercises the schema default.
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["rate_at_synth"] == "+0%"

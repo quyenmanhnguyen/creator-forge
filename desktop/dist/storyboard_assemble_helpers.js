@@ -126,6 +126,21 @@
     const CAPTION_MODES = ['soft', 'burn', 'none'];
     const DEFAULT_CAPTION_MODE = 'soft';
 
+    // HF-10 — burn caption styling whitelists. Kept 1:1 in sync with
+    // ``research/core/pixelle/assembler.py:CAPTION_STYLE_PRESETS`` and
+    // the ``CaptionStyle`` / ``CaptionFontSize`` / ``CaptionPosition``
+    // Literals on ``research/api/routes/producer.py:AssembleRequest``.
+    // If any of those drift this list must drift with them — the
+    // ``test_storyboard_assemble_helpers.js`` round-trip tests catch
+    // mismatches. The font-size + position lists deliberately omit
+    // empty string ('preset default') because the wire schema uses
+    // ``null`` for that case; the helper coerces the UI's empty
+    // string to ``null`` before serialising.
+    const CAPTION_STYLES = ['modern', 'cinematic', 'tiktok', 'minimal'];
+    const DEFAULT_CAPTION_STYLE = 'modern';
+    const CAPTION_FONT_SIZES = ['small', 'medium', 'large'];
+    const CAPTION_POSITIONS = ['bottom', 'middle', 'top'];
+
     /**
      * Build the JSON body for POST /producer/assemble from form
      * inputs. Empty string fields collapse to `null` to match the
@@ -142,6 +157,17 @@
      * @param {string} [form.captionMode] - one of 'soft' (default,
      *   mov_text track), 'burn' (PR-32, rendered into video), 'none'
      *   (drop srt). Unknown values fall back to 'soft'.
+     * @param {string} [form.captionStyle] - HF-10 burn preset name
+     *   ('modern' / 'cinematic' / 'tiktok' / 'minimal'). Only emitted
+     *   when ``captionMode === 'burn'``; unknown values fall back to
+     *   ``DEFAULT_CAPTION_STYLE`` so a stale UI never produces a 422.
+     * @param {string} [form.captionFontSize] - HF-10 font-size
+     *   override ('small' / 'medium' / 'large') or empty string for
+     *   the preset default. Empty / unknown values map to ``null``
+     *   on the wire.
+     * @param {string} [form.captionPosition] - HF-10 vertical-position
+     *   override ('bottom' / 'middle' / 'top') or empty string for
+     *   the preset default. Empty / unknown values map to ``null``.
      * @returns {object}
      */
     function buildAssemblePayload(form) {
@@ -161,7 +187,7 @@
             ? f.captionMode
             : DEFAULT_CAPTION_MODE;
 
-        return {
+        const payload = {
             scene_videos: cleaned,
             audio_path: blankToNull(f.audioPath),
             srt_path: blankToNull(f.srtPath),
@@ -170,6 +196,25 @@
             trim_to: (f.trimTo === 'audio') ? 'audio' : 'video',
             caption_mode: captionMode,
         };
+
+        // HF-10 — burn-only styling fields. Only sent when the user
+        // actually picked ``burn`` so the wire payload stays minimal
+        // for the common ``soft`` / ``none`` paths. Unknown values
+        // collapse to the default preset / null so a stale renderer
+        // never produces a 422.
+        if (captionMode === 'burn') {
+            payload.caption_style = CAPTION_STYLES.includes(f.captionStyle)
+                ? f.captionStyle
+                : DEFAULT_CAPTION_STYLE;
+            payload.caption_font_size = CAPTION_FONT_SIZES.includes(f.captionFontSize)
+                ? f.captionFontSize
+                : null;
+            payload.caption_position = CAPTION_POSITIONS.includes(f.captionPosition)
+                ? f.captionPosition
+                : null;
+        }
+
+        return payload;
     }
 
     /**
@@ -204,6 +249,10 @@
         SUPPORTED_VIDEO_EXTS,
         CAPTION_MODES,
         DEFAULT_CAPTION_MODE,
+        CAPTION_STYLES,
+        DEFAULT_CAPTION_STYLE,
+        CAPTION_FONT_SIZES,
+        CAPTION_POSITIONS,
         parseSceneVideoPaths,
         pullScenePathsFromBatch,
         buildAssemblePayload,

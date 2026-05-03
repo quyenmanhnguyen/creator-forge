@@ -258,6 +258,163 @@ test("validateAssembleForm: 1 scene + audio override is fine", () => {
     assert.strictEqual(v.reason, "");
 });
 
+// ─── HF-10 — burn caption styling ──────────────────────────────────────────
+//
+// The renderer-side whitelist + ``buildAssemblePayload`` must agree
+// with the backend's ``CAPTION_STYLE_PRESETS`` / ``CaptionFontSize``
+// / ``CaptionPosition`` Literals. These tests pin the contract:
+//
+//   * The four constants exist and contain the documented values.
+//   * Burn payloads include caption_style + caption_font_size +
+//     caption_position fields (non-burn omits them entirely).
+//   * Unknown style / font-size / position values fall back to the
+//     default / null so a stale renderer never produces a 422.
+//   * ``DEFAULT_CAPTION_STYLE`` matches the backend's default
+//     ("modern").
+
+test("CAPTION_STYLES whitelist matches backend's CaptionStyle Literal", () => {
+    // ``research/core/pixelle/assembler.py:CAPTION_STYLE_PRESETS`` keys
+    // are the source of truth — keep this list in lock-step.
+    assert.deepStrictEqual(
+        [...helpers.CAPTION_STYLES].sort(),
+        ["cinematic", "minimal", "modern", "tiktok"],
+    );
+});
+
+test("CAPTION_FONT_SIZES whitelist exposes small / medium / large", () => {
+    assert.deepStrictEqual(
+        [...helpers.CAPTION_FONT_SIZES].sort(),
+        ["large", "medium", "small"],
+    );
+});
+
+test("CAPTION_POSITIONS whitelist exposes bottom / middle / top", () => {
+    assert.deepStrictEqual(
+        [...helpers.CAPTION_POSITIONS].sort(),
+        ["bottom", "middle", "top"],
+    );
+});
+
+test("DEFAULT_CAPTION_STYLE matches backend default ('modern')", () => {
+    // The backend's AssembleRequest.caption_style defaults to "modern".
+    assert.strictEqual(helpers.DEFAULT_CAPTION_STYLE, "modern");
+});
+
+test("buildAssemblePayload: burn mode includes caption_style + font_size + position fields", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        srtPath: "/tmp/captions.srt",
+        captionMode: "burn",
+        captionStyle: "tiktok",
+        captionFontSize: "large",
+        captionPosition: "top",
+    });
+    assert.strictEqual(payload.caption_mode, "burn");
+    assert.strictEqual(payload.caption_style, "tiktok");
+    assert.strictEqual(payload.caption_font_size, "large");
+    assert.strictEqual(payload.caption_position, "top");
+});
+
+test("buildAssemblePayload: burn mode without overrides defaults to modern + null overrides", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "burn",
+        // No captionStyle/FontSize/Position — exercise defaults.
+    });
+    assert.strictEqual(payload.caption_style, "modern");
+    assert.strictEqual(payload.caption_font_size, null);
+    assert.strictEqual(payload.caption_position, null);
+});
+
+test("buildAssemblePayload: soft mode omits the caption_style fields entirely", () => {
+    // Wire-payload minimisation — the backend's AssembleRequest
+    // ignores caption_style for non-burn modes anyway, so sending
+    // them just bloats the request. Confirm the helper drops them.
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "soft",
+        captionStyle: "tiktok",
+        captionFontSize: "large",
+        captionPosition: "top",
+    });
+    assert.strictEqual(payload.caption_mode, "soft");
+    assert.strictEqual("caption_style" in payload, false);
+    assert.strictEqual("caption_font_size" in payload, false);
+    assert.strictEqual("caption_position" in payload, false);
+});
+
+test("buildAssemblePayload: 'none' caption mode also omits the styling fields", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "none",
+        captionStyle: "tiktok",
+    });
+    assert.strictEqual(payload.caption_mode, "none");
+    assert.strictEqual("caption_style" in payload, false);
+});
+
+test("buildAssemblePayload: invalid captionStyle in burn mode falls back to default", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "burn",
+        captionStyle: "ferrari-red",
+    });
+    assert.strictEqual(payload.caption_style, helpers.DEFAULT_CAPTION_STYLE);
+});
+
+test("buildAssemblePayload: invalid captionFontSize in burn mode collapses to null", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "burn",
+        captionFontSize: "huge",
+    });
+    assert.strictEqual(payload.caption_font_size, null);
+});
+
+test("buildAssemblePayload: invalid captionPosition in burn mode collapses to null", () => {
+    const payload = helpers.buildAssemblePayload({
+        scenePaths: ["/tmp/a.mp4"],
+        captionMode: "burn",
+        captionPosition: "diagonal",
+    });
+    assert.strictEqual(payload.caption_position, null);
+});
+
+test("buildAssemblePayload: every CAPTION_STYLE round-trips intact when burn is selected", () => {
+    // Pin the whitelist contract — if a future change adds a key it
+    // must propagate through buildAssemblePayload too.
+    for (const style of helpers.CAPTION_STYLES) {
+        const payload = helpers.buildAssemblePayload({
+            scenePaths: ["/tmp/a.mp4"],
+            captionMode: "burn",
+            captionStyle: style,
+        });
+        assert.strictEqual(
+            payload.caption_style, style,
+            `caption_style '${style}' should round-trip but became '${payload.caption_style}'`,
+        );
+    }
+});
+
+test("buildAssemblePayload: every CAPTION_FONT_SIZE / CAPTION_POSITION round-trips when burn", () => {
+    for (const size of helpers.CAPTION_FONT_SIZES) {
+        const payload = helpers.buildAssemblePayload({
+            scenePaths: ["/tmp/a.mp4"],
+            captionMode: "burn",
+            captionFontSize: size,
+        });
+        assert.strictEqual(payload.caption_font_size, size);
+    }
+    for (const pos of helpers.CAPTION_POSITIONS) {
+        const payload = helpers.buildAssemblePayload({
+            scenePaths: ["/tmp/a.mp4"],
+            captionMode: "burn",
+            captionPosition: pos,
+        });
+        assert.strictEqual(payload.caption_position, pos);
+    }
+});
+
 // ─── runner ────────────────────────────────────────────────────────────────
 
 let pass = 0;
