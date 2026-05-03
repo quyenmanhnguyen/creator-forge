@@ -57,11 +57,13 @@ from research.core.pixelle import (
     group_word_boundaries,
     list_provider_specs,
     make_short,
+    scale_captions_to_duration,
     serialize_breakdown_md,
 )
 from research.core.pixelle.video_probe import (
     MIN_FINAL_MP4_BYTES,
     MIN_USABLE_VIDEO_BYTES,
+    probe_video_file,
     validate_video_output,
 )
 from research.core.pixelle.voices import VOICES, voice_short_names, voices_for_provider
@@ -937,6 +939,57 @@ def compose_short(req: ShortRequest) -> ShortResponse:
 # duplication is cheaper than the coupling a helper would introduce.
 
 
+def _sum_scene_video_duration(
+    scene_videos: list[str], *, warnings: list[str]
+) -> float:
+    """Sum video-stream durations for ``scene_videos`` via ffprobe.
+
+    Used by ``/producer/audio`` to auto-scale captions so the SRT
+    covers the assembled video. Robust-failure: a missing / unreadable
+    / un-probable file appends a warning and is skipped, matching the
+    rest of the route's contract.
+
+    Returns 0.0 when ``scene_videos`` is empty or no probe yielded a
+    usable duration — caller treats that as "no scaling".
+    """
+    total = 0.0
+    if not scene_videos:
+        return 0.0
+    for raw in scene_videos:
+        path = (raw or "").strip()
+        if not path:
+            continue
+        try:
+            probe = probe_video_file(path)
+        except Exception as exc:  # noqa: BLE001 — never let the route 500.
+            warnings.append(
+                f"Scene video probe failed for {path!r}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if not probe.exists:
+            warnings.append(f"Scene video missing: {path}")
+            continue
+        # Prefer the video stream duration over the container duration —
+        # mov_text subs / silent audio padding can extend the container
+        # beyond the actual visual length.
+        dur = (
+            probe.video_stream_duration_sec
+            if probe.video_stream_duration_sec is not None
+            else probe.duration_sec
+        )
+        if dur is None or dur <= 0:
+            if not probe.ffprobe_available:
+                warnings.append(
+                    f"ffprobe not available — cannot measure {path}, "
+                    "captions will not be scaled."
+                )
+            else:
+                warnings.append(f"ffprobe returned no duration for {path}.")
+            continue
+        total += float(dur)
+    return total
+
+
 def _default_audio_output_dir() -> Path:
     """Per-call output dir for audio-only renders.
 
@@ -985,9 +1038,55 @@ class AudioOnlyRequest(BaseModel):
         True,
         description="Write a sibling captions.srt next to the audio file.",
     )
+    # PR-A — auto-sync SRT timing to the assembled video. Renderer fills
+    # ``scene_videos`` from the settled rows of the I2V/Veo3 batch above
+    # the Compose panel; the route probes them with ffprobe and uses the
+    # summed video-stream duration to scale captions so the soft-subs
+    # cover the full visual track even if the TTS audio is shorter or
+    # longer. ``target_duration_s`` is an explicit override (e.g. when
+    # the user wants captions to fit a custom length); when both are
+    # set the explicit value wins.
+    scene_videos: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional absolute paths to per-scene mp4/mov/m4v/webm clips. "
+            "When non-empty the route runs ffprobe on each file, sums the "
+            "video-stream durations, and scales the captions so the last "
+            "caption ends exactly at that duration. Missing/unreadable "
+            "files are skipped with a warning instead of failing the "
+            "request. When ``target_duration_s`` is also set, the explicit "
+            "value wins."
+        ),
+    )
+    target_duration_s: float | None = Field(
+        None,
+        ge=0.0,
+        description=(
+            "Explicit override for SRT timing. When > 0, captions are "
+            "linearly scaled so the last caption ends at exactly this many "
+            "seconds — useful when the user wants the SRT to fit a video "
+            "of known length. When 0 / null, falls back to the summed "
+            "duration of ``scene_videos`` (if any) or no scaling at all."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+    @field_validator("scene_videos", mode="before")
+    @classmethod
+    def _strip_scene_videos(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    cleaned.append(stripped)
+            elif item is not None:
+                cleaned.append(str(item))
+        return cleaned
 
 
 class AudioOnlyResponse(BaseModel):
@@ -1002,6 +1101,12 @@ class AudioOnlyResponse(BaseModel):
     output_dir: str
     warnings: list[str] = []
     notes: str = ""
+    # PR-A — surfaced so the renderer can show "captions scaled to Ns"
+    # without having to compare audio_duration vs scene_videos
+    # client-side. Both fields default to "no scaling happened" so old
+    # responses (pre-PR-A clients) keep parsing.
+    target_duration_s: float = 0.0
+    captions_scaled: bool = False
 
 
 @router.post("/audio", response_model=AudioOnlyResponse)
@@ -1094,6 +1199,47 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         logger.warning(msg)
         warnings.append(msg)
 
+    # PR-A — auto-sync SRT timing to the assembled video. Resolve the
+    # target duration before serialising to .srt so the file on disk
+    # already reflects the scaling. ``target_duration_s`` (explicit
+    # override) wins over ffprobe-derived ``scene_videos`` when both
+    # are set.
+    target_duration_s = 0.0
+    if req.target_duration_s and req.target_duration_s > 0:
+        target_duration_s = float(req.target_duration_s)
+    elif req.scene_videos:
+        target_duration_s = _sum_scene_video_duration(
+            req.scene_videos, warnings=warnings
+        )
+
+    captions_scaled = False
+    if target_duration_s > 0 and captions:
+        # Stretch / compress the existing captions linearly. If TTS
+        # never produced timed captions but we have a script + target,
+        # fall back to a sentence split spread across the target so the
+        # video still has subtitles.
+        captions = scale_captions_to_duration(captions, target_duration_s)
+        captions_scaled = True
+    elif target_duration_s > 0 and not captions:
+        try:
+            captions = fallback_captions_from_text(
+                script, audio_duration_s=target_duration_s
+            )
+            if captions:
+                caption_source = "sentence_fallback"
+                captions_scaled = True
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"Caption auto-fit fallback failed: {type(exc).__name__}: {exc}"
+            )
+
+    if target_duration_s > 0 and duration_s > target_duration_s + 0.05:
+        warnings.append(
+            f"Narration audio is {duration_s:.2f}s but target is "
+            f"{target_duration_s:.2f}s — captions were compressed to fit "
+            "the shorter video. Consider trimming the script."
+        )
+
     written_srt: Path | None = None
     if req.write_srt and captions:
         try:
@@ -1117,6 +1263,8 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         caption_source=caption_source,
         output_dir=str(output_dir),
         warnings=warnings,
+        target_duration_s=round(target_duration_s, 3),
+        captions_scaled=captions_scaled,
     )
 
 

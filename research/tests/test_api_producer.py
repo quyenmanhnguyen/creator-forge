@@ -2012,6 +2012,271 @@ def test_audio_default_output_dir_uses_audio_prefix(monkeypatch, tmp_path):
     assert sentinel.exists()
 
 
+# ─── /producer/audio — PR-A (target_duration_s + scene_videos auto-fit) ────
+
+
+def _fake_word_adapter(audio_secs: float, words: list[tuple[float, float, str]]):
+    """Build a fake TTS adapter that returns deterministic word boundaries."""
+
+    class FakeAdapter:
+        name = "fake-edge"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=audio_secs,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[
+                    WordBoundary(start_s=s, end_s=e, text=t) for s, e, t in words
+                ],
+            )
+
+    return FakeAdapter
+
+
+def test_audio_target_duration_scales_captions_in_srt(monkeypatch, tmp_path):
+    """Explicit ``target_duration_s`` stretches captions linearly."""
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=5.0,
+            words=[
+                (0.0, 1.0, "first"),
+                (1.0, 2.0, "second"),
+                (2.0, 3.0, "third."),
+                (3.0, 4.0, "fourth."),
+                (4.0, 5.0, "fifth."),
+            ],
+        ),
+    )
+    out = tmp_path / "audio-target"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(out),
+            "target_duration_s": 10.0,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["captions_scaled"] is True
+    assert body["target_duration_s"] == 10.0
+    assert body["caption_source"] == "word_boundaries"
+    # SRT was written and the last caption should end at exactly the
+    # target — verify by reading the file off disk.
+    srt = (out / "captions.srt").read_text(encoding="utf-8")
+    # Last cue is rendered as ``HH:MM:SS,mmm --> HH:MM:SS,mmm``.
+    last_cue = [line for line in srt.splitlines() if "-->" in line][-1]
+    assert last_cue.split(" --> ")[1].startswith("00:00:10,000"), last_cue
+
+
+def test_audio_scene_videos_drive_target_via_ffprobe(monkeypatch, tmp_path):
+    """When ``scene_videos`` is supplied and ``target_duration_s`` isn't,
+    the route runs ffprobe on each path, sums durations, and uses that
+    as the auto-fit target."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    # Stub probe_video_file: each scene reports 4s of video (12s total).
+    def fake_probe(file_path, **kwargs):
+        return VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=4.5,
+            video_stream_duration_sec=4.0,  # video stream wins over container
+            has_video_stream=True,
+            width=720,
+            height=1280,
+            codec="h264",
+        )
+
+    monkeypatch.setattr(producer_route, "probe_video_file", fake_probe)
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=6.0,
+            words=[
+                (0.0, 2.0, "alpha"),
+                (2.0, 4.0, "beta"),
+                (4.0, 6.0, "gamma."),
+            ],
+        ),
+    )
+
+    out = tmp_path / "audio-scene-videos"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(out),
+            "scene_videos": [
+                "/abs/path/shot1.mp4",
+                "/abs/path/shot2.mp4",
+                "/abs/path/shot3.mp4",
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["captions_scaled"] is True
+    # 3 scenes × 4.0s each.
+    assert body["target_duration_s"] == 12.0
+    last_cue = [
+        line for line in (out / "captions.srt").read_text("utf-8").splitlines()
+        if "-->" in line
+    ][-1]
+    assert last_cue.split(" --> ")[1].startswith("00:00:12,000")
+
+
+def test_audio_target_duration_overrides_scene_videos(monkeypatch, tmp_path):
+    """Explicit ``target_duration_s`` wins over the ``scene_videos`` sum."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=1024,
+            ffprobe_available=True,
+            duration_sec=20.0,
+            video_stream_duration_sec=20.0,
+            has_video_stream=True,
+        ),
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=2.0,
+            words=[(0.0, 1.0, "x"), (1.0, 2.0, "y.")],
+        ),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-override"),
+            "scene_videos": ["/foo.mp4"],
+            "target_duration_s": 7.5,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_duration_s"] == 7.5
+    assert body["captions_scaled"] is True
+
+
+def test_audio_missing_scene_video_warns_and_skips(monkeypatch, tmp_path):
+    """A missing scene video is dropped with a warning, not a 500.
+
+    When every entry is missing the fallback target is 0 and no scaling
+    happens — the response still carries audio + native-length captions."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(exists=False, size=0, ffprobe_available=True),
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=4.0,
+            words=[(0.0, 2.0, "hi"), (2.0, 4.0, "there.")],
+        ),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-missing"),
+            "scene_videos": ["/does/not/exist.mp4"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["captions_scaled"] is False
+    assert body["target_duration_s"] == 0.0
+    assert any(
+        "Scene video missing" in w or "ffprobe" in w for w in body["warnings"]
+    )
+
+
+def test_audio_warns_when_narration_longer_than_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=12.0,
+            words=[
+                (0.0, 4.0, "long"),
+                (4.0, 8.0, "long"),
+                (8.0, 12.0, "audio."),
+            ],
+        ),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-too-long"),
+            "target_duration_s": 6.0,
+        },
+    )
+    body = r.json()
+    assert body["captions_scaled"] is True
+    assert body["target_duration_s"] == 6.0
+    assert any("Narration audio is" in w for w in body["warnings"])
+
+
+def test_audio_scene_videos_strip_whitespace_and_empties():
+    """The ``scene_videos`` validator must drop blanks before reaching
+    the route logic — mirrors the assemble-side contract.
+    """
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "scene_videos": ["", "  ", "  /x.mp4  ", "\n"],
+            # No target -> if ffprobe isn't on the runner, the route
+            # still returns 200 with warnings (no scaling). We're only
+            # checking the request schema accepts the noisy input.
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_audio_pre_pr_a_request_unchanged(monkeypatch, tmp_path):
+    """Old clients that don't send ``scene_videos`` / ``target_duration_s``
+    must observe the exact same behaviour as before — no scaling, no
+    extra warnings, ``captions_scaled=False``."""
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=3.0,
+            words=[(0.0, 1.0, "hi"), (1.0, 2.0, "there"), (2.0, 3.0, "now.")],
+        ),
+    )
+    r = client.post(
+        "/producer/audio",
+        json={"script": AUDIO_SCRIPT, "output_dir": str(tmp_path / "legacy")},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["captions_scaled"] is False
+    assert body["target_duration_s"] == 0.0
+
+
 # ─── /producer/assemble — PR-31 (concat scene videos + audio + soft subs) ───
 #
 # These tests stub ``assembler.assemble_final_mp4`` (and its underlying

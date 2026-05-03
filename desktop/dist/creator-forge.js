@@ -1101,39 +1101,48 @@
         }
     }
 
-    // PR-30 — selected output mode for the Compose panel. ``short`` is
-    // the original /producer/short flow (TTS + visuals + 9:16 mp4);
-    // ``audio`` is the new /producer/audio flow (TTS + captions only,
-    // no ffmpeg). Read by ``runComposeShort`` to route to the right
-    // IPC channel + payload.
-    function psCurrentMode() {
-        const sel = $('ps-mode');
-        const v = (sel && sel.value) || 'short';
-        return v === 'audio' ? 'audio' : 'short';
+    // PR-A — Compose panel is /producer/audio only. The legacy
+    // /producer/short flow (TTS + visuals + 9:16 mp4) was retired
+    // because the I2V/Veo3 batch + Video Assembly panel now produce
+    // real per-scene visuals; the route still lives in the sidecar for
+    // back-compat and tests but is no longer reachable from the UI.
+
+    /**
+     * Pull settled scene-video paths from ``sbbState.videoRows`` and
+     * paint a short summary in the Compose panel's reference field. The
+     * path list is what ``runComposeShort`` will send to /producer/audio
+     * as ``scene_videos[]`` so the SRT timing is auto-fit to the
+     * assembled video. Idempotent — safe to call from anywhere
+     * sbbState.videoRows mutates.
+     */
+    function psRefreshReferenceVideos() {
+        const helpers = paHelpers();
+        let paths = [];
+        if (helpers && typeof helpers.pullScenePathsFromBatch === 'function') {
+            paths = helpers.pullScenePathsFromBatch(sbbState && sbbState.videoRows);
+        }
+        const summary = $('ps-reference-summary');
+        if (summary) {
+            if (!paths.length) {
+                summary.value = '';
+                summary.placeholder = 'no scene videos yet — generate the Video batch above to enable auto-fit';
+            } else {
+                summary.value = `${paths.length} scene video${paths.length === 1 ? '' : 's'} ready — captions will auto-fit their summed duration (override below).`;
+            }
+        }
+        return paths;
     }
 
-    function psApplyComposeMode() {
-        const mode = psCurrentMode();
-        // Hide form fields tagged for a different mode (today only the
-        // Style picker is short-only — Voice / TTS provider / Output
-        // dir / Write captions / Script all apply in both modes).
-        const form = document.querySelector('[data-form="compose-short"]');
-        if (form) {
-            form.querySelectorAll('[data-ps-mode-show]').forEach((el) => {
-                const want = el.getAttribute('data-ps-mode-show');
-                el.style.display = (want === mode) ? '' : 'none';
-            });
+    async function composeRefreshReference() {
+        const paths = psRefreshReferenceVideos();
+        const target = $('ps-result');
+        if (target) {
+            if (paths.length === 0) {
+                target.innerHTML = `<div class="info">No settled video rows found. Generate the Video batch above first; ffprobe needs at least one mp4/mov/m4v/webm to scale the SRT.</div>`;
+            } else {
+                target.innerHTML = `<div class="info">Compose audio will scale captions to fit ${paths.length} scene video${paths.length === 1 ? '' : 's'} (auto-fit). Override via the "Target duration" field above.</div>`;
+            }
         }
-        // Reflect the active route in the panel header pill so the user
-        // can see at a glance which sidecar endpoint will be hit.
-        const pill = $('ps-mode-pill');
-        if (pill) pill.textContent = (mode === 'audio') ? '/producer/audio' : '/producer/short';
-        // Button label: 'Compose short' vs 'Compose audio'. The
-        // ``data-run="compose-short"`` attribute stays the same so the
-        // existing click delegate keeps working (the handler reads the
-        // mode at click time).
-        const btn = $('ps-run-btn');
-        if (btn) btn.textContent = (mode === 'audio') ? 'Compose audio' : 'Compose short';
     }
 
     async function runComposeShort() {
@@ -1142,7 +1151,10 @@
             showError('ps-result', { status: 422, message: 'Paste a script (or copy from Storyboard above).' });
             return;
         }
-        const mode = psCurrentMode();
+        if (!api.producer || typeof api.producer.composeAudio !== 'function') {
+            showError('ps-result', { status: 0, message: 'electronAPI.producer.composeAudio is unavailable — desktop shell needs PR-30 preload.' });
+            return;
+        }
         const params = {
             script,
             // PR-23: tts_provider lets the user pick Piper (offline) over
@@ -1154,29 +1166,25 @@
         };
         const outDir = asNonEmpty($('ps-output-dir').value);
         if (outDir) params.output_dir = outDir;
-        if (mode === 'audio') {
-            // /producer/audio rejects unknown extra fields softly (it
-            // just ignores ``style``) but we drop it to keep the wire
-            // payload tight.
-            if (!api.producer || typeof api.producer.composeAudio !== 'function') {
-                showError('ps-result', { status: 0, message: 'electronAPI.producer.composeAudio is unavailable — desktop shell needs PR-30 preload.' });
-                return;
-            }
-            showLoading('ps-result', 'Rendering TTS audio (this usually takes a few seconds)...');
-            try {
-                const data = await api.producer.composeAudio(params);
-                renderComposeAudio(data);
-            } catch (err) {
-                showError('ps-result', err);
-            }
-            return;
+        // PR-A — auto-sync SRT to the assembled video. Always send the
+        // settled scene videos so the sidecar can ffprobe-sum their
+        // durations; an explicit numeric ``Target duration override``
+        // wins (skips ffprobe and uses the literal seconds).
+        const sceneVideos = psRefreshReferenceVideos();
+        if (sceneVideos.length) params.scene_videos = sceneVideos;
+        const targetRaw = ($('ps-target-duration') && $('ps-target-duration').value) || '';
+        const target = parseFloat(targetRaw);
+        if (Number.isFinite(target) && target > 0) {
+            params.target_duration_s = target;
         }
-        // mode === 'short' — original flow, unchanged.
-        params.style = $('ps-style').value || 'violet-pink';
-        showLoading('ps-result', 'Rendering TTS + captions + 9:16 mp4 (this can take 10–60s)...');
+        showLoading('ps-result', 'Rendering TTS audio (this usually takes a few seconds)...');
         try {
-            const data = await api.producer.composeShort(params);
-            renderComposeShort(data);
+            const data = await api.producer.composeAudio(params);
+            renderComposeAudio(data);
+            // PR-A — auto-fill the Video Assembly panel below the moment
+            // the audio + SRT exist on disk so the user can just press
+            // "Assemble final MP4" without copy-pasting paths.
+            paAutoFillFromAudioResult(data);
         } catch (err) {
             showError('ps-result', err);
         }
@@ -1189,6 +1197,13 @@
         const d = data || {};
         const fmt = (d.audio_format === 'wav') ? 'wav' : 'mp3';
         let html = '';
+        // PR-A — surface the auto-fit target so the user can confirm at
+        // a glance whether the SRT was scaled to a scene-video duration
+        // or left at native TTS timing.
+        const targetSecs = Number(d.target_duration_s) || 0;
+        const scaledLabel = d.captions_scaled
+            ? `auto-fit · ${targetSecs.toFixed(2)}s`
+            : 'native TTS timing';
         html += `<div class="stats-row">
             <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
             <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
@@ -1196,6 +1211,7 @@
             <span>Format<b>${escapeHtml(fmt)}</b></span>
             <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
             <span>Caption source<b>${escapeHtml(d.caption_source || 'none')}</b></span>
+            <span>SRT timing<b>${escapeHtml(scaledLabel)}</b></span>
         </div>`;
         const paths = [
             [`voice.${fmt}`, d.audio_path],
@@ -1227,6 +1243,13 @@
 
     // Read every form input into a single object so the helpers can
     // build the POST body (and the validator can mirror it).
+    //
+    // PR-A — the ``Audio mode`` / ``Trim to`` / ``Caption mode``
+    // dropdowns were removed from the UI: ``replace`` + ``video`` +
+    // ``soft`` cover ~100% of the supported workflow and are pinned
+    // here so the renderer always sends the documented defaults.
+    // Power users can still hit /producer/assemble directly with the
+    // other values via the wire API.
     function paReadForm() {
         const sceneText = ($('pa-scene-videos') && $('pa-scene-videos').value) || '';
         const helpers = paHelpers();
@@ -1238,10 +1261,50 @@
             audioPath: ($('pa-audio-path') && $('pa-audio-path').value) || '',
             srtPath: ($('pa-srt-path') && $('pa-srt-path').value) || '',
             outputDir: ($('pa-output-dir') && $('pa-output-dir').value) || '',
-            audioMode: ($('pa-audio-mode') && $('pa-audio-mode').value) || 'replace',
-            trimTo: ($('pa-trim-to') && $('pa-trim-to').value) || 'video',
-            captionMode: ($('pa-caption-mode') && $('pa-caption-mode').value) || 'soft',
+            audioMode: 'replace',
+            trimTo: 'video',
+            captionMode: 'soft',
         };
+    }
+
+    // PR-A — track whether the user manually edited the scene-videos
+    // textarea since the last auto-fill. We set it ``true`` on every
+    // user-typed input so that subsequent video-batch settles do NOT
+    // overwrite their hand-edits. ``Refresh from Video batch`` clears
+    // the flag and re-pulls.
+    let paScenesUserEdited = false;
+
+    /**
+     * Repaint the scene-videos textarea from the current ``videoRows``
+     * unless the user has hand-edited the box. Called from
+     * ``sbbRepaintVideo`` so newly-settled rows show up immediately.
+     */
+    function paAutoFillScenesFromBatch() {
+        if (paScenesUserEdited) return;
+        const helpers = paHelpers();
+        const ta = $('pa-scene-videos');
+        if (!helpers || !ta) return;
+        const paths = helpers.pullScenePathsFromBatch(
+            sbbState && sbbState.videoRows,
+        );
+        const next = paths.join('\n');
+        // Only mutate when something changes — avoids stomping on the
+        // cursor / scroll position when the user is mid-paste.
+        if (ta.value !== next) ta.value = next;
+    }
+
+    /**
+     * PR-A — auto-populate the narration audio + SRT inputs from the
+     * /producer/audio response so the user can press Assemble without
+     * a copy-paste. Skips silently when the response carries no audio
+     * (e.g. TTS failed; the warnings already surface that).
+     */
+    function paAutoFillFromAudioResult(data) {
+        if (!data || typeof data !== 'object') return;
+        const audioInput = $('pa-audio-path');
+        if (audioInput && data.audio_path) audioInput.value = data.audio_path;
+        const srtInput = $('pa-srt-path');
+        if (srtInput && data.srt_path) srtInput.value = data.srt_path;
     }
 
     async function paPickAudioFile() {
@@ -1282,6 +1345,9 @@
         const paths = helpers.pullScenePathsFromBatch(sbbState.videoRows);
         const ta = $('pa-scene-videos');
         if (ta) ta.value = paths.join('\n');
+        // Manual refresh re-arms the auto-fill so subsequent batch settles
+        // keep the textarea in lock-step until the user edits it again.
+        paScenesUserEdited = false;
         if (target) {
             if (paths.length === 0) {
                 target.innerHTML = `<div class="info">No settled video rows found. Generate the Video batch first, or check that rows have a saved file path.</div>`;
@@ -1366,35 +1432,11 @@
         $('pa-result').innerHTML = html;
     }
 
-    function renderComposeShort(data) {
-        const d = data || {};
-        let html = '';
-        html += `<div class="stats-row">
-            <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
-            <span>Voice<b>${escapeHtml(d.voice || '')}</b></span>
-            <span>Engine<b>${escapeHtml(d.engine || '')}</b></span>
-            <span>Style<b>${escapeHtml(d.style || '')}</b></span>
-            <span>Captions<b>${escapeHtml(d.captions_count || 0)}</b></span>
-            <span>Caption source<b>${escapeHtml(d.caption_source || 'none')}</b></span>
-        </div>`;
-        const paths = [
-            ['mp4', d.mp4_path],
-            ['voice.mp3', d.audio_path],
-            ['captions.srt', d.srt_path],
-        ].filter(([, p]) => !!p);
-        if (paths.length) {
-            html += `<div class="scene-card"><div class="scene-title">Output files</div>`;
-            paths.forEach(([label, p]) => {
-                html += `<div class="scene-block"><span class="scene-label">${escapeHtml(label)}</span><code>${escapeHtml(p)}</code></div>`;
-            });
-            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
-        } else {
-            html += renderEmpty('No mp4 produced. Check warnings — Edge-TTS or moviepy may be missing.');
-        }
-        html += renderWarnings(d.warnings);
-        html += renderRawJson(d);
-        $('ps-result').innerHTML = html;
-    }
+    // PR-A — ``renderComposeShort`` (mp4 short-mode renderer) was deleted
+    // along with the Output mode selector. The /producer/short route is
+    // still callable from the wire API + still tested in the sidecar
+    // bucket, but the renderer never composes a 9:16 mp4 anymore — that
+    // workflow is replaced by I2V/Veo3 batch + Video Assembly.
 
     // Delegate clicks on action chips so we don't have to attach
     // listeners to every row on every repaint.
@@ -1616,6 +1658,11 @@
         sbbUpdateGenerateButton('video');
         // HF-5 #10 — same headline counter as the image table.
         sbbUpdateProgressBadge('video');
+        // PR-A — keep the Compose panel reference summary and the Video
+        // Assembly scene-videos textarea in lock-step with the batch.
+        // Both no-op when nothing has changed; both respect user edits.
+        try { psRefreshReferenceVideos(); } catch (_e) { /* tolerant */ }
+        try { paAutoFillScenesFromBatch(); } catch (_e) { /* tolerant */ }
     }
 
     /**
@@ -3498,6 +3545,9 @@
         humanize: runHumanize,
         'scene-breakdown': runSceneBreakdown,
         'compose-short': runComposeShort,
+        // PR-A — manual re-pull of settled scene videos into the Compose
+        // panel's reference summary (used for SRT auto-fit).
+        'compose-refresh-reference': composeRefreshReference,
         'storyboard-batch-fill': async () => sbbAutoFill(),
         'storyboard-batch-clear': async () => sbbClear(),
         'storyboard-batch-image': sbbGenerateImages,
@@ -3596,9 +3646,17 @@
         // first paint and again whenever the user flips the dropdown,
         // so the Style picker hides / button label updates without
         // requiring a panel rebuild.
-        psApplyComposeMode();
-        const psModeSel = $('ps-mode');
-        if (psModeSel) psModeSel.addEventListener('change', psApplyComposeMode);
+        // PR-A — paint the reference-video summary on cold start so the
+        // empty-state message is visible before the user runs the batch.
+        try { psRefreshReferenceVideos(); } catch (_e) { /* tolerant */ }
+        // PR-A — flip the user-edited flag the first time anyone types
+        // into the assemble scene-videos textarea so subsequent batch
+        // settles do NOT clobber the manual edit. ``Refresh from Video
+        // batch`` resets the flag inside ``paPullFromBatch``.
+        const paScenesTa = $('pa-scene-videos');
+        if (paScenesTa) {
+            paScenesTa.addEventListener('input', () => { paScenesUserEdited = true; });
+        }
         // P2 — TTS provider × Voice picker coupling. When the user
         // flips the provider dropdown, repaint the voice <select>
         // from the cached /producer/voices payload, filtered to
