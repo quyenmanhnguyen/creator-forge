@@ -252,6 +252,119 @@ def long_script_chunked(
     return body_a.rstrip() + "\n\n" + body_b.lstrip()
 
 
+def refine_per_scene_narrations(
+    *,
+    original_script: str,
+    scenes: list[dict],
+    language: str = "English",
+    words_per_second: float = 2.5,
+) -> list[str]:
+    """Rewrite per-scene narrations so each line fits its scene's video.
+
+    The Compose-audio path used to chunk the user's full script linearly
+    across scenes, which produced narrations that were either too long
+    (TTS overflowed the scene_video and bled into the next clip) or too
+    short (silence pad ate half the scene). This helper asks DeepSeek to
+    produce one narration per scene using three pieces of context:
+
+    * ``original_script`` — the source of truth for storyline and tone.
+    * Each scene's ``image_prompt`` — the visual content actually on
+      screen at that moment, so the narration matches what's shown.
+    * Each scene's ``target_duration_s`` — the *real* duration of the
+      scene's I2V video, so word count is sized to fit (default
+      ``words_per_second=2.5`` matches the en-US-AriaNeural TTS
+      cadence we use elsewhere).
+
+    Each entry in ``scenes`` should be a dict with at least ``index``
+    (0-based) and ``target_duration_s``; ``image_prompt`` and
+    ``original_narration`` are optional but improve quality when
+    provided. Returns a list of strings the same length as ``scenes``;
+    empty entries are filled with the per-scene fallback (the original
+    narration if any, else an empty string) so the caller can still pad
+    silence rather than crashing.
+
+    Raises ``RuntimeError(ERR_NO_DEEPSEEK_KEY)`` when the API key is
+    missing — the caller is expected to surface this as a warning and
+    fall back to the linear-chunking path.
+    """
+    n = len(scenes)
+    if n == 0:
+        return []
+
+    # Build per-scene budget hints so the LLM can match word count to
+    # actual video length. We ceil to whole seconds before applying the
+    # rate so a 4.4s clip still gets at least 11 words of headroom.
+    items: list[dict] = []
+    for i, sc in enumerate(scenes):
+        if not isinstance(sc, dict):
+            sc = {}
+        dur = sc.get("target_duration_s")
+        try:
+            dur_f = float(dur) if dur is not None else 0.0
+        except (TypeError, ValueError):
+            dur_f = 0.0
+        target_words = max(4, int(round(dur_f * words_per_second))) if dur_f > 0 else 12
+        items.append({
+            "index": int(sc.get("index", i)),
+            "target_duration_s": round(dur_f, 2) if dur_f > 0 else None,
+            "target_words": target_words,
+            "image_prompt": str(sc.get("image_prompt") or "").strip(),
+            "original_narration": str(sc.get("original_narration") or "").strip(),
+        })
+
+    sys = (
+        "You rewrite voice-over narration so it fits each scene of a"
+        " short video.\n"
+        "INPUTS:\n"
+        "- An ORIGINAL_SCRIPT: the storyline / tone source of truth.\n"
+        "- An array of SCENES, one per scene in playback order. Each"
+        " scene has: index (0-based), target_duration_s (real duration"
+        " of that scene's video), target_words (recommended word"
+        " budget for the narration to fit the duration at a natural"
+        " pace), image_prompt (what is visible on screen during this"
+        " scene), and original_narration (the linear chunk the renderer"
+        " split off the original script — use it as a starting point,"
+        " refine it).\n"
+        "RULES:\n"
+        "- Output exactly one refined narration per scene, IN ORDER.\n"
+        "- Each narration MUST fit roughly within its target_words"
+        " budget (\u00b120%); if you can't say it cleanly in the"
+        " budget, prefer being slightly shorter.\n"
+        "- Each narration should describe / complement what the scene's"
+        " image_prompt shows, while staying faithful to the storyline"
+        " in ORIGINAL_SCRIPT.\n"
+        "- Maintain emotional continuity scene-to-scene (do not repeat"
+        " the same opening words across scenes).\n"
+        "- No section headers, no scene labels, no markdown — just the"
+        " narration sentence(s) themselves.\n"
+        f"- Write all narrations in {language}.\n"
+        "OUTPUT FORMAT: a single JSON object with a key"
+        " \"narrations\" whose value is an array of"
+        f" {n} strings, in scene order."
+    )
+    user_payload = {
+        "ORIGINAL_SCRIPT": original_script,
+        "SCENES": items,
+    }
+    raw = chat_json(json.dumps(user_payload, ensure_ascii=False), system=sys)
+    parsed = parse_llm_json(raw)
+    out_raw = parsed.get("narrations")
+    fallbacks = [it["original_narration"] for it in items]
+    if not isinstance(out_raw, list):
+        return fallbacks
+    out: list[str] = []
+    for i in range(n):
+        v = out_raw[i] if i < len(out_raw) else None
+        if isinstance(v, str):
+            txt = v.strip()
+        elif v is None:
+            txt = ""
+        else:
+            txt = str(v).strip()
+        out.append(txt if txt else fallbacks[i])
+    return out
+
+
 def humanize_rewrite(script: str, *, language: str) -> str:
     """Step 5 — rewrite to remove AI tells without shrinking length."""
     sys = (

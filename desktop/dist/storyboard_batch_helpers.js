@@ -179,11 +179,13 @@
     // PR-B — minimum file size for an image to count as "really
     // generated". Anything smaller is almost certainly a Grok error
     // page / blank placeholder / Cloudflare interstitial that the
-    // upstream service still attached the URL of. Using 200 KB as the
-    // threshold matches the user-reported observation that broken
-    // images come in well below this and that a real 720×1280 jpeg
-    // from Grok always weighs at least ~250 KB.
-    const MIN_OK_IMAGE_BYTES = 200 * 1024;
+    // upstream service still attached the URL of. The threshold was
+    // first set to 200 KB but legitimate Pro-mode JPEGs sometimes land
+    // at ~180 KB (heavily compressed but still visually correct), so
+    // it was lowered to 100 KB — Grok error pages observed in the
+    // wild are well under this (typically <30 KB) so the gate still
+    // catches them.
+    const MIN_OK_IMAGE_BYTES = 100 * 1024;
 
     /**
      * Settle a row with the final result for the image phase. The
@@ -231,7 +233,7 @@
                 && bytes < MIN_OK_IMAGE_BYTES
             ) {
                 status = "fallback";
-                reason = `image is ${Math.round(bytes / 1024)} KB — below 200 KB minimum, treated as failed`;
+                reason = `image is ${Math.round(bytes / 1024)} KB — below 100 KB minimum, treated as failed`;
             }
             return Object.assign({}, row, {
                 status,

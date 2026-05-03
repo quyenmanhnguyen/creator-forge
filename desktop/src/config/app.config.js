@@ -18,23 +18,28 @@ const MODEL_CONFIG = {
     REF_IMAGE_MODEL: "imagine-image-edit",
 };
 
-// Video Generation Config
+// Video Generation Config — defaults bumped to the highest resolution
+// available for each route so output is always at top quality (the user
+// asked: "đầu ra video luôn luôn cũng là chất lượng tốt nhất"). The
+// resolutionOptions list is unchanged so the UI can still expose lower
+// tiers later if needed.
 const VIDEO_CONFIG = {
     aspectRatio: "16:9",
     videoLength: 10,
     isVideoEdit: false,
-    resolutionName: "720p",
+    resolutionName: "1080p",
     resolutionOptions: ["480p", "720p", "1080p"],
     aspectRatioOptions: ["16:9", "9:16", "1:1", "4:3"],
     lengthOptions: [5, 10, 15, 20],
 };
 
-// Image-to-Video Config
+// Image-to-Video Config — bumped from 480p to 720p (the highest tier
+// the I2V service exposes). Same rationale as VIDEO_CONFIG above.
 const I2V_CONFIG = {
     aspectRatio: "2:3",
     videoLength: 6,
     isVideoEdit: false,
-    resolutionName: "480p",
+    resolutionName: "720p",
     resolutionOptions: ["480p", "720p"],
     aspectRatioOptions: ["2:3", "3:2", "16:9", "9:16", "1:1"],
     lengthOptions: [3, 6, 9, 12],

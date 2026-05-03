@@ -1195,6 +1195,21 @@
             const anyNonBlank = sceneNarrations.some(n => n.length > 0);
             if (anyNonBlank) {
                 params.scene_narrations = sceneNarrations;
+                // Per-scene LLM humanise pass: pair the narrations with
+                // each scene's image_prompt so the sidecar can rewrite
+                // them to match the visual content + real video
+                // duration (instead of just chunking the raw script).
+                // The sidecar treats this as opt-in via
+                // ``humanize_per_scene`` and falls back to the raw
+                // narrations when DEEPSEEK_API_KEY is missing or the
+                // LLM call errors, so toggling it on is always safe.
+                const sceneImagePrompts = scenes.map(s => {
+                    if (!s || typeof s !== 'object') return '';
+                    const p = s.image_prompt != null ? String(s.image_prompt).trim() : '';
+                    return p;
+                });
+                params.scene_image_prompts = sceneImagePrompts;
+                params.humanize_per_scene = true;
             }
         }
         showLoading('ps-result', 'Rendering TTS audio (this usually takes a few seconds)...');
@@ -1226,10 +1241,15 @@
             : 'native TTS timing';
         // Surface per-scene mode so the user can confirm narration was
         // synthesised one TTS pass per scene (matching the storyboard
-        // beat-by-beat) instead of dumping the full script.
+        // beat-by-beat) instead of dumping the full script. Tag with
+        // ``+ humanise`` when the sidecar successfully ran the LLM
+        // rewrite pass over the per-scene narrations so it's obvious
+        // which audio reflects DeepSeek-tuned narrations vs the raw
+        // renderer-split chunks.
         const scenesRendered = Number(d.scenes_rendered) || 0;
+        const humanizedPerScene = !!d.humanized_per_scene;
         const sceneModeLabel = scenesRendered > 0
-            ? `per-scene · ${scenesRendered} scene${scenesRendered === 1 ? '' : 's'}`
+            ? `per-scene · ${scenesRendered} scene${scenesRendered === 1 ? '' : 's'}${humanizedPerScene ? ' · humanised' : ''}`
             : 'single-pass';
         html += `<div class="stats-row">
             <span>Duration<b>${escapeHtml((d.duration_s || 0).toFixed(2))}s</b></span>
@@ -1475,9 +1495,16 @@
             <span>Captions<b>${d.captions_attached ? 'attached (soft)' : '—'}</b></span>
         </div>`;
         if (d.video_path) {
+            // Action chips for the final mp4 + its containing folder.
+            // ``data-swc-open`` / ``data-swc-show`` are the same delegated
+            // click handlers the storyboard rows use, so the user gets
+            // the same Open / Show in folder affordance as the per-scene
+            // image / video tables instead of having to copy-paste paths.
+            const finalActions = sbbRenderPathActions(d.video_path);
+            const folderActions = d.output_dir ? sbbRenderPathActions(d.output_dir) : '';
             html += `<div class="scene-card"><div class="scene-title">Final video</div>`;
-            html += `<div class="scene-block"><span class="scene-label">final.mp4</span><code>${escapeHtml(d.video_path)}</code></div>`;
-            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code></div></div>`;
+            html += `<div class="scene-block"><span class="scene-label">final.mp4</span><code>${escapeHtml(d.video_path)}</code> ${finalActions}</div>`;
+            html += `<div class="scene-meta">Output dir: <code>${escapeHtml(d.output_dir || '')}</code> ${folderActions}</div></div>`;
         } else {
             html += renderEmpty('No final.mp4 produced. Check warnings below — ffmpeg likely failed or no scene videos resolved.');
         }
@@ -3356,7 +3383,7 @@
             // Hot-fix — ImageService / RefImageService return ``savedFiles``
             // as a ``string[]`` (no per-file ``bytes``), so ``mapped`` lands
             // here with ``bytes === 0`` and the ``MIN_OK_IMAGE_BYTES`` gate
-            // in ``applyBatchResult`` would silently skip a < 200 KB file.
+            // in ``applyBatchResult`` would silently skip a < 100 KB file.
             // Stat each settled image on disk so the gate sees the real
             // size before the row reaches the I2V batch.
             const settled = (typeof helpers.enrichBatchRowsWithFileBytes === 'function' && api && typeof api.statBytes === 'function')

@@ -2494,6 +2494,232 @@ def test_audio_scene_videos_strip_whitespace_and_empties():
     assert r.status_code == 200, r.text
 
 
+def test_audio_humanize_per_scene_calls_llm_and_uses_refined_narrations(monkeypatch, tmp_path):
+    """When ``humanize_per_scene=True`` the route must (a) call
+    ``llm.refine_per_scene_narrations`` with the original script + each
+    scene's image_prompt + each scene's actual scene_video duration,
+    and (b) feed the *refined* narrations into TTS instead of the raw
+    renderer-split chunks. The response surfaces
+    ``humanized_per_scene=True`` so the renderer can label the audio
+    accordingly.
+    """
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "refined"), (1.0, 2.0, "one.")]),
+        (3.0, [(0.0, 1.5, "refined"), (1.5, 3.0, "two.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=4.0,
+            video_stream_duration_sec=4.0,
+            has_video_stream=True,
+        ),
+    )
+
+    captured_llm: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured_llm.update(kwargs)
+        return ["Refined scene one.", "Refined scene two."]
+
+    monkeypatch.setattr(llm, "refine_per_scene_narrations", fake_refine)
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+
+    out = tmp_path / "audio-humanise"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Original full script — the storyline source of truth.",
+            "output_dir": str(out),
+            "scene_narrations": ["Raw chunk one.", "Raw chunk two."],
+            "scene_image_prompts": [
+                "A wide shot of a forest at dawn.",
+                "A close-up of a deer drinking water.",
+            ],
+            "scene_videos": ["/scene1.mp4", "/scene2.mp4"],
+            "humanize_per_scene": True,
+            "humanize_language": "English",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["humanized_per_scene"] is True, body
+    assert body["scenes_rendered"] == 2
+
+    # The LLM helper received the original script + each scene's
+    # image_prompt + each scene's real scene_video duration (4.0s
+    # each from the probe stub).
+    assert captured_llm["original_script"] == (
+        "Original full script — the storyline source of truth."
+    )
+    sent_scenes = captured_llm["scenes"]
+    assert len(sent_scenes) == 2
+    assert sent_scenes[0]["image_prompt"] == "A wide shot of a forest at dawn."
+    assert sent_scenes[1]["image_prompt"] == "A close-up of a deer drinking water."
+    assert sent_scenes[0]["target_duration_s"] == pytest.approx(4.0)
+    assert sent_scenes[1]["target_duration_s"] == pytest.approx(4.0)
+    assert sent_scenes[0]["original_narration"] == "Raw chunk one."
+    assert sent_scenes[1]["original_narration"] == "Raw chunk two."
+
+    # TTS received the refined narrations, NOT the raw chunks.
+    calls = Adapter._calls["calls"]  # type: ignore[attr-defined]
+    assert [c["text"] for c in calls] == ["Refined scene one.", "Refined scene two."]
+
+
+def test_audio_humanize_per_scene_falls_back_when_llm_key_missing(monkeypatch, tmp_path):
+    """Missing ``DEEPSEEK_API_KEY`` must surface a friendly warning and
+    fall back to the raw scene_narrations rather than 500ing.
+    ``humanized_per_scene`` stays false in the response.
+    """
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "raw"), (1.0, 2.0, "one.")]),
+        (1.5, [(0.0, 0.7, "raw"), (0.7, 1.5, "two.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+
+    def raising_refine(**_kwargs):
+        raise RuntimeError(llm.ERR_NO_DEEPSEEK_KEY)
+
+    monkeypatch.setattr(llm, "refine_per_scene_narrations", raising_refine)
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+
+    out = tmp_path / "audio-humanise-no-key"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Whatever the script.",
+            "output_dir": str(out),
+            "scene_narrations": ["Raw chunk one.", "Raw chunk two."],
+            "scene_image_prompts": ["img1", "img2"],
+            "humanize_per_scene": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["humanized_per_scene"] is False, body
+    assert body["scenes_rendered"] == 2
+    assert any(
+        "Per-scene humanise skipped: DEEPSEEK_API_KEY not set" in w
+        for w in body["warnings"]
+    ), body["warnings"]
+    # TTS still ran on the raw chunks so the user gets a working voice.
+    calls = Adapter._calls["calls"]  # type: ignore[attr-defined]
+    assert [c["text"] for c in calls] == ["Raw chunk one.", "Raw chunk two."]
+
+
+def test_audio_humanize_per_scene_falls_back_when_llm_returns_wrong_shape(monkeypatch, tmp_path):
+    """If the LLM returns a list of the wrong length (or a non-list)
+    we must surface a warning, leave the raw scene_narrations in
+    place, and keep ``humanized_per_scene=False``.
+    """
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "raw"), (1.0, 2.0, "one.")]),
+        (1.5, [(0.0, 0.7, "raw"), (0.7, 1.5, "two.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+    # Return only ONE narration when two scenes were requested.
+    monkeypatch.setattr(
+        llm,
+        "refine_per_scene_narrations",
+        lambda **_kw: ["Only one narration came back."],
+    )
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Script body.",
+            "output_dir": str(tmp_path / "audio-humanise-shape"),
+            "scene_narrations": ["Raw one.", "Raw two."],
+            "scene_image_prompts": ["i1", "i2"],
+            "humanize_per_scene": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["humanized_per_scene"] is False, body
+    assert any(
+        "Per-scene humanise returned an unexpected shape" in w
+        for w in body["warnings"]
+    ), body["warnings"]
+    # TTS received the raw narrations because the LLM output was
+    # rejected.
+    calls = Adapter._calls["calls"]  # type: ignore[attr-defined]
+    assert [c["text"] for c in calls] == ["Raw one.", "Raw two."]
+
+
+def test_audio_humanize_per_scene_skipped_when_flag_false(monkeypatch, tmp_path):
+    """When ``humanize_per_scene`` is false (or omitted) the LLM helper
+    must NOT be called and the raw scene_narrations are TTS'd as-is.
+    """
+    Adapter = _fake_per_scene_word_adapter([
+        (2.0, [(0.0, 1.0, "raw"), (1.0, 2.0, "one.")]),
+    ])
+    monkeypatch.setattr(producer_route, "_tts_adapter_factory", Adapter)
+
+    def boom(**_kw):  # pragma: no cover - asserts non-call
+        raise AssertionError("LLM must not be called when humanize_per_scene=False")
+
+    monkeypatch.setattr(llm, "refine_per_scene_narrations", boom)
+
+    def fake_concat(segments, *, silence_pads_s, output_path, audio_format, timeout_s=600.0):
+        Path(output_path).write_bytes(b"\x00" * 32)
+        return True, ""
+
+    monkeypatch.setattr(producer_route, "_ffmpeg_concat_audio_segments", fake_concat)
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Script.",
+            "output_dir": str(tmp_path / "audio-no-humanise"),
+            "scene_narrations": ["Raw one."],
+            # humanize_per_scene omitted entirely.
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["humanized_per_scene"] is False
+    assert body["scenes_rendered"] == 1
+
+
+def test_audio_scene_image_prompts_validator_normalises_entries():
+    """``scene_image_prompts`` must accept None / non-string entries
+    without 422ing — same shape contract as ``scene_narrations``.
+    """
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "scene_image_prompts": ["  prompt one  ", None, 42, ""],
+            # No humanize flag → entries are accepted but not used.
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
 def test_audio_pre_pr_a_request_unchanged(monkeypatch, tmp_path):
     """Old clients that don't send ``scene_videos`` / ``target_duration_s``
     must observe the exact same behaviour as before — no scaling, no

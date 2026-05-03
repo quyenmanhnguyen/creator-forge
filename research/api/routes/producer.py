@@ -1122,6 +1122,47 @@ class AudioOnlyRequest(BaseModel):
             "duration of ``scene_videos`` (if any) or no scaling at all."
         ),
     )
+    # Per-scene LLM humanise pass. When ``humanize_per_scene`` is true
+    # and ``scene_narrations`` is non-empty, the route asks DeepSeek to
+    # rewrite each narration so it (a) fits the actual ``scene_videos``
+    # duration of its scene at a natural TTS cadence, and (b) describes
+    # what is on screen during that scene (per ``scene_image_prompts``)
+    # while staying faithful to the original ``script``. The original
+    # scene_narrations entry is sent in as a starting point. Without
+    # the LLM key (or on any LLM error) the route falls back to the
+    # original scene_narrations and surfaces a warning.
+    humanize_per_scene: bool = Field(
+        False,
+        description=(
+            "When true and ``scene_narrations`` is non-empty, the route "
+            "calls DeepSeek (``core.llm.refine_per_scene_narrations``) "
+            "before TTS to rewrite each scene's narration so it fits the "
+            "real ``scene_videos`` duration of its scene and matches the "
+            "visual content described by ``scene_image_prompts``. Falls "
+            "back to the original ``scene_narrations`` and emits a "
+            "warning when DEEPSEEK_API_KEY is not set or the LLM call "
+            "fails — never 500s."
+        ),
+    )
+    scene_image_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-scene image prompts (one per scene, in playback "
+            "order, parallel to ``scene_narrations`` and ``scene_videos``). "
+            "When ``humanize_per_scene`` is true the LLM uses these to "
+            "anchor each refined narration to what's visible on screen "
+            "during that scene. Ignored when ``humanize_per_scene`` is "
+            "false."
+        ),
+    )
+    humanize_language: str = Field(
+        "English",
+        description=(
+            "Human-readable language label passed to the LLM rewrite "
+            "(e.g. \"English\", \"Vietnamese\"). Only used when "
+            "``humanize_per_scene`` is true."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
@@ -1163,6 +1204,24 @@ class AudioOnlyRequest(BaseModel):
                 cleaned.append(str(item).strip())
         return cleaned
 
+    @field_validator("scene_image_prompts", mode="before")
+    @classmethod
+    def _strip_scene_image_prompts(cls, v: object) -> object:
+        # Same shape contract as ``_strip_scene_narrations`` — preserve
+        # list length so index ``i`` still points at scene ``i``'s
+        # image prompt, but coerce non-string / None to empty string.
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                cleaned.append(item.strip())
+            elif item is None:
+                cleaned.append("")
+            else:
+                cleaned.append(str(item).strip())
+        return cleaned
+
 
 class AudioOnlyResponse(BaseModel):
     audio_path: str
@@ -1188,6 +1247,13 @@ class AudioOnlyResponse(BaseModel):
     # the user can confirm "yes, voice was rendered per-scene, not
     # from the full script".
     scenes_rendered: int = 0
+    # Per-scene LLM humanise pass (default false = off). True when the
+    # route successfully ran ``llm.refine_per_scene_narrations`` and
+    # used the refined narrations for TTS (instead of the raw chunks
+    # the renderer originally split off the script). The renderer
+    # surfaces this so the user can confirm whether the audio
+    # reflected the LLM-tuned narrations or the raw split.
+    humanized_per_scene: bool = False
 
 
 @dataclass
@@ -1619,6 +1685,77 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
     # useful audio file.
     per_scene_active = any(bool((s or "").strip()) for s in req.scene_narrations)
     scenes_rendered = 0
+    humanized_per_scene = False
+
+    # Per-scene LLM humanise pass. Run BEFORE TTS so the rewritten
+    # narrations (one per scene, sized to fit each scene's real
+    # ``scene_videos`` duration and matched to its
+    # ``scene_image_prompts``) replace the raw renderer-split chunks.
+    # Robust-failure: any exception (missing key, network, malformed
+    # JSON) surfaces as a warning and we fall back to the originals.
+    effective_scene_narrations = list(req.scene_narrations)
+    if per_scene_active and req.humanize_per_scene:
+        scene_video_durations_for_llm = _per_scene_video_durations(
+            req.scene_videos, warnings=warnings
+        )
+        scenes_payload: list[dict] = []
+        for i, narration in enumerate(effective_scene_narrations):
+            dur = (
+                float(scene_video_durations_for_llm[i])
+                if i < len(scene_video_durations_for_llm)
+                else 0.0
+            )
+            img_prompt = (
+                req.scene_image_prompts[i].strip()
+                if i < len(req.scene_image_prompts)
+                and isinstance(req.scene_image_prompts[i], str)
+                else ""
+            )
+            scenes_payload.append({
+                "index": i,
+                "target_duration_s": dur,
+                "image_prompt": img_prompt,
+                "original_narration": narration,
+            })
+        try:
+            refined = llm.refine_per_scene_narrations(
+                original_script=script,
+                scenes=scenes_payload,
+                language=req.humanize_language or "English",
+            )
+            if isinstance(refined, list) and len(refined) == len(
+                effective_scene_narrations
+            ):
+                effective_scene_narrations = [
+                    (refined[i] or "").strip()
+                    or effective_scene_narrations[i]
+                    for i in range(len(effective_scene_narrations))
+                ]
+                humanized_per_scene = True
+            else:
+                warnings.append(
+                    "Per-scene humanise returned an unexpected shape "
+                    f"({type(refined).__name__}, len="
+                    f"{len(refined) if isinstance(refined, list) else 'n/a'}) "
+                    f"vs {len(effective_scene_narrations)} scenes — "
+                    "using original scene_narrations."
+                )
+        except RuntimeError as exc:
+            if llm.ERR_NO_DEEPSEEK_KEY in str(exc):
+                warnings.append(
+                    "Per-scene humanise skipped: DEEPSEEK_API_KEY not set "
+                    "— using original scene_narrations."
+                )
+            else:
+                warnings.append(
+                    "Per-scene humanise failed: "
+                    f"{type(exc).__name__}: {exc} — using original scene_narrations."
+                )
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            warnings.append(
+                "Per-scene humanise failed: "
+                f"{type(exc).__name__}: {exc} — using original scene_narrations."
+            )
 
     if per_scene_active:
         scene_video_durations = _per_scene_video_durations(
@@ -1628,7 +1765,7 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
             adapter = _resolve_tts_adapter(req.tts_provider)
             engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
             per_scene_results, combined_captions = _synthesize_per_scene_audio(
-                req.scene_narrations,
+                effective_scene_narrations,
                 adapter=adapter,
                 voice=req.voice,
                 output_dir=output_dir,
@@ -1805,6 +1942,7 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         target_duration_s=round(target_duration_s, 3),
         captions_scaled=captions_scaled,
         scenes_rendered=scenes_rendered,
+        humanized_per_scene=humanized_per_scene,
     )
 
 
