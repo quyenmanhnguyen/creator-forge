@@ -110,37 +110,50 @@ test("applyBatchResult: writes image_path/video_path/bytes and flips progress to
     assert.match(rows[1].reason, /blur/);
 });
 
-// PR-B regression coverage: small image files (< 200 KB) almost
+// PR-B regression coverage: small image files (< 100 KB) almost
 // always indicate a Grok error page / blank placeholder rather than
 // a real generation. ``applyBatchResult`` must demote them to
 // fallback so they do NOT pair into the I2V batch.
 
-test("applyBatchResult: demotes 'generated' image with bytes < 200 KB to fallback", () => {
-    assert.strictEqual(helpers.MIN_OK_IMAGE_BYTES, 200 * 1024, "constant exported for callers");
+test("applyBatchResult: demotes 'generated' image with bytes < 100 KB to fallback", () => {
+    assert.strictEqual(helpers.MIN_OK_IMAGE_BYTES, 100 * 1024, "constant exported for callers");
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 1, {
+        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 50 * 1024,
+    });
+    assert.strictEqual(rows[0].status, "fallback", "50 KB image must NOT count as generated");
+    assert.match(rows[0].reason, /50 KB/, "reason names the actual size for the user");
+    assert.match(rows[0].reason, /below 100 KB/, "reason names the threshold");
+    // bytes is preserved so the row still shows the size next to the
+    // (now red) thumbnail in the table.
+    assert.strictEqual(rows[0].bytes, 50 * 1024);
+});
+
+test("applyBatchResult: keeps 'generated' image at the 100 KB threshold (>= passes)", () => {
     let rows = helpers.initImageRowsFromScenes(SCENES);
     rows = helpers.startBatchPhase(rows);
     rows = helpers.applyBatchResult(rows, 1, {
         status: "generated", attempts: 1, image_path: "/p1.png", bytes: 100 * 1024,
     });
-    assert.strictEqual(rows[0].status, "fallback", "100 KB image must NOT count as generated");
-    assert.match(rows[0].reason, /100 KB/, "reason names the actual size for the user");
-    assert.match(rows[0].reason, /below 200 KB/, "reason names the threshold");
-    // bytes is preserved so the row still shows the size next to the
-    // (now red) thumbnail in the table.
-    assert.strictEqual(rows[0].bytes, 100 * 1024);
-});
-
-test("applyBatchResult: keeps 'generated' image with bytes >= 200 KB", () => {
-    let rows = helpers.initImageRowsFromScenes(SCENES);
-    rows = helpers.startBatchPhase(rows);
-    rows = helpers.applyBatchResult(rows, 1, {
-        status: "generated", attempts: 1, image_path: "/p1.png", bytes: 200 * 1024,
-    });
-    assert.strictEqual(rows[0].status, "generated", "200 KB image is right at threshold and must pass");
+    assert.strictEqual(rows[0].status, "generated", "100 KB image is right at threshold and must pass");
     rows = helpers.applyBatchResult(rows, 2, {
         status: "generated", attempts: 1, image_path: "/p2.png", bytes: 5 * 1024 * 1024,
     });
     assert.strictEqual(rows[1].status, "generated");
+});
+
+test("applyBatchResult: 184 KB legitimate JPEG (the user's regression case) is no longer demoted", () => {
+    // Regression: scene 2 in the user's screenshot landed at 184 KB
+    // and was demoted under the old 200 KB gate even though the file
+    // was a perfectly fine Pro-mode JPEG. With the threshold lowered
+    // to 100 KB this exact size must now pass through cleanly.
+    let rows = helpers.initImageRowsFromScenes(SCENES);
+    rows = helpers.startBatchPhase(rows);
+    rows = helpers.applyBatchResult(rows, 2, {
+        status: "generated", attempts: 1, image_path: "/p2.png", bytes: 184 * 1024,
+    });
+    assert.strictEqual(rows[1].status, "generated", "184 KB JPEG must pass the 100 KB gate");
 });
 
 test("applyBatchResult: video result with no bytes is unaffected by image-size gate", () => {
@@ -196,7 +209,7 @@ test("enrichBatchRowsWithFileBytes: backfills bytes from disk for image rows mis
     assert.strictEqual(mapped[1].bytes, 0);
 });
 
-test("enrichBatchRowsWithFileBytes: feeds applyBatchResult so the < 200 KB gate fires", async () => {
+test("enrichBatchRowsWithFileBytes: feeds applyBatchResult so the < 100 KB gate fires", async () => {
     // The bug: the renderer's old wiring used to pass rows with
     // ``bytes === 0`` straight into ``applyBatchResult``, and the
     // gate (``bytes > 0 && bytes < MIN_OK_IMAGE_BYTES``) silently
@@ -213,7 +226,7 @@ test("enrichBatchRowsWithFileBytes: feeds applyBatchResult so the < 200 KB gate 
     rows = helpers.applyBatchResult(rows, enriched[0].scene_id, enriched[0]);
     assert.strictEqual(rows[0].status, "fallback", "80 KB image must NOT count as generated after enrichment");
     assert.match(rows[0].reason, /80 KB/);
-    assert.match(rows[0].reason, /below 200 KB/);
+    assert.match(rows[0].reason, /below 100 KB/);
 });
 
 test("enrichBatchRowsWithFileBytes: leaves rows alone when bytes already known (trusted IPC path)", async () => {
