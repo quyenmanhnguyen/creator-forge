@@ -1,8 +1,8 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-03 (post HF-9 sprint — image gate hardening + per-scene audio + LLM refine + thumbnail sharpness)
-> Main HEAD: `e71553a` — `feat(audio,thumbs): LLM Refine-script + sharper storyboard thumbnails (#81)`
-> Last sprint code commits: `53d2d43` (PR-79) → `9385554` (PR-80) → `e71553a` (PR-81)
+> Last updated: 2026-05-03 (post HF-9 sprint — image gate hardening + per-scene audio + LLM refine + PR-83 retry boost)
+> Main HEAD: `c84dd17` — `feat(image): boost output count on retry + enhanced reject reasons (#83)`
+> Last sprint code commits: `53d2d43` (PR-79) → `9385554` (PR-80) → `e71553a` (PR-81) → `bff32f9` (PR-82) → `c84dd17` (PR-83)
 
 ---
 
@@ -12,7 +12,7 @@
 | --- | --- |
 | **CI strict pytest bucket** | **246 passed** (`test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler` + `test_llm_helpers`) — +26 from HF-9 additions (PR-79 +11 audio-scene, PR-80 +5 adaptive-audio/gate, PR-81 +10 refine-script/fallback) |
 | **Full pytest (local, all deps)** | **644 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap) |
-| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **116 / 116** (+9 from HF-9: image gate 100 KB, PR-79 enrichBatchRowsWithFileBytes, PR-81 thumbnail CSS); `test_storyboard_assemble_helpers.js`: **21 / 21** |
+| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **123 / 123** (+7 from PR-82/83: retry assertions, reason tiers); `test_storyboard_assemble_helpers.js`: **21 / 21**. Cross-platform path assertions hardened for Windows. |
 | `ruff check research` | clean |
 | `node --check` (Electron entry points + dist) | clean |
 | Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
@@ -31,6 +31,8 @@ User feedback after HF-8: "Small broken Grok images (50–150 KB) still slip int
 | #79 | fix(image+audio): block <200KB images from I2V batch + per-scene narration TTS | **(1)** `enrichBatchRowsWithFileBytes` calls `fs.stat` and injects `bytes` into each image row before `applyBatchResult`; gate inside `applyBatchResult` demotes rows with `bytes < MIN_OK_IMAGE_BYTES` to `fallback` so `pairImagePathsForI2V` never sees them. **(2)** `/producer/audio` accepts `scene_narrations[]` — one narration string per scene; each slot is TTS-rendered independently and padded with ffmpeg silence to match its `scene_videos[]` duration, then concatenated. Negative control: omitting `scene_narrations` falls back to legacy single-pass TTS. Adds 11 new backend tests + 4 new JS tests. |
 | #80 | image gate to 100KB + best-quality video defaults + adaptive audio + Final-video Open/Folder buttons | **(1)** `MIN_OK_IMAGE_BYTES` lowered from `200 * 1024` → `100 * 1024` (empirically matches real Grok failure range). **(2)** Video generation defaults bumped to best-quality presets (duration, Pro mode). **(3)** `/producer/audio` gains `humanize_per_scene` flag: when set, DeepSeek rewrites each scene narration to natural spoken language before TTS (falls back gracefully if key missing). **(4)** Compose panel adds **Open file** + **📂 Open folder** buttons for the final assembled video. Adds 5 new backend tests. |
 | #81 | feat(audio,thumbs): LLM Refine-script for narration + sharper storyboard thumbnails | **(1)** New `POST /producer/refine_script` endpoint: accepts a polluted script (raw image-prompt JSON), `scene_videos[]` for duration target, and an image-prompts list for topic grounding; calls DeepSeek to strip banned tokens (`negative_prompt`, `nsfw`, `avoid`, `watermark`, `deformed`, etc.) and rewrite to clean narration sized to `target_words = ⌊target_duration_s × 2.5⌋`; falls back (preserves input, `used_llm=false`, warning) when `DEEPSEEK_API_KEY` absent. **(2)** Storyboard `.thumb-cell img/video` bumped from 64×64 → **96×132 portrait** + `image-rendering: -webkit-optimize-contrast` for sharper downscale; cell width 76→112 px. **(3)** New `research/core/llm.py` helper (`call_deepseek`) extracted from scattered inline calls. Adds 10 new backend tests + 1 JS thumbnail CSS test. |
+| #82 | fix(image): auto-retry small images + fix stale thumbnail on Retry | **(1)** Renderer auto-retries rows up to 3 times when they fall below the 100 KB gate. **(2)** Service-level retry checks saved image size before returning, backing off and retrying up to 2 times internally. **(3)** Clears `url/image_path` on retry to avoid stale thumbnails. Adds 4 JS tests. |
+| #83 | feat(image): boost output count on retry + enhanced reject reasons | **(1)** Boosts `imageGenerationCount` from 1 to 4 on retries (both Renderer and Service-level) so Grok produces multiple candidates, sorting by size and keeping the largest. **(2)** Enhances reject reasons for <30 KB (CDN moderation), <60 KB (incomplete download), and <100 KB (too small). Adds 3 JS tests. |
 
 All three PRs tested end-to-end on the Devin Linux VM with ffmpeg-generated scene_videos (no Grok/DeepSeek credentials needed for the fix paths). Negative controls confirmed flip-one-knob design: same payload, only env or flag toggled → behaviour flips lockstep.
 

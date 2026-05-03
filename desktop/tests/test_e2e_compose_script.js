@@ -65,11 +65,11 @@ test("parseArgs: --help short and long", () => {
 test("pickUsableImages: filters by ≥ 50 KB and allowed extensions", () => {
     const fakeStat = (p) => {
         const sizes = {
-            "/d/a.jpg": { size: 60_000 },
-            "/d/b.jpg": { size: 10_000 },
-            "/d/c.png": { size: 80_000 },
-            "/d/notes.txt": { size: 90_000 },
-            "/d/d.webp": { size: 50_001 },
+            [path.resolve("/d", "a.jpg")]: { size: 60_000 },
+            [path.resolve("/d", "b.jpg")]: { size: 10_000 },
+            [path.resolve("/d", "c.png")]: { size: 80_000 },
+            [path.resolve("/d", "notes.txt")]: { size: 90_000 },
+            [path.resolve("/d", "d.webp")]: { size: 50_001 },
         };
         if (!(p in sizes)) throw new Error("ENOENT " + p);
         return sizes[p];

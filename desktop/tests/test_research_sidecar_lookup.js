@@ -134,7 +134,7 @@ test('resolvePythonExecutable: Linux packaged → resources/python/bin/python3',
         repoRoot: null,
         fsImpl: makeFs([resources + '/python/bin/python3']),
     });
-    assert.strictEqual(got, resources + '/python/bin/python3');
+    assert.strictEqual(got.replace(/\\/g, '/'), resources + '/python/bin/python3');
 });
 
 test('resolvePythonExecutable: dev-mode bundled (Windows) when packaged path missing', () => {
@@ -162,7 +162,7 @@ test('resolvePythonExecutable: dev-mode bundled (Linux)', () => {
         repoRoot,
         fsImpl: makeFs([expected]),
     });
-    assert.strictEqual(got, expected);
+    assert.strictEqual(got.replace(/\\/g, '/'), expected);
 });
 
 test('resolvePythonExecutable: PATH fallback (Windows)', () => {
@@ -200,7 +200,7 @@ test('resolvePythonExecutable: dev-mode bundled (darwin-x64) (PR-62)', () => {
         repoRoot,
         fsImpl: makeFs([expected]),
     });
-    assert.strictEqual(got, expected);
+    assert.strictEqual(got.replace(/\\/g, '/'), expected);
 });
 
 test('resolvePythonExecutable: dev-mode bundled (darwin-arm64) (PR-62)', () => {
@@ -214,7 +214,7 @@ test('resolvePythonExecutable: dev-mode bundled (darwin-arm64) (PR-62)', () => {
         repoRoot,
         fsImpl: makeFs([expected]),
     });
-    assert.strictEqual(got, expected);
+    assert.strictEqual(got.replace(/\\/g, '/'), expected);
 });
 
 test('resolvePythonExecutable: macOS packaged → resources/python/bin/python3 (PR-62)', () => {
@@ -227,7 +227,7 @@ test('resolvePythonExecutable: macOS packaged → resources/python/bin/python3 (
         repoRoot: null,
         fsImpl: makeFs([resources + '/python/bin/python3']),
     });
-    assert.strictEqual(got, resources + '/python/bin/python3');
+    assert.strictEqual(got.replace(/\\/g, '/'), resources + '/python/bin/python3');
 });
 
 test('resolvePythonExecutable: dev-mode skipped on unsupported platform/arch', () => {
