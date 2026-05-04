@@ -1,23 +1,24 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-03 (post HF-11 sprint — caption-repeat dedupe + ElevenLabs TTS provider, both PRs OPEN awaiting merge)
-> Main HEAD: `91dc43a` — `fix(sidecar): use /F /T /PID tree-kill in killByPort on Windows (#85)`
-> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → `91dc43a` (killByPort tree-kill) → **PR #85 + PR #86 (HF-11, awaiting merge)**
+> Last updated: 2026-05-04 (post HF-11 sprint — caption-repeat dedupe + ElevenLabs TTS provider both MERGED into main)
+> Main HEAD: `78b297f` — `feat(audio): add ElevenLabs TTS provider as alternative to edge-tts (#86)`
+> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → `91dc43a` (killByPort tree-kill, PR #85 sidecar fix) → `fe2316f` (PR #85 caption-dedupe) → `78b297f` (PR #86 ElevenLabs)
 
 ---
 
-## ⚠ Action required to resume on a clean main
+## Current state
 
-Two HF-11 PRs are open + green; main does NOT yet contain them.
+All HF-10 + HF-11 work is merged into `main`. No outstanding PRs to land before resuming.
 
-| PR | Title | State | CI | Mergeable |
-| --- | --- | --- | --- | --- |
-| [#85](https://github.com/quyenmanhnguyen/creator-forge/pull/85) | fix(audio): dedupe per-scene narrations to prevent caption-repeat at end of video | OPEN | 2/2 ✓ | yes |
-| [#86](https://github.com/quyenmanhnguyen/creator-forge/pull/86) | feat(audio): add ElevenLabs TTS provider as alternative to edge-tts | OPEN | 2/2 ✓ | yes |
+| PR | Title | State |
+| --- | --- | --- |
+| [#84](https://github.com/quyenmanhnguyen/creator-forge/pull/84) | feat(audio,captions): HF-10 — caption styling presets + speech-rate slider + voice expansion | **Merged** (`43268cf`) |
+| [#85](https://github.com/quyenmanhnguyen/creator-forge/pull/85) | fix(audio): dedupe per-scene narrations to prevent caption-repeat at end of video | **Merged** (`fe2316f`) |
+| [#86](https://github.com/quyenmanhnguyen/creator-forge/pull/86) | feat(audio): add ElevenLabs TTS provider as alternative to edge-tts | **Merged** (`78b297f`) |
 
-**To resume:** click **Merge pull request** on each, then `git checkout main && git pull --ff-only` locally.
+**To resume:** `git checkout main && git pull --ff-only` — `main` is the source of truth.
 
-## Run-locally checklist (after merge)
+## Run-locally checklist
 
 ```powershell
 # Windows PowerShell — only needed if you'll test the ElevenLabs provider:
@@ -45,7 +46,7 @@ In the desktop window:
 
 ---
 
-## HF-11 — Caption-repeat fix + ElevenLabs TTS provider (sprint complete pre-merge)
+## HF-11 — Caption-repeat fix + ElevenLabs TTS provider (sprint complete, merged)
 
 User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa đủ hay, thô kệch quá, và video gần cuối nó bị lặp lại text đoạn đầu". Scope after clarification: skip upscale + skip BGM, focus on caption-repeat fix + ElevenLabs (with API key).
 
@@ -54,7 +55,7 @@ User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa 
 | **#85** caption-dedupe | Two-layer guard against duplicate per-scene narrations: **(1)** `core/llm.refine_per_scene_narrations` post-processes the LLM output through new `_dedupe_scene_narrations` helper — duplicate slots swap for `original_narration` fallback, or blank to silence-pad if fallback also collides. **(2)** `routes/producer._dedupe_per_scene_narrations` is the safety net AFTER `humanize_per_scene` — catches duplicates from any source (LLM, upstream chunker, user paste) and emits a structured warning naming the scene index. Both compare case-insensitively + whitespace-collapsed. Tests: +5 `test_llm_helpers` + +4 `test_api_producer`. |
 | **#86** ElevenLabs adapter | New `ElevenLabsAdapter` in `core/pixelle/tts.py`: `.synthesize()` POSTs `/v1/text-to-speech/{voice_id}` (mp3 stream); `.synthesize_with_timing()` POSTs `/with-timestamps` and converts per-character `normalized_alignment` to `WordBoundary` objects (whitespace-bounded grouping; punctuation stays attached to preceding word — matches Edge-TTS contract). Reads `ELEVENLABS_API_KEY` from env; missing key → `RuntimeError` with link to https://elevenlabs.io/app/settings/api-keys. HTTP errors unpacked to `"ElevenLabs <status>: <message>"`. `KNOWN_TTS_PROVIDERS` gains `"elevenlabs"`; `make_tts_adapter("elevenlabs")` routes to new adapter. 12 curated voices added to `VOICES` (Rachel, Antoni, Sarah, Domi, Adam, Arnold, Charlotte, Charlie, Matilda, Josh, Dorothy, Grace) — `short_name` is the raw ElevenLabs voice id so existing voice-picker plumbing passes it straight to the API. `_AUDIO_FORMAT_BY_PROVIDER` maps `elevenlabs → mp3`. `_list_tts_providers()` reports `elevenlabs` with `is_configured` following env presence. HTML `ps-tts-provider` dropdown gains `elevenlabs` option. Tests: +11 `test_pixelle_tts_providers` + 1 line in `test_api_producer` providers-set assertion. |
 
-**Strict-bucket pytest:** 261 (PR #85) → **275 (PR #86)** all passing. `ruff` clean, `node --check` clean, JS voice-picker tests 13/13 unchanged.
+**Strict-bucket pytest at HF-11 head (`78b297f`):** **271 passed** (re-measured 2026-05-04 against the exact CI command) — the `Pytest — API tests (must pass)` bucket: `test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler`. `ruff check research` clean, `python -m compileall research` clean.
 
 **Out-of-scope this sprint (deferred per user):**
 - Real-ESRGAN upscaling ("bỏ upscale đi")
@@ -63,31 +64,29 @@ User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa 
 
 ---
 
----
-
 ## Status
 
 | Metric | Value |
 | --- | --- |
-| **CI strict pytest bucket** | **265 passed** (`test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler` + `test_llm_helpers`) — +19 from HF-10 additions (PR-82/83 image retry, HF-10 +14 assembler burn-style + +5 producer caption/rate). Previously +26 from HF-9 additions. |
-| **Full pytest (local, all deps)** | **663 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap) |
-| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: **123 / 123**; `test_storyboard_assemble_helpers.js`: **33 / 33**; `test_research_sidecar_restart.js`: **16 / 16** (PR-85: tree-kill assertion updated). |
+| **CI strict pytest bucket** | **271 passed** at HEAD `78b297f` (re-measured 2026-05-04). Bucket = `test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler`. `test_llm_helpers.py` is NOT in the strict CI bucket (it imports `from core import llm` which only resolves under the sidecar runtime, not pytest's default sys.path). |
+| **Full pytest (local, all deps)** | **~677 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap). |
+| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: 123 / 123; `test_storyboard_assemble_helpers.js`: 33 / 33; `test_research_sidecar_restart.js`: 16 / 16; `test_compose_voice_picker_helpers.js`: 13 / 13 (HF-11 ElevenLabs option). |
 | `ruff check research` | clean |
 | `node --check` (Electron entry points + dist) | clean |
-| Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only) |
-| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) · **PR-85: API key Save no longer throws "port still busy" in dev mode** |
+| Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only). |
+| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) · **PR-85 sidecar fix: API key Save no longer throws "port still busy" in dev mode** · **HF-11 PR #85 caption-dedupe + PR #86 ElevenLabs:** verified via CI green (271 strict-bucket passed) — live audio smoke test still pending until user supplies `ELEVENLABS_API_KEY` (or skips ElevenLabs path). |
 
 ---
 
 ## Sprint History (PR-47 → PR-86)
 
-### PR-85 (current) — fix(audio): dedupe per-scene narrations
+### PR #85 — fix(audio): dedupe per-scene narrations (merged, `fe2316f`)
 
-See "HF-11" section above. Awaiting merge.
+See "HF-11" section above for full rationale + per-layer breakdown.
 
-### PR-86 (current) — feat(audio): add ElevenLabs TTS provider
+### PR #86 — feat(audio): add ElevenLabs TTS provider (merged, `78b297f`)
 
-See "HF-11" section above. Awaiting merge.
+See "HF-11" section above for full rationale + adapter contract.
 
 ### `91dc43a` — fix(sidecar): `killByPort` Windows tree-kill on API key Save
 
@@ -99,11 +98,11 @@ User report: "Keys saved, sidecar restart failed: research sidecar restart: port
 
 **Test update:** `test_research_sidecar_restart.js` → `killByPort: windows` test renamed and assertion updated from `['/F', '/PID', '4242']` → `['/F', '/T', '/PID', '4242']`. All 16 tests pass.
 
-### HF-10 — Audio caption enhancements + voice expansion (WIP, branch `devin/1777811026-audio-caption-enhancements`)
+### HF-10 — Audio caption enhancements + voice expansion (merged in PR #84, `43268cf`)
 
 User feedback after HF-9 / PR-82 / PR-83: "Audio quality and SRT/caption appearance can be improved. Want professional caption styling, more voice options, speed control, configurable burn-in captions."
 
-**Implemented (code complete, pre-PR):**
+**Shipped:**
 
 | Feature | What it ships |
 | --- | --- |
@@ -193,7 +192,15 @@ A chain of seven follow-up fixes triggered by users hitting `sidecar restart fai
 
 ## Architectural deltas
 
-### HF-10 additions (WIP)
+### HF-11 additions (merged in PR #85 + PR #86)
+
+- **Caption-dedupe two-layer guard.** `core/llm._dedupe_scene_narrations(narrations, fallbacks)` is the post-LLM-rewrite layer — duplicate slot swaps for the corresponding `original_narration`, or blanks to silence if the fallback also collides. `routes/producer._dedupe_per_scene_narrations(narrations, *, warnings)` is the route safety net AFTER `humanize_per_scene` — duplicate slots become empty strings (rendered as silence the length of that scene's video), and a structured warning naming the scene index is appended. Both compare case-insensitively + whitespace-collapsed.
+- **`ElevenLabsAdapter`.** New TTS provider in `research/core/pixelle/tts.py`. `.synthesize(text, voice, *, format="mp3")` POSTs `/v1/text-to-speech/{voice_id}` and streams MP3 bytes. `.synthesize_with_timing(...)` POSTs `/with-timestamps` and converts per-character `normalized_alignment` into `WordBoundary` objects (whitespace-bounded grouping; punctuation attaches to the preceding word — matches the Edge-TTS contract). Reads `ELEVENLABS_API_KEY` from env; missing key raises `RuntimeError` linking to https://elevenlabs.io/app/settings/api-keys. HTTP errors are unpacked to `"ElevenLabs <status>: <message>"`.
+- **Provider routing.** `KNOWN_TTS_PROVIDERS` gains `"elevenlabs"`; `make_tts_adapter("elevenlabs")` instantiates the new adapter. `_AUDIO_FORMAT_BY_PROVIDER` maps `elevenlabs → mp3`. `_list_tts_providers()` reports `elevenlabs` with `is_configured` reflecting env presence.
+- **Voice catalogue.** `VOICES` tuple gains 12 curated ElevenLabs voices (Rachel, Antoni, Sarah, Domi, Adam, Arnold, Charlotte, Charlie, Matilda, Josh, Dorothy, Grace). The `short_name` for each is the raw ElevenLabs voice id, so existing voice-picker plumbing passes it straight to the API.
+- **Provider dropdown.** HTML `ps-tts-provider` `<select>` gains an `elevenlabs` option. Voice list refreshes when the provider changes.
+
+### HF-10 additions (merged in PR #84)
 
 - **Burn caption style presets.** `CAPTION_STYLE_PRESETS` dict in `assembler.py` — four entries (`modern`, `cinematic`, `tiktok`, `minimal`), each a `dict[str, str]` of ASS style parameters. `build_force_style(caption_style, font_size, position)` merges preset + overrides into a single ffmpeg `force_style` string.
 - **Caption styling pipeline.** `assemble_final_mp4()` gains `caption_style`, `caption_font_size`, `caption_position` keyword args. When `caption_mode="burn"`, `build_force_style()` is called and the resulting string is injected into the ffmpeg `-vf` chain as `subtitles=_subs.srt:force_style='...'`.
@@ -233,9 +240,9 @@ A chain of seven follow-up fixes triggered by users hitting `sidecar restart fai
 
 ## Test Inventory
 
-### Strict CI bucket (265 passed)
+### Strict CI bucket (271 passed at HEAD `78b297f`)
 
-`research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py`, `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`, **`test_llm_helpers.py`** (new — PR-81).
+`research/tests/test_api_niche.py`, `test_api_keywords.py`, `test_api_outlier.py`, `test_api_cloner.py`, `test_api_studio.py`, `test_api_producer.py`, `test_video_probe.py`, `test_pixelle_tts_providers.py`, `test_assembler.py`. (`test_llm_helpers.py` and the heavy-dep tests are NOT in the strict bucket — see Status table above.)
 
 Key additions since PR-75:
 - +11 producer tests (PR-79): per-scene narration, padding, blank-slot skip, validator normalisation, legacy fallback, negative control
@@ -243,6 +250,8 @@ Key additions since PR-75:
 - +10 producer tests (PR-81): refine_script happy path, banned-token strip, grounding, target_words, fallback no-key, blank-script 422, `test_llm_helpers.py` (8 cases for `call_deepseek`)
 - +5 producer tests (HF-10): caption_style pass-through, defaults, unknown style 422, AudioOnlyRequest.rate acceptance + defaults
 - +14 assembler tests (HF-10): build_force_style (all 4 presets, font size override, position override, combined, unknown preset, invalid size/position) + _build_ffmpeg_args with/without force_style
+- +5 `test_llm_helpers` + +4 `test_api_producer` (HF-11 PR #85): `_dedupe_scene_narrations` + `refine_per_scene_narrations` dedupe paths; `_dedupe_per_scene_narrations` route safety net + structured warnings.
+- +11 `test_pixelle_tts_providers` (HF-11 PR #86): `ElevenLabsAdapter.synthesize` mocked POST, missing-key `RuntimeError`, HTTP-error unpacking, `synthesize_with_timing` `WordBoundary` conversion, `make_tts_adapter("elevenlabs")` routing, `_list_tts_providers` env-presence reporting.
 
 ### Desktop offline tests (28 files, all PASS)
 
@@ -300,8 +309,10 @@ test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.
 | Scene breakdown LLM prompt (PR-77) | `research/core/pixelle/scene_breakdown.py::build_breakdown_system_prompt` (Hard rule #6) |
 | Image size gate | `desktop/dist/storyboard_batch_helpers.js` → `MIN_OK_IMAGE_BYTES = 100 * 1024` |
 | Image retry boost + tiered reject (PR-82/83) | `desktop/dist/storyboard_batch_helpers.js` (auto-retry, reject reasons) + `desktop/src/services/ImageService.js` (service-level retry, boost count) |
-| Voice registry (HF-10) | `research/core/pixelle/voices.py` → `VOICES` tuple (22 edge-tts + 6 piper-tts voices) |
+| Voice registry (HF-10 + HF-11) | `research/core/pixelle/voices.py` → `VOICES` tuple (22 edge-tts + 6 piper-tts + 12 ElevenLabs voices) |
 | Burn caption presets (HF-10) | `research/core/pixelle/assembler.py` → `CAPTION_STYLE_PRESETS`, `CAPTION_FONT_SIZES`, `CAPTION_POSITIONS`, `build_force_style()` |
+| Per-scene narration dedupe (HF-11 PR #85) | `research/core/llm.py` (`_dedupe_scene_narrations`, applied inside `refine_per_scene_narrations`) + `research/api/routes/producer.py` (`_dedupe_per_scene_narrations` route safety net) |
+| ElevenLabs TTS provider (HF-11 PR #86) | `research/core/pixelle/tts.py` (`ElevenLabsAdapter`, `make_tts_adapter("elevenlabs")`) + `research/api/routes/producer.py` (`KNOWN_TTS_PROVIDERS`, `_AUDIO_FORMAT_BY_PROVIDER`, `_list_tts_providers`) + `desktop/dist/creator-forge.html` (`ps-tts-provider` option) |
 
 ---
 
