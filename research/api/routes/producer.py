@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from research.core import llm
 from research.core.pixelle import (
+    DEFAULT_EDGE_FALLBACK_VOICE,
     DEFAULT_PROVIDER_NAME,
     MAX_VARIANTS_PER_SCENE,
     SCENE_TEMPLATES,
@@ -44,6 +45,8 @@ from research.core.pixelle import (
     DEFAULT_TTS_PROVIDER,
     KNOWN_TTS_PROVIDERS,
     EdgeTTSAdapter,
+    edge_voice_for_elevenlabs,
+    is_elevenlabs_fatal_error,
     make_tts_adapter,
     LongFormScene,
     SceneAsset,
@@ -642,6 +645,32 @@ def _resolve_tts_adapter(provider: str | None):
     return factory()
 
 
+def _resolve_edge_fallback(
+    *, primary_voice: str, primary_engine: str
+) -> tuple[Any, str, str]:
+    """Build an edge-tts fallback adapter for an ElevenLabs failure.
+
+    Returns ``(adapter, voice, audio_format)`` with an
+    :class:`EdgeTTSAdapter` and the locale-matched edge-tts voice (so a
+    Rachel-EN-US ElevenLabs request falls back to en-US-AriaNeural, not
+    a random voice). When the primary engine wasn't elevenlabs we still
+    return the same triple — callers should only invoke this on
+    confirmed fatal-elevenlabs paths.
+
+    ``audio_format`` is always ``"mp3"`` because edge-tts writes mp3,
+    even when the primary engine was elevenlabs (also mp3) or piper
+    (wav). Callers writing into a per-scene ``.mp3`` path keep working
+    without renaming files.
+    """
+    fallback_voice = (
+        edge_voice_for_elevenlabs(primary_voice)
+        if (primary_engine or "").lower() == "elevenlabs"
+        else DEFAULT_EDGE_FALLBACK_VOICE
+    )
+    adapter = _tts_factory_func("edge-tts")
+    return adapter, fallback_voice, "mp3"
+
+
 _make_short = make_short
 _validate_video_output = validate_video_output
 
@@ -808,9 +837,36 @@ def compose_short(req: ShortRequest) -> ShortResponse:
     try:
         adapter = _resolve_tts_adapter(req.tts_provider)
         engine_name = getattr(adapter, "name", EdgeTTSAdapter.name)
-        tts_result = adapter.synthesize_with_timing(
-            script, output_path=audio_path, voice=req.voice
-        )
+        tts_voice = req.voice
+        try:
+            tts_result = adapter.synthesize_with_timing(
+                script, output_path=audio_path, voice=tts_voice
+            )
+        except Exception as exc:  # noqa: BLE001 — boundary catch.
+            # HF-13 — auto-fallback to edge-tts on fatal ElevenLabs
+            # error so the user still gets audio + captions even when
+            # their key/IP is rate-limited or revoked.
+            if (
+                (engine_name or "").lower() == "elevenlabs"
+                and is_elevenlabs_fatal_error(exc)
+            ):
+                fb_adapter, fb_voice, _fb_audio_format = _resolve_edge_fallback(
+                    primary_voice=tts_voice,
+                    primary_engine=engine_name,
+                )
+                warnings.append(
+                    "ElevenLabs returned a fatal error "
+                    f"({type(exc).__name__}: {exc}) — falling back to edge-tts "
+                    f"voice {fb_voice!r}."
+                )
+                adapter = fb_adapter
+                tts_voice = fb_voice
+                engine_name = getattr(fb_adapter, "name", EdgeTTSAdapter.name)
+                tts_result = adapter.synthesize_with_timing(
+                    script, output_path=audio_path, voice=tts_voice
+                )
+            else:
+                raise
         # PR-23: Piper writes ``.wav`` next to the requested ``.mp3``
         # path. Honour the actual ``audio_path`` reported by the
         # adapter so downstream stages (compose, response payload) see
@@ -1489,6 +1545,7 @@ def _synthesize_per_scene_audio(
     scene_video_durations: list[float],
     audio_format: Literal["mp3", "wav"],
     warnings: list[str],
+    fallback_factory: Any = None,
 ) -> tuple[list[_PerSceneSynthResult], list[Caption]]:
     """Run TTS per-scene and pad each segment to its scene_video duration.
 
@@ -1503,10 +1560,26 @@ def _synthesize_per_scene_audio(
     ``scene_video_durations`` entry (or skipped entirely when no scene
     video duration is known for that slot — caller should treat the
     skip as "no entry in the final concat").
+
+    HF-13 — when the primary adapter is :class:`ElevenLabsAdapter` and a
+    scene hits a *fatal* ElevenLabs error (401 / 403 / quota / region —
+    see :func:`is_elevenlabs_fatal_error`), we **swap the adapter sticky**
+    for the rest of the batch. ``fallback_factory`` (a zero-arg callable
+    returning ``(adapter, voice, audio_format)``) is invoked once on the
+    first fatal hit, the failing scene is retried with the fallback
+    adapter, and every subsequent scene also uses the fallback. A single
+    warning summarises the swap so the user knows the audio came from
+    edge-tts even though they picked elevenlabs in the dropdown.
+
+    When ``fallback_factory`` is ``None`` (e.g. tests, or the request
+    explicitly disables fallback) the legacy behaviour is preserved:
+    the failing scene is replaced with silence and we keep using the
+    primary adapter.
     """
     results: list[_PerSceneSynthResult] = []
     combined_captions: list[Caption] = []
     cumulative_offset_s = 0.0
+    swapped_to_fallback = False
 
     for i, raw_narration in enumerate(scene_narrations):
         narration = (raw_narration or "").strip()
@@ -1554,42 +1627,85 @@ def _synthesize_per_scene_audio(
             continue
 
         # Real narration → TTS this scene independently.
+        tts_result = None
         try:
             tts_result = adapter.synthesize_with_timing(
                 narration, output_path=scene_path, voice=voice
             )
         except Exception as exc:  # noqa: BLE001 — boundary catch.
-            warnings.append(
-                f"Scene {i + 1} TTS failed: {type(exc).__name__}: {exc}"
-            )
-            # Replace with silence of scene_video length so the timeline
-            # still makes sense; if we don't have a target duration,
-            # skip this slot entirely (cumulative offset unchanged).
-            if target_dur > 0:
-                results.append(
-                    _PerSceneSynthResult(
-                        audio_path=Path(""),
-                        duration_s=0.0,
-                        captions=[],
-                        caption_source="none",
-                        target_duration_s=target_dur,
-                        pad_silence_s=target_dur,
-                        final_segment_duration_s=target_dur,
+            # HF-13 — fatal ElevenLabs error (auth / quota / region) on
+            # the primary adapter? Swap to edge-tts once for the rest of
+            # this batch and retry the current scene with the fallback
+            # adapter so we still surface audio for it.
+            fallback_used = False
+            if (
+                not swapped_to_fallback
+                and fallback_factory is not None
+                and is_elevenlabs_fatal_error(exc)
+            ):
+                try:
+                    fb_adapter, fb_voice, fb_audio_format = fallback_factory()
+                except Exception as fb_exc:  # noqa: BLE001
+                    warnings.append(
+                        "ElevenLabs hit a fatal error and the edge-tts "
+                        f"fallback could not be built: {type(fb_exc).__name__}: {fb_exc}"
                     )
-                )
-                cumulative_offset_s += target_dur
-            else:
-                results.append(
-                    _PerSceneSynthResult(
-                        audio_path=Path(""),
-                        skipped=True,
-                        skip_reason=(
-                            f"scene {i + 1}: TTS failed and no scene_video duration "
-                            "to substitute silence — skipped"
-                        ),
+                else:
+                    swapped_to_fallback = True
+                    fallback_used = True
+                    warnings.append(
+                        "ElevenLabs returned a fatal error "
+                        f"({type(exc).__name__}: {exc}) — falling back to edge-tts "
+                        f"voice {fb_voice!r} for scene {i + 1} and beyond."
                     )
-                )
-            continue
+                    adapter = fb_adapter
+                    voice = fb_voice
+                    audio_format = fb_audio_format
+                    scene_path = output_dir / f"voice_scene_{i + 1:02d}.{audio_format}"
+                    try:
+                        tts_result = adapter.synthesize_with_timing(
+                            narration, output_path=scene_path, voice=voice
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        warnings.append(
+                            f"Scene {i + 1} edge-tts fallback also failed: "
+                            f"{type(fallback_exc).__name__}: {fallback_exc}"
+                        )
+                        tts_result = None
+            if tts_result is None:
+                if not fallback_used:
+                    warnings.append(
+                        f"Scene {i + 1} TTS failed: {type(exc).__name__}: {exc}"
+                    )
+                # Replace with silence of scene_video length so the timeline
+                # still makes sense; if we don't have a target duration,
+                # skip this slot entirely (cumulative offset unchanged).
+                if target_dur > 0:
+                    results.append(
+                        _PerSceneSynthResult(
+                            audio_path=Path(""),
+                            duration_s=0.0,
+                            captions=[],
+                            caption_source="none",
+                            target_duration_s=target_dur,
+                            pad_silence_s=target_dur,
+                            final_segment_duration_s=target_dur,
+                        )
+                    )
+                    cumulative_offset_s += target_dur
+                else:
+                    results.append(
+                        _PerSceneSynthResult(
+                            audio_path=Path(""),
+                            skipped=True,
+                            skip_reason=(
+                                f"scene {i + 1}: TTS failed and no scene_video duration "
+                                "to substitute silence — skipped"
+                            ),
+                        )
+                    )
+                continue
+            # Else: fallback succeeded — fall through to result-processing.
 
         if isinstance(getattr(tts_result, "audio_path", None), Path):
             scene_path = tts_result.audio_path
@@ -1844,6 +1960,22 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
             # doesn't crash the call.
             if req.rate and hasattr(adapter, "rate"):
                 adapter.rate = req.rate
+            primary_engine = getattr(adapter, "name", "")
+            primary_voice = req.voice
+
+            def _build_fallback() -> tuple[Any, str, str]:
+                # HF-13 — only ElevenLabs benefits from auto-fallback;
+                # piper/edge-tts errors are usually request-level and
+                # should surface as scene-level failures (silence pad).
+                if (primary_engine or "").lower() != "elevenlabs":
+                    raise RuntimeError(
+                        f"no fallback registered for engine {primary_engine!r}"
+                    )
+                return _resolve_edge_fallback(
+                    primary_voice=primary_voice,
+                    primary_engine=primary_engine,
+                )
+
             per_scene_results, combined_captions = _synthesize_per_scene_audio(
                 effective_scene_narrations,
                 adapter=adapter,
@@ -1852,6 +1984,7 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                 scene_video_durations=scene_video_durations,
                 audio_format=audio_format_default,
                 warnings=warnings,
+                fallback_factory=_build_fallback,
             )
         except Exception as exc:  # noqa: BLE001 — boundary catch.
             msg = f"Per-scene TTS failed: {type(exc).__name__}: {exc}"
@@ -1922,9 +2055,40 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
             # unconventional adapters (Piper / tests) don't crash.
             if req.rate and hasattr(adapter, "rate"):
                 adapter.rate = req.rate
-            tts_result = adapter.synthesize_with_timing(
-                script, output_path=audio_path, voice=req.voice
-            )
+            tts_voice = req.voice
+            try:
+                tts_result = adapter.synthesize_with_timing(
+                    script, output_path=audio_path, voice=tts_voice
+                )
+            except Exception as exc:  # noqa: BLE001 — boundary catch.
+                # HF-13 — same auto-fallback contract as the per-scene
+                # path: when the user picked elevenlabs and the API
+                # returned a fatal error (auth / quota / region), we
+                # transparently retry the entire single-pass synth on
+                # edge-tts so the call still produces audio.
+                if (
+                    (engine_name or "").lower() == "elevenlabs"
+                    and is_elevenlabs_fatal_error(exc)
+                ):
+                    fb_adapter, fb_voice, _fb_audio_format = _resolve_edge_fallback(
+                        primary_voice=tts_voice,
+                        primary_engine=engine_name,
+                    )
+                    warnings.append(
+                        "ElevenLabs returned a fatal error "
+                        f"({type(exc).__name__}: {exc}) — falling back to edge-tts "
+                        f"voice {fb_voice!r} for the full script."
+                    )
+                    if req.rate and hasattr(fb_adapter, "rate"):
+                        fb_adapter.rate = req.rate
+                    adapter = fb_adapter
+                    tts_voice = fb_voice
+                    engine_name = getattr(fb_adapter, "name", EdgeTTSAdapter.name)
+                    tts_result = adapter.synthesize_with_timing(
+                        script, output_path=audio_path, voice=tts_voice
+                    )
+                else:
+                    raise
             if isinstance(getattr(tts_result, "audio_path", None), Path):
                 audio_path = tts_result.audio_path
             audio_ok = audio_path.exists()
@@ -2234,6 +2398,148 @@ def refine_script(req: RefineScriptRequest) -> RefineScriptResponse:
         refined_length=len(refined_clean),
         target_duration_s=round(target_duration_s, 3),
         target_words=target_words,
+        used_llm=True,
+        warnings=warnings,
+    )
+
+
+# ─── /producer/soften_prompts — rewrite image prompts to bypass moderation ──
+
+# HF-13 — when the user's storyboard prompts trip Grok / generic CDN
+# moderation (returns ~80 KB blurred placeholders that the renderer's
+# 100 KB gate demotes to ``fallback``), retrying the same prompt is
+# wasted compute. This route asks DeepSeek to rewrite each prompt so
+# explicit anatomy / fabric vocabulary is replaced with editorial
+# equivalents (\"form-fitting silk slip\" instead of \"see-through wet-look
+# transparent fabric revealing nipples\") while pose / lighting / camera
+# / mood / style tags are preserved verbatim. The desktop renderer
+# wires this to a \"✨ Mềm hoá prompts\" button on the Storyboard panel
+# so a stuck row can be one-click rescued.
+#
+# Robust-failure: missing DEEPSEEK_API_KEY or any LLM error returns
+# 200 with ``softened_prompts == prompts`` + warning. The renderer
+# uses ``used_llm`` to decide whether to surface a success toast or
+# the warning text.
+
+
+class SoftenPromptsRequest(BaseModel):
+    prompts: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Image prompts to soften, in storyboard order. The route preserves"
+            " ordering and length in the response; an empty / blank entry is"
+            " passed through unchanged."
+        ),
+    )
+    language: str = Field(
+        default="English",
+        description=(
+            "Language of the prompts (English / Vietnamese / Korean / ...)."
+            " Used so the softener doesn't accidentally Anglicise prompts"
+            " written in another language."
+        ),
+    )
+
+    @field_validator("prompts", mode="before")
+    @classmethod
+    def _strip_prompts(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                cleaned.append(item.strip())
+            elif item is None:
+                cleaned.append("")
+            else:
+                cleaned.append(str(item))
+        return cleaned
+
+
+class SoftenPromptsResponse(BaseModel):
+    softened_prompts: list[str]
+    original_count: int
+    softened_count: int
+    used_llm: bool = False
+    warnings: list[str] = []
+
+
+@router.post("/soften_prompts", response_model=SoftenPromptsResponse)
+def soften_prompts(req: SoftenPromptsRequest) -> SoftenPromptsResponse:
+    """Rewrite a list of image prompts to be safe for CDN moderation.
+
+    Robust-failure: missing key / LLM error returns 200 with the
+    originals unchanged + a warning. ``used_llm=True`` is set only
+    when the LLM actually produced rewrites, so the renderer can
+    decide whether to celebrate or just surface the warning.
+    """
+    originals = [str(p or "") for p in req.prompts]
+    warnings: list[str] = []
+    n = len(originals)
+
+    if n == 0 or all(not p.strip() for p in originals):
+        # Defensive: pydantic min_length=1 guarantees at least one
+        # entry, but every-blank is still a valid input shape.
+        return SoftenPromptsResponse(
+            softened_prompts=originals,
+            original_count=n,
+            softened_count=n,
+            used_llm=False,
+            warnings=["Soften skipped: every prompt was blank."] if n else [],
+        )
+
+    try:
+        rewritten = llm.soften_image_prompts(
+            originals, language=req.language or "English"
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg == llm.ERR_NO_DEEPSEEK_KEY:
+            warnings.append(
+                "Soften-prompts skipped: DEEPSEEK_API_KEY not set --"
+                " prompts unchanged. Set the key in your environment to"
+                " enable LLM rewrites."
+            )
+        else:
+            warnings.append(f"Soften-prompts LLM error: {msg}")
+        return SoftenPromptsResponse(
+            softened_prompts=originals,
+            original_count=n,
+            softened_count=n,
+            used_llm=False,
+            warnings=warnings,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never let the route 500.
+        warnings.append(
+            f"Soften-prompts failed: {type(exc).__name__}: {exc} --"
+            " prompts unchanged."
+        )
+        return SoftenPromptsResponse(
+            softened_prompts=originals,
+            original_count=n,
+            softened_count=n,
+            used_llm=False,
+            warnings=warnings,
+        )
+
+    if not isinstance(rewritten, list) or len(rewritten) != n:
+        warnings.append(
+            "Soften-prompts returned malformed response -- prompts unchanged."
+        )
+        return SoftenPromptsResponse(
+            softened_prompts=originals,
+            original_count=n,
+            softened_count=n,
+            used_llm=False,
+            warnings=warnings,
+        )
+
+    softened = [(p or "").strip() or originals[i] for i, p in enumerate(rewritten)]
+    return SoftenPromptsResponse(
+        softened_prompts=softened,
+        original_count=n,
+        softened_count=n,
         used_llm=True,
         warnings=warnings,
     )

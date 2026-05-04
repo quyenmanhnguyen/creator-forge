@@ -139,6 +139,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
         // before TTS. Strips prompt JSON / bracketed lists; sizes
         // the output to scene_videos duration via ffprobe-sum.
         refineScript: (params) => ipcRenderer.invoke('producer:refineScript', params),
+        // HF-13: rewrite a list of image prompts to be safe for CDN
+        // moderation (so Grok stops returning <100KB blurred
+        // placeholders). Renderer wires this to a Storyboard button.
+        softenPrompts: (params) => ipcRenderer.invoke('producer:softenPrompts', params),
         // PR-31: stitch scene mp4s + narration mp3 into a single final mp4.
         assemble: (params) => ipcRenderer.invoke('producer:assemble', params),
         // PR-31: discover the most recent /producer/audio render so the

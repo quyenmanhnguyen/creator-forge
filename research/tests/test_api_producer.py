@@ -3466,3 +3466,249 @@ def test_audio_endpoint_dedupes_duplicate_scene_narrations(
     # Warning surfaces the duplicate scene index for renderer toast.
     dedupe_warnings = [w for w in body["warnings"] if "Scene 3" in w and "duplicate" in w]
     assert dedupe_warnings, body["warnings"]
+
+
+# ---------------------------------------------------------------------------
+# HF-13 — ElevenLabs → edge-tts auto-fallback (single-pass + per-scene)
+# ---------------------------------------------------------------------------
+
+
+def test_audio_falls_back_to_edge_when_elevenlabs_returns_fatal_401(
+    monkeypatch, tmp_path
+):
+    """When the user picks ``elevenlabs`` and the API trips the
+    ``Free Tier usage disabled`` 401, /producer/audio must transparently
+    swap to edge-tts so the call still produces audio. The response
+    should:
+
+    - Return 200 with ``audio_ok=True`` (a real mp3 was written).
+    - Contain a ``warnings`` entry naming the swap so the renderer
+      can surface it.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeElevenLabs:
+        name = "elevenlabs"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured.setdefault("elevenlabs_calls", []).append({
+                "voice": voice, "text": text,
+            })
+            raise RuntimeError(
+                "ElevenLabs 401: Free Tier usage disabled. "
+                "Unusual activity detected."
+            )
+
+    class FakeEdge:
+        name = "edge-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured.setdefault("edge_calls", []).append({
+                "voice": voice, "text": text,
+            })
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=1.25,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    def factory(provider):
+        if provider == "elevenlabs":
+            return FakeElevenLabs()
+        return FakeEdge()
+
+    monkeypatch.setattr(producer_route, "_tts_factory_func", factory)
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Hello world. This is a test narration.",
+            "tts_provider": "elevenlabs",
+            "voice": "21m00Tcm4TlvDq8ikWAM",
+            "output_dir": str(tmp_path / "out_eleven_fallback"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Audio was actually written by the edge-tts fallback.
+    assert body["audio_path"], body
+    assert Path(body["audio_path"]).exists(), body
+    assert body["engine"] == "edge-tts"
+    # Warning surfaces the swap so the renderer can show the user.
+    swap_warnings = [
+        w for w in body["warnings"]
+        if "ElevenLabs" in w and "edge-tts" in w
+    ]
+    assert swap_warnings, body["warnings"]
+    # Voice mapped from the Rachel ElevenLabs id to en-US-AriaNeural.
+    assert captured["edge_calls"], "edge-tts fallback was never invoked"
+    assert captured["edge_calls"][0]["voice"] == "en-US-AriaNeural"
+
+
+def test_audio_per_scene_falls_back_once_then_uses_edge_for_remaining_scenes(
+    monkeypatch, tmp_path
+):
+    """In per-scene mode, the fallback should be sticky: the first scene
+    that trips a fatal ElevenLabs error swaps the adapter for every
+    subsequent scene, so we don't re-burn the auth-failing API on
+    scene 2, 3, 4..."""
+    captured: dict[str, list[Any]] = {"elevenlabs_calls": [], "edge_calls": []}
+
+    class FakeElevenLabs:
+        name = "elevenlabs"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["elevenlabs_calls"].append(text)
+            raise RuntimeError("ElevenLabs 401: Free Tier usage disabled")
+
+    class FakeEdge:
+        name = "edge-tts"
+
+        def synthesize_with_timing(self, text, *, output_path, voice):
+            captured["edge_calls"].append(text)
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 32)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=0.8,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    def factory(provider):
+        if provider == "elevenlabs":
+            return FakeElevenLabs()
+        return FakeEdge()
+
+    monkeypatch.setattr(producer_route, "_tts_factory_func", factory)
+
+    # Stub the ffmpeg concat so we don't need real mp3s on disk —
+    # without this the per-scene path falls back to single-pass on
+    # ffmpeg failure and runs both code paths (which is a valid
+    # secondary fallback but pollutes the per-scene assertion).
+    def fake_concat(audio_segments, *, silence_pads_s, output_path,
+                    audio_format, timeout_s):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(b"\x00" * 128)
+        return True, None
+
+    monkeypatch.setattr(
+        producer_route, "_ffmpeg_concat_audio_segments", fake_concat
+    )
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "Discarded — per-scene narrations win.",
+            "scene_narrations": [
+                "Scene one narration line.",
+                "Scene two narration line.",
+                "Scene three narration line.",
+            ],
+            "tts_provider": "elevenlabs",
+            "voice": "21m00Tcm4TlvDq8ikWAM",
+            "output_dir": str(tmp_path / "out_per_scene_fallback"),
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # ElevenLabs was tried exactly once (scene 1) before the swap;
+    # every scene was rendered through edge-tts after the swap stuck.
+    assert len(captured["elevenlabs_calls"]) == 1, captured
+    assert len(captured["edge_calls"]) == 3, captured
+    # Single warning surfaces the swap (not three repeats).
+    swap_warnings = [
+        w for w in body["warnings"]
+        if "ElevenLabs" in w and "edge-tts" in w
+    ]
+    assert len(swap_warnings) == 1, body["warnings"]
+
+
+# ---------------------------------------------------------------------------
+# HF-13 — /producer/soften_prompts
+# ---------------------------------------------------------------------------
+
+
+def test_soften_prompts_calls_llm_and_returns_rewritten(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_softener(prompts, *, language="English"):
+        captured["prompts"] = list(prompts)
+        captured["language"] = language
+        return [f"softened-{p}" for p in prompts]
+
+    monkeypatch.setattr(llm, "soften_image_prompts", fake_softener)
+
+    r = client.post(
+        "/producer/soften_prompts",
+        json={
+            "prompts": [
+                "wet-look transparent mesh revealing nipples",
+                "see-through wet bralette underboob",
+            ],
+            "language": "Vietnamese",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is True
+    assert body["softened_prompts"] == [
+        "softened-wet-look transparent mesh revealing nipples",
+        "softened-see-through wet bralette underboob",
+    ]
+    assert captured["language"] == "Vietnamese"
+    assert body["original_count"] == 2
+    assert body["softened_count"] == 2
+    assert body["warnings"] == []
+
+
+def test_soften_prompts_falls_back_when_deepseek_key_missing(monkeypatch):
+    """Missing DEEPSEEK_API_KEY → 200 with prompts unchanged + warning,
+    so the renderer can keep going even when the user hasn't set up
+    the LLM yet."""
+    def explode(prompts, *, language="English"):
+        raise RuntimeError(llm.ERR_NO_DEEPSEEK_KEY)
+
+    monkeypatch.setattr(llm, "soften_image_prompts", explode)
+
+    r = client.post(
+        "/producer/soften_prompts",
+        json={"prompts": ["explicit prompt that needs softening"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is False
+    assert body["softened_prompts"] == ["explicit prompt that needs softening"]
+    assert any("DEEPSEEK_API_KEY" in w for w in body["warnings"]), body["warnings"]
+
+
+def test_soften_prompts_falls_back_on_malformed_llm_response(monkeypatch):
+    """When the LLM returns a list with the wrong length, the route
+    must still return the originals + a warning rather than silently
+    rendering through with N-1 prompts."""
+    monkeypatch.setattr(
+        llm, "soften_image_prompts", lambda prompts, **k: ["only-one-rewrite"]
+    )
+
+    r = client.post(
+        "/producer/soften_prompts",
+        json={"prompts": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_llm"] is False
+    assert body["softened_prompts"] == ["a", "b", "c"]
+    assert any("malformed" in w.lower() for w in body["warnings"]), body["warnings"]
+
+
+def test_soften_prompts_rejects_empty_input():
+    """min_length=1 on the request model — pydantic returns 422."""
+    r = client.post("/producer/soften_prompts", json={"prompts": []})
+    assert r.status_code == 422, r.text

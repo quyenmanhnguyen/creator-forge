@@ -82,6 +82,13 @@ const CHANNELS = {
     // back to the original script (200 + warning) when
     // DEEPSEEK_API_KEY is missing.
     'producer:refineScript':      { method: 'POST', path: '/producer/refine_script' },
+    // HF-13: LLM image-prompt softener. Renderer's "✨ Mềm hoá prompts"
+    // button on the Storyboard panel calls this to rewrite explicit
+    // anatomy / fabric vocabulary in stuck rows so Grok / generic CDN
+    // moderation stops returning <100KB blurred placeholders. Falls
+    // back to the originals (200 + warning) when DEEPSEEK_API_KEY is
+    // missing or the LLM errors.
+    'producer:softenPrompts':     { method: 'POST', path: '/producer/soften_prompts' },
     // PR-31: Video Assembly — concat per-scene MP4s, replace audio with
     // /producer/audio output, attach soft mov_text subs, write
     // ~/.creator-forge/output/assembly-<ts>/final.mp4.

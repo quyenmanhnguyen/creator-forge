@@ -1563,6 +1563,7 @@
                             <span class="sbb-progress-badge" id="sbb-image-progress-badge" aria-live="polite"></span>
                             <button class="primary" data-run="storyboard-batch-image">Generate images</button>
                             <button type="button" class="secondary" data-run="storyboard-batch-retry-failed-image" title="Re-run only the rows that landed in the fallback bucket on the last batch.">🔄 Retry failed</button>
+                            <button type="button" class="secondary" data-run="storyboard-soften-prompts" title="Ask DeepSeek to rewrite each row's image_prompt so explicit anatomy / fabric vocabulary is replaced with editorial equivalents (pose / lighting / mood preserved). Use this when Grok / CDN moderation keeps returning <100KB blurred placeholders.">✨ Mềm hoá prompts</button>
                             <button type="button" class="secondary" data-run="storyboard-batch-open-output-image" title="Open the output folder for this batch in the OS file browser.">📂 Open folder</button>
                         </div>
                     </div>
