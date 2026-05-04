@@ -13,6 +13,54 @@
 
 const http = require('http');
 
+/**
+ * HF-16 — Electron's structured-clone bridge between main and renderer
+ * only preserves ``Error.message`` / ``.name`` / ``.stack`` and drops every
+ * other own-property. Earlier code did
+ *
+ *     reject(Object.assign(new Error(`sidecar ${code}`), { status, body }))
+ *
+ * which meant the renderer only ever saw the literal string
+ * "sidecar 422" — useful enough to know something failed, useless for
+ * pinpointing which field. We now flatten the body into the message so
+ * the renderer can show the FastAPI validation detail verbatim.
+ */
+function _summarizeFastApiDetail(detail) {
+    if (!Array.isArray(detail)) return null;
+    const parts = [];
+    for (const d of detail) {
+        if (!d || typeof d !== 'object') continue;
+        const loc = Array.isArray(d.loc) ? d.loc.filter((p) => p !== 'body').join('.') : '';
+        const msg = typeof d.msg === 'string' ? d.msg : (d.type || 'invalid');
+        parts.push(loc ? `${loc}: ${msg}` : msg);
+    }
+    return parts.length ? parts.join('; ') : null;
+}
+
+function _formatSidecarError(statusCode, parsed) {
+    let summary = '';
+    if (parsed && typeof parsed === 'object') {
+        const detailSummary = _summarizeFastApiDetail(parsed.detail);
+        if (detailSummary) {
+            summary = detailSummary;
+        } else if (typeof parsed.detail === 'string') {
+            summary = parsed.detail;
+        } else if (typeof parsed.message === 'string') {
+            summary = parsed.message;
+        } else if (typeof parsed.error === 'string') {
+            summary = parsed.error;
+        } else if (typeof parsed.raw === 'string') {
+            summary = parsed.raw;
+        } else {
+            try { summary = JSON.stringify(parsed); } catch (_) { /* ignore */ }
+        }
+    }
+    if (summary && summary.length > 800) summary = `${summary.slice(0, 800)}…`;
+    return summary
+        ? `sidecar ${statusCode} — ${summary}`
+        : `sidecar ${statusCode}`;
+}
+
 function jsonRequest(port, method, urlPath, body) {
     return new Promise((resolve, reject) => {
         const data = body == null ? null : Buffer.from(JSON.stringify(body), 'utf8');
@@ -36,7 +84,8 @@ function jsonRequest(port, method, urlPath, body) {
                     let parsed = null;
                     try { parsed = raw ? JSON.parse(raw) : null; } catch (_) { parsed = { raw }; }
                     if (res.statusCode >= 400) {
-                        reject(Object.assign(new Error(`sidecar ${res.statusCode}`), { status: res.statusCode, body: parsed }));
+                        const message = _formatSidecarError(res.statusCode, parsed);
+                        reject(Object.assign(new Error(message), { status: res.statusCode, body: parsed }));
                     } else {
                         resolve(parsed);
                     }
@@ -119,4 +168,11 @@ function register({ ipcMain, sidecar }) {
     }
 }
 
-module.exports = { register, CHANNELS };
+module.exports = {
+    register,
+    CHANNELS,
+    // Exposed for unit tests (HF-16) — verify renderer-visible error
+    // messages flatten FastAPI 422 detail bodies.
+    _formatSidecarError,
+    _summarizeFastApiDetail,
+};

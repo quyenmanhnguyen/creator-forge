@@ -30,6 +30,11 @@
         lastTitle: '',
         lastOutlineParts: null,   // array of {part, role, emotion, expansion}
         lastScript: '',
+        // HF-16 — humanized output from /studio/humanize. Sent to the
+        // Storyboard panel preferentially when "Send script → Storyboard"
+        // fires, since the user humanizes specifically to remove
+        // LLM-detection markers before breaking into scenes.
+        lastHumanizedScript: '',
         // Latest scene_breakdown — captured so "Compose with AutoGrok"
         // (PR-16) can pick up scenes without re-running the LLM.
         lastScenes: [],
@@ -884,6 +889,12 @@
 
     function renderHumanize(data) {
         const out = (data && data.script_final) || '';
+        // HF-16 — cache the humanized output so "Send script → Storyboard"
+        // can prefer it over the raw step-4 script. Without this cache
+        // the user has to copy-paste the humanized text into the
+        // Storyboard textarea by hand even though the workflow's whole
+        // point is to humanize before breaking into scenes.
+        state.lastHumanizedScript = out || '';
         let html = '';
         html += `<div class="stats-row">
             <span>Chars in<b>${escapeHtml(data.chars_in || 0)}</b></span>
@@ -891,6 +902,12 @@
         </div>`;
         if (out) {
             html += `<details open><summary>Humanized script</summary><pre style="max-height:480px">${escapeHtml(out)}</pre></details>`;
+            // HF-16 — also mirror the humanized output into the
+            // Storyboard's script textarea so the user can run "Break
+            // into scenes" without a manual paste. Mirrors the
+            // identical behaviour `renderScript` performs for the raw
+            // generated script (line 856).
+            $('sb-script').value = out;
         } else {
             html += renderEmpty('No humanized script returned.');
         }
@@ -2891,7 +2908,13 @@
         const el = $(elementId);
         const raw = el && el.value != null ? el.value : '';
         const n = parseInt(raw, 10);
-        if (Number.isFinite(n) && n > 0 && n <= 16) return n;
+        // HF-16 — backend's MAX_VARIANTS_PER_SCENE is 8. Older builds of
+        // this helper allowed up to 16, which would let stale UI values
+        // sneak past the renderer and trip a sidecar 422 even though the
+        // backend now clamps. Match the server cap so the user never
+        // sees a clamp warning unless they hand-edit the form.
+        if (Number.isFinite(n) && n > 0 && n <= 8) return n;
+        if (Number.isFinite(n) && n > 8) return 8;
         return fallback;
     }
 
@@ -4024,6 +4047,7 @@
         state.lastTitle = '';
         state.lastOutlineParts = null;
         state.lastScript = '';
+        state.lastHumanizedScript = '';
         ['st-topics-result', 'st-titles-result', 'st-outline-result',
             'st-script-result', 'st-humanize-result'].forEach((id) => $(id).innerHTML = '');
         $('st-titles-topic').value = '';
@@ -4032,10 +4056,33 @@
         $('st-humanize-script').value = '';
     }
 
-    function sendScriptToStoryboard() {
-        const script = state.lastScript || asNonEmpty($('st-humanize-script').value) || '';
+    /**
+     * HF-16 — push the best available script into the Storyboard panel
+     * and switch tabs. Source priority:
+     *
+     *   1. Humanized output (state.lastHumanizedScript) — the user
+     *      humanizes specifically to feed the Storyboard, so prefer
+     *      it when present.
+     *   2. Raw generated script (state.lastScript) — fallback when
+     *      step 5 (Humanize) hasn't been run yet.
+     *   3. Whatever the user has typed into the Humanize input — last-
+     *      resort so a user who pasted a script directly still gets
+     *      the cross-tab handoff.
+     *
+     * ``resultId`` is the panel's result <div> id (so the Humanize
+     * panel's button can complain into its own row instead of the
+     * Script panel's row).
+     */
+    function sendScriptToStoryboard(resultId) {
+        const targetResultId = resultId || 'st-script-result';
+        const script = (
+            asNonEmpty(state.lastHumanizedScript)
+            || asNonEmpty(state.lastScript)
+            || asNonEmpty($('st-humanize-script').value)
+            || ''
+        );
         if (!script) {
-            showError('st-script-result', { status: 422, message: 'Generate a script first.' });
+            showError(targetResultId, { status: 422, message: 'Generate a script first.' });
             return;
         }
         $('sb-script').value = script;
@@ -4140,7 +4187,13 @@
         $$('button[data-action]').forEach((btn) => {
             const action = btn.getAttribute('data-action');
             if (action === 'reset-studio') btn.addEventListener('click', resetStudio);
-            if (action === 'send-to-storyboard') btn.addEventListener('click', sendScriptToStoryboard);
+            if (action === 'send-to-storyboard') {
+                // HF-16 — `data-result-id` lets the Humanize panel button
+                // (added in this PR) report missing-script errors into
+                // its own result row instead of the Script panel's.
+                const resultId = btn.getAttribute('data-result-id') || 'st-script-result';
+                btn.addEventListener('click', () => sendScriptToStoryboard(resultId));
+            }
             if (action === 'copy-script-from-storyboard') btn.addEventListener('click', copyScriptFromStoryboard);
         });
     }

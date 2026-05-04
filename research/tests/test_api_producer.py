@@ -92,40 +92,118 @@ def test_producer_rejects_empty_or_whitespace_script(script_value):
     assert r.status_code == 422, r.text
 
 
-def test_producer_rejects_unknown_template_key():
+def test_producer_clamps_unknown_template_key(monkeypatch):
+    """HF-16 — an unrecognised template_key falls back to 'cinematic'
+    with a warning instead of returning 422. The IPC bridge swallows
+    422 bodies, so the user used to see a bare 'sidecar 422' with no
+    hint about which field was wrong.
+    """
+    monkeypatch.setattr(
+        producer_route, "generate_scene_breakdown",
+        lambda *args, **kwargs: [_scene(i) for i in range(1, 4)],
+    )
     r = client.post(
         "/producer/scene_breakdown",
         json={"script": SAMPLE_SCRIPT, "template_key": "made_up"},
     )
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
     body = r.json()
-    assert any("template_key" in str(d).lower() for d in body["detail"])
+    assert body["template_key"] == "cinematic"
+    assert any("template_key" in w and "made_up" in w for w in body["warnings"])
 
 
-def test_producer_rejects_n_scenes_out_of_range():
+def test_producer_clamps_n_scenes_below_min(monkeypatch):
+    """HF-16 — n_scenes=2 (below the 3-scene floor) clamps to 3 with a
+    warning instead of 422.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
+        captured["n_scenes"] = n_scenes
+        return [_scene(i) for i in range(1, 4)]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
     r = client.post(
         "/producer/scene_breakdown",
-        json={"script": SAMPLE_SCRIPT, "n_scenes": 2},  # < 3
+        json={"script": SAMPLE_SCRIPT, "n_scenes": 2},
     )
-    assert r.status_code == 422
-    r = client.post(
-        "/producer/scene_breakdown",
-        json={"script": SAMPLE_SCRIPT, "n_scenes": 61},  # > 60
-    )
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["n_scenes_requested"] == 3
+    assert captured["n_scenes"] == 3
+    assert any("n_scenes" in w and "clamped to 3" in w for w in body["warnings"])
 
 
-def test_producer_rejects_words_per_minute_out_of_range():
+def test_producer_clamps_n_scenes_above_max(monkeypatch):
+    """HF-16 — n_scenes=99 clamps to the 60-scene ceiling with a
+    warning.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
+        captured["n_scenes"] = n_scenes
+        return [_scene(i) for i in range(1, 4)]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
     r = client.post(
         "/producer/scene_breakdown",
-        json={"script": SAMPLE_SCRIPT, "words_per_minute": 80},
+        json={"script": SAMPLE_SCRIPT, "n_scenes": 99},
     )
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["n_scenes_requested"] == 60
+    assert captured["n_scenes"] == 60
+    assert any("n_scenes" in w and "clamped to 60" in w for w in body["warnings"])
+
+
+def test_producer_clamps_words_per_minute(monkeypatch):
+    """HF-16 — words_per_minute outside [90, 200] clamps with a warning
+    instead of 422.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
+        captured["wpm"] = words_per_minute
+        return [_scene(i) for i in range(1, 4)]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
+
     r = client.post(
         "/producer/scene_breakdown",
-        json={"script": SAMPLE_SCRIPT, "words_per_minute": 250},
+        json={"script": SAMPLE_SCRIPT, "words_per_minute": 50},
     )
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["wpm"] == 90
+    assert any("words_per_minute" in w and "clamped to 90" in w for w in body["warnings"])
+
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "words_per_minute": 999},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["wpm"] == 200
+    assert any("words_per_minute" in w and "clamped to 200" in w for w in body["warnings"])
+
+
+def test_producer_clamps_images_per_scene_above_max(monkeypatch):
+    """HF-16 — images_per_scene above MAX_VARIANTS_PER_SCENE (8) clamps
+    instead of 422. Stale renderer caches that allow up to 16 used to
+    trip this on the user's actual workflow.
+    """
+    monkeypatch.setattr(
+        producer_route, "generate_scene_breakdown",
+        lambda *args, **kwargs: [_scene(i) for i in range(1, 4)],
+    )
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "images_per_scene": 16},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["images_per_scene"] == 8
+    assert any("images_per_scene" in w and "clamped to 8" in w for w in body["warnings"])
 
 
 def test_producer_rejects_invalid_language():
