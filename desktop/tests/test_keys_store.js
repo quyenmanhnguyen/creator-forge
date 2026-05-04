@@ -171,6 +171,38 @@ test('saveKeys writes the file with mode 0600 (POSIX only)', () => {
     );
 });
 
+test('saveKeys + loadKeys round-trip ELEVENLABS_API_KEY (HF-11 hosted TTS)', () => {
+    const ks = loadFreshModule();
+    const tmp = freshTmpDir('elevenlabs');
+    const written = ks.saveKeys(
+        { ELEVENLABS_API_KEY: 'sk_elevenlabs_secret_123' },
+        { storeDir: tmp, env: {} },
+    );
+    assert.deepStrictEqual(written, { ELEVENLABS_API_KEY: 'sk_elevenlabs_secret_123' });
+    const reloaded = ks.loadKeys({ storeDir: tmp, env: {} });
+    assert.deepStrictEqual(reloaded, written);
+});
+
+test('saveKeys persists ELEVENLABS_API_KEY alongside the existing TTS-unrelated keys', () => {
+    const ks = loadFreshModule();
+    const tmp = freshTmpDir('elevenlabs-mix');
+    const written = ks.saveKeys(
+        {
+            DEEPSEEK_API_KEY: 'sk-ds',
+            YOUTUBE_API_KEY: 'AIza-yt',
+            ELEVENLABS_API_KEY: 'sk_elevenlabs_test',
+        },
+        { storeDir: tmp, env: {} },
+    );
+    assert.deepStrictEqual(written, {
+        DEEPSEEK_API_KEY: 'sk-ds',
+        YOUTUBE_API_KEY: 'AIza-yt',
+        ELEVENLABS_API_KEY: 'sk_elevenlabs_test',
+    });
+    const reloaded = ks.loadKeys({ storeDir: tmp, env: {} });
+    assert.deepStrictEqual(reloaded, written);
+});
+
 test('getKeyEnv mirrors loadKeys — never leaks process.env', () => {
     const ks = loadFreshModule();
     const tmp = freshTmpDir('env-leak');
