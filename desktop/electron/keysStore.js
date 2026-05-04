@@ -50,6 +50,7 @@ const ALLOWED_KEYS = Object.freeze([
     'GOOGLE_API_KEY',
     'GEMINI_API_KEY',
     'RUNNINGHUB_API_KEY',
+    'ELEVENLABS_API_KEY',
 ]);
 
 /**

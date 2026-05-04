@@ -28,6 +28,11 @@ const SAMPLE = [
     { short_name: 'vi-VN-HoaiMyNeural',    label: 'Tiếng Việt · Hoài My · F',     locale: 'vi-VN', gender: 'F', provider: 'edge-tts' },
     { short_name: 'vi_VN-vais1000-medium', label: 'Tiếng Việt · VAIS-1000',       locale: 'vi-VN', gender: 'M', provider: 'piper-tts' },
     { short_name: 'en_US-amy-medium',      label: 'English (US) · Amy (Piper)',   locale: 'en-US', gender: 'F', provider: 'piper-tts' },
+    // HF-11 PR #86: ElevenLabs voices need to round-trip through the same
+    // filter so the Compose panel's TTS provider × Voice picker pair surfaces
+    // the 12 curated voices when the user flips the dropdown to elevenlabs.
+    { short_name: '21m00Tcm4TlvDq8ikWAM', label: 'ElevenLabs · Rachel · F (calm en-US)', locale: 'en-US', gender: 'F', provider: 'elevenlabs' },
+    { short_name: 'ErXwobaYiN019PkySvjV', label: 'ElevenLabs · Antoni · M (well-rounded)', locale: 'en-US', gender: 'M', provider: 'elevenlabs' },
 ];
 
 const tests = [];
@@ -76,6 +81,27 @@ test('filterVoicesByProvider treats a missing provider field as edge-tts', () =>
 
 test('filterVoicesByProvider returns [] for an unknown provider', () => {
     assert.deepStrictEqual(filterVoicesByProvider(SAMPLE, 'bogus-engine'), []);
+});
+
+test('filterVoicesByProvider surfaces ElevenLabs voices when provider=elevenlabs', () => {
+    const elev = filterVoicesByProvider(SAMPLE, 'elevenlabs');
+    assert.strictEqual(elev.length, 2);
+    assert.ok(elev.every((v) => v.provider === 'elevenlabs'));
+    assert.deepStrictEqual(
+        elev.map((v) => v.short_name),
+        ['21m00Tcm4TlvDq8ikWAM', 'ErXwobaYiN019PkySvjV'],
+    );
+});
+
+test('selectVoicesForProvider picks the first ElevenLabs voice when no current pick exists', () => {
+    const result = selectVoicesForProvider({
+        allVoices: SAMPLE,
+        provider: 'elevenlabs',
+        current: 'en-US-AriaNeural',  // edge-tts id, not in the elevenlabs filtered set
+        sidecarDefault: 'en-US-AriaNeural',
+    });
+    assert.strictEqual(result.voices.length, 2);
+    assert.strictEqual(result.selected, '21m00Tcm4TlvDq8ikWAM');
 });
 
 test('filterVoicesByProvider skips malformed entries', () => {

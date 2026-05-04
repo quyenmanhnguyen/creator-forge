@@ -84,6 +84,7 @@
         YOUTUBE_API_KEY: 'key-youtube',
         GOOGLE_API_KEY: 'key-google',
         RUNNINGHUB_API_KEY: 'key-runninghub',
+        ELEVENLABS_API_KEY: 'key-elevenlabs',
     };
 
     function setKeysStatus(text, level) {
@@ -1098,6 +1099,36 @@
         } catch (err) {
             // Sidecar not ready yet — listVoices returns the soft sentinel.
             // Leave the static placeholder option alone; refresh on next call.
+        }
+    }
+
+    /**
+     * Provider-change handler: repaint immediately from the cached voice
+     * list so the dropdown flips with no perceptible delay, then kick a
+     * fresh `/producer/voices` fetch in the background. The fetch is
+     * what catches the case where the renderer's cache was populated
+     * against an older sidecar (pre-HF-11) that didn't ship ElevenLabs
+     * voices yet — without this re-fetch, switching to the elevenlabs
+     * provider showed an empty "no voices for elevenlabs" state until
+     * the user manually reloaded the renderer (Ctrl+R).
+     *
+     * The fetch only repaints if the new payload is strictly larger
+     * than the cached one, so users who change the dropdown back and
+     * forth don't see a visual flicker.
+     */
+    async function _psOnProviderChange() {
+        _psRepaintVoiceOptions();
+        if (!api) return;
+        try {
+            const data = await api.producer.listVoices();
+            if (!data || !Array.isArray(data.voices) || !data.voices.length) return;
+            if (data.voices.length > psVoiceState.allVoices.length) {
+                psVoiceState.allVoices = data.voices.slice();
+                psVoiceState.sidecarDefault = data.default || psVoiceState.sidecarDefault;
+                _psRepaintVoiceOptions();
+            }
+        } catch (_) {
+            // Sidecar transient — keep the cached state.
         }
     }
 
@@ -3963,7 +3994,7 @@
         // ``provider=piper-tts`` + ``voice=en-US-AriaNeural`` (an
         // edge-tts id) would silently mis-route on the sidecar.
         const psProviderSel = $('ps-tts-provider');
-        if (psProviderSel) psProviderSel.addEventListener('change', _psRepaintVoiceOptions);
+        if (psProviderSel) psProviderSel.addEventListener('change', _psOnProviderChange);
         // PR-20D — paint the empty-state for the batch panel and
         // poll the Grok session banner so the user sees right away
         // whether they need to log in.
