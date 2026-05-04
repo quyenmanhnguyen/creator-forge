@@ -140,6 +140,10 @@ jobs:
           node desktop/tests/test_video_service_process_one.js
           node desktop/tests/test_i2v_service_process_one.js
           node desktop/tests/test_refimg_service_process_one.js
+          # HF-16: researchIPC FastAPI 422 detail flattening — verifies
+          # the renderer-visible Error.message includes the failing
+          # field name + validator message instead of just "sidecar 422".
+          node desktop/tests/test_research_ipc_error_format.js
 
       - name: Syntax check standalone E2E scripts
         run: |

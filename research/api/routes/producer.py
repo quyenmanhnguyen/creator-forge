@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from research.core import llm
 from research.core.pixelle import (
@@ -123,20 +123,30 @@ class SceneBreakdownRequest(BaseModel):
         description=f"One of {TEMPLATE_KEYS} from research.core.pixelle.scene_breakdown.",
     )
     n_scenes: int | None = Field(
-        None, ge=3, le=60,
-        description="Force the scene count. ``None`` = auto-estimate from the script length.",
+        None,
+        description=(
+            "Force the scene count. ``None`` = auto-estimate from the script length. "
+            "Out-of-range values are clamped to [3, 60] with a warning instead of "
+            "returning 422 (HF-16) so a stale UI never blocks the user."
+        ),
     )
-    words_per_minute: int = Field(150, ge=90, le=200)
+    words_per_minute: int = Field(
+        150,
+        description=(
+            "Words-per-minute for narration timing. Clamped to [90, 200] when "
+            "out of range (HF-16) instead of returning 422."
+        ),
+    )
     language: Literal["en", "ko", "ja", "vi"] = "en"
     images_per_scene: int = Field(
         1,
-        ge=1,
-        le=MAX_VARIANTS_PER_SCENE,
         description=(
             "PR-26 — number of varied image prompts to expand per scene. "
             "When > 1, each scene gets an ``image_prompts`` list whose entries "
             "differ on ≥2 of (composition, lighting, camera angle, detail focus) "
-            "and share the auto-extracted (or user-overridden) Visual DNA."
+            "and share the auto-extracted (or user-overridden) Visual DNA. "
+            "HF-16 — out-of-range values are clamped to [1, MAX_VARIANTS_PER_SCENE] "
+            "instead of returning 422 (older renderers fall through to 16)."
         ),
     )
     visual_dna_override: str | None = Field(
@@ -149,8 +159,75 @@ class SceneBreakdownRequest(BaseModel):
         ),
     )
 
+    # HF-16 — collected at parse time so the route can echo them in the
+    # response.warnings array. Underscore prefix keeps it out of the
+    # JSON body Pydantic emits for the model.
+    clamp_warnings_: list[str] = Field(default_factory=list, exclude=True)
+
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_template = field_validator("template_key", mode="before")(classmethod(lambda cls, v: _strip(v)))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clamp_numeric_fields(cls, data: Any) -> Any:
+        """HF-16 — clamp numeric fields to valid ranges instead of 422.
+
+        Older renderer builds and stale browser caches sometimes send
+        ``images_per_scene=16`` (frontend cap) when the backend max is
+        ``MAX_VARIANTS_PER_SCENE`` (8), or ``words_per_minute`` outside
+        [90, 200] when the user blanks the input. Returning 422 with a
+        body the IPC bridge swallows leaves the user staring at an
+        opaque "sidecar 422" — clamp instead and surface a warning.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        warnings: list[str] = []
+
+        def _clamp(name: str, lo: int, hi: int, *, default: int | None = None) -> None:
+            raw = data.get(name)
+            if raw is None:
+                return
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                if default is not None:
+                    data[name] = default
+                    warnings.append(
+                        f"{name}={raw!r} not an integer; using default {default}."
+                    )
+                return
+            if n < lo:
+                data[name] = lo
+                warnings.append(
+                    f"{name}={n} below minimum {lo}; clamped to {lo}."
+                )
+            elif n > hi:
+                data[name] = hi
+                warnings.append(
+                    f"{name}={n} above maximum {hi}; clamped to {hi}."
+                )
+
+        _clamp("words_per_minute", 90, 200, default=150)
+        _clamp("images_per_scene", 1, MAX_VARIANTS_PER_SCENE, default=1)
+        # n_scenes is optional — only clamp when set.
+        if data.get("n_scenes") is not None:
+            _clamp("n_scenes", 3, 60)
+
+        # template_key fallback so a stale UI value (or extra whitespace)
+        # never blocks the call. The strict validator below catches the
+        # remaining "not a string at all" cases.
+        tk = data.get("template_key")
+        if isinstance(tk, str) and tk.strip() and tk.strip() not in SCENE_TEMPLATES:
+            warnings.append(
+                f"template_key={tk!r} not in {list(SCENE_TEMPLATES)}; "
+                "falling back to 'cinematic'."
+            )
+            data["template_key"] = "cinematic"
+
+        if warnings:
+            data["clamp_warnings_"] = warnings
+        return data
 
     @field_validator("template_key")
     @classmethod
@@ -229,7 +306,10 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
     """
     script = req.script.strip()
     template = SCENE_TEMPLATES[req.template_key]
-    warnings: list[str] = []
+    # HF-16 — surface clamp_warnings_ from the request validator so the
+    # renderer's "Warnings" panel tells the user when its stale UI sent
+    # an out-of-range value (instead of returning an opaque 422).
+    warnings: list[str] = list(req.clamp_warnings_)
 
     words = count_words(script)
     auto_n = estimate_scene_count(script)
