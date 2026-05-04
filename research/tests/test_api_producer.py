@@ -2212,6 +2212,13 @@ def test_audio_missing_scene_video_warns_and_skips(monkeypatch, tmp_path):
 
 
 def test_audio_warns_when_narration_longer_than_target(monkeypatch, tmp_path):
+    """When ``auto_fit_audio=False`` the legacy warning fires verbatim.
+
+    HF-15: with the new ``auto_fit_audio`` default (True) the route
+    runs ffmpeg ``atempo`` so the warning text changes. Pinning the
+    flag off here keeps coverage on the legacy code path so we don't
+    accidentally drop it on a future refactor.
+    """
     monkeypatch.setattr(
         producer_route,
         "_tts_adapter_factory",
@@ -2230,12 +2237,242 @@ def test_audio_warns_when_narration_longer_than_target(monkeypatch, tmp_path):
             "script": AUDIO_SCRIPT,
             "output_dir": str(tmp_path / "audio-too-long"),
             "target_duration_s": 6.0,
+            "auto_fit_audio": False,
         },
     )
     body = r.json()
     assert body["captions_scaled"] is True
     assert body["target_duration_s"] == 6.0
+    assert body["audio_auto_fit"] is False
+    assert body["audio_tempo_applied"] == 1.0
     assert any("Narration audio is" in w for w in body["warnings"])
+
+
+# ─── /producer/audio — HF-15 auto_fit_audio (atempo) ──────────────────────
+
+
+def test_audio_auto_fit_invokes_atempo_and_marks_response(monkeypatch, tmp_path):
+    """Audio that overruns the target by a fittable amount triggers
+    a single ffmpeg ``atempo`` call and the response advertises the
+    factor that was applied."""
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=8.0,
+            words=[
+                (0.0, 4.0, "alpha"),
+                (4.0, 8.0, "beta."),
+            ],
+        ),
+    )
+
+    captured: dict = {}
+
+    def fake_atempo(audio_path, *, tempo, audio_format, timeout_s=180.0):
+        captured["audio_path"] = Path(audio_path)
+        captured["tempo"] = tempo
+        captured["audio_format"] = audio_format
+        # Pretend we shrunk the file successfully.
+        return True, ""
+
+    monkeypatch.setattr(
+        producer_route,
+        "_ffmpeg_atempo_audio_in_place",
+        fake_atempo,
+    )
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-auto-fit"),
+            "target_duration_s": 6.0,  # 8/6 = 1.333× → in [0.85, 1.5]
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_auto_fit"] is True
+    assert body["audio_tempo_applied"] == pytest.approx(8.0 / 6.0, rel=1e-3)
+    assert body["captions_scaled"] is True
+    assert captured["tempo"] == pytest.approx(8.0 / 6.0, rel=1e-3)
+    assert captured["audio_format"] == "mp3"
+    # Successful auto-fit logs an informational warning, not the legacy
+    # "captions were compressed" string.
+    assert any("Audio auto-fit:" in w for w in body["warnings"])
+    assert not any("Narration audio is" in w for w in body["warnings"])
+
+
+def test_audio_auto_fit_caps_at_max_tempo_and_warns(monkeypatch, tmp_path):
+    """When the natural tempo exceeds ``auto_fit_max_tempo`` the route
+    still applies atempo at the cap and warns the user that the audio
+    will still overflow the target."""
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=20.0,  # 20/5 = 4× — way over the 1.5 default cap
+            words=[
+                (0.0, 10.0, "way-too"),
+                (10.0, 20.0, "long."),
+            ],
+        ),
+    )
+    captured = {}
+
+    def fake_atempo(audio_path, *, tempo, audio_format, timeout_s=180.0):
+        captured["tempo"] = tempo
+        return True, ""
+
+    monkeypatch.setattr(
+        producer_route, "_ffmpeg_atempo_audio_in_place", fake_atempo
+    )
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-auto-fit-cap"),
+            "target_duration_s": 5.0,
+            "auto_fit_max_tempo": 1.5,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_auto_fit"] is True
+    assert body["audio_tempo_applied"] == pytest.approx(1.5, rel=1e-3)
+    assert captured["tempo"] == pytest.approx(1.5, rel=1e-3)
+    # Cap-warning fires with the per-cap shape so the user knows to trim.
+    assert any(
+        "capped at" in w and "auto_fit_max_tempo" in w
+        for w in body["warnings"]
+    )
+
+
+def test_audio_auto_fit_skipped_when_atempo_fails(monkeypatch, tmp_path):
+    """If ``_ffmpeg_atempo_audio_in_place`` returns ``(False, msg)``
+    the response keeps ``audio_auto_fit=False`` and falls back to the
+    legacy "Narration audio is …" warning so the user still knows
+    their tail is being cut."""
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=8.0,
+            words=[(0.0, 4.0, "first"), (4.0, 8.0, "second.")],
+        ),
+    )
+    monkeypatch.setattr(
+        producer_route,
+        "_ffmpeg_atempo_audio_in_place",
+        lambda *_a, **_kw: (False, "ffmpeg not installed"),
+    )
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-auto-fit-fail"),
+            "target_duration_s": 6.0,
+        },
+    )
+    body = r.json()
+    assert body["audio_auto_fit"] is False
+    assert body["audio_tempo_applied"] == 1.0
+    assert any("Audio auto-fit skipped" in w for w in body["warnings"])
+    assert any("Narration audio is" in w for w in body["warnings"])
+
+
+def test_audio_auto_fit_disabled_by_request(monkeypatch, tmp_path):
+    """``auto_fit_audio=False`` skips the atempo call entirely."""
+    called = {"count": 0}
+
+    def boom(*_a, **_kw):
+        called["count"] += 1
+        raise AssertionError("atempo must NOT be called when auto_fit_audio=False")
+
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=8.0,
+            words=[(0.0, 4.0, "first"), (4.0, 8.0, "second.")],
+        ),
+    )
+    monkeypatch.setattr(producer_route, "_ffmpeg_atempo_audio_in_place", boom)
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-no-fit"),
+            "target_duration_s": 6.0,
+            "auto_fit_audio": False,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["audio_auto_fit"] is False
+    assert called["count"] == 0
+
+
+def test_audio_auto_fit_short_audio_no_op(monkeypatch, tmp_path):
+    """Audio shorter than the target is left alone — atempo would
+    *slow down* the narration which sounds sluggish; the assembler
+    silence-pads the gap instead. We assert the helper isn't even
+    consulted."""
+    called = {"count": 0}
+
+    def fake_atempo(*_a, **_kw):
+        called["count"] += 1
+        return True, ""
+
+    monkeypatch.setattr(
+        producer_route,
+        "_tts_adapter_factory",
+        _fake_word_adapter(
+            audio_secs=4.0,
+            words=[(0.0, 2.0, "short"), (2.0, 4.0, "audio.")],
+        ),
+    )
+    monkeypatch.setattr(producer_route, "_ffmpeg_atempo_audio_in_place", fake_atempo)
+
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-short"),
+            "target_duration_s": 10.0,  # video longer than audio
+        },
+    )
+    body = r.json()
+    assert body["audio_auto_fit"] is False
+    assert called["count"] == 0
+
+
+def test_audio_auto_fit_validation_rejects_invalid_tempos(tmp_path):
+    """Field validators on ``auto_fit_max_tempo`` / ``auto_fit_min_tempo``
+    refuse out-of-range values so callers can't slip a 3× into the route."""
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-bad-tempo"),
+            "target_duration_s": 6.0,
+            "auto_fit_max_tempo": 3.0,  # ffmpeg atempo caps at 2.0
+        },
+    )
+    assert r.status_code == 422
+    r2 = client.post(
+        "/producer/audio",
+        json={
+            "script": AUDIO_SCRIPT,
+            "output_dir": str(tmp_path / "audio-bad-tempo-2"),
+            "target_duration_s": 6.0,
+            "auto_fit_min_tempo": 1.5,  # must be < 1.0
+        },
+    )
+    assert r2.status_code == 422
 
 
 # ─── /producer/audio — per-scene narration (one TTS pass per scene) ────────

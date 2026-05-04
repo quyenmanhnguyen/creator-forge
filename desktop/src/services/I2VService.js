@@ -380,11 +380,24 @@ class I2VService {
         delete dlHeaders['content-type'];
 
         const fullUrl = url.startsWith('http') ? url : `${API_ENDPOINTS.ASSETS_BASE_URL}${url}`;
+        // HF-15 — retry budget covers BOTH HTTP 404/403 (Grok still
+        // finalising the video URL on its CDN) AND validator rejection
+        // (a 200 OK that turned out to be a partial / corrupt mp4 —
+        // ffprobe would refuse to play it). The validator path used
+        // to return null on the first reject, which surfaced to users
+        // as "Video URL received but download or validation failed"
+        // even though Grok was still warming up the asset.
         const MAX_RETRIES = 5;
         const RETRY_DELAY = 3000;
+        // Validator failures often mean Grok is still streaming the
+        // moov atom out — give the CDN extra breathing room before
+        // the next pull. 5 s is the empirical sweet spot from real
+        // user runs.
+        const VALIDATION_RETRY_DELAY = 5000;
         const tmpPath = `${filePath}.download`;
         FileService.ensureDir(path.dirname(filePath));
 
+        let lastValidationReason = null;
         for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
             try {
                 if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
@@ -415,20 +428,38 @@ class I2VService {
                         // ffprobe isn't installed the helper degrades to
                         // exists+size and we keep the legacy contract.
                         const check = await validateVideoOutput(tmpPath, { minBytes: MIN_USABLE_VIDEO_BYTES });
-                        if (!check.ok) {
-                            try { fs.unlinkSync(tmpPath); } catch (_) {}
-                            console.log(`[I2VService] Download rejected by validator: ${check.reason}`);
-                            return null;
+                        if (check.ok) {
+                            if (!check.ffprobeAvailable) {
+                                console.log('[I2VService] ffprobe unavailable — accepted on size-only fallback.');
+                            }
+                            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                            fs.renameSync(tmpPath, filePath);
+                            console.log(`[I2VService] Saved stream: ${filePath}`);
+                            return { path: filePath, size, validation: check };
                         }
-                        if (!check.ffprobeAvailable) {
-                            console.log('[I2VService] ffprobe unavailable — accepted on size-only fallback.');
+                        // HF-15 — validator rejected the temp file. Retry
+                        // up to MAX_RETRIES with a longer delay so Grok
+                        // can finish writing the moov atom. Old behaviour
+                        // (return null on first reject) gave up on the
+                        // first partial response.
+                        try { fs.unlinkSync(tmpPath); } catch (_) {}
+                        lastValidationReason = check.reason;
+                        if (attempt < MAX_RETRIES - 1) {
+                            console.log(`[I2VService] Validator rejected (${check.reason}), retry ${attempt + 1}/${MAX_RETRIES} in ${VALIDATION_RETRY_DELAY}ms...`);
+                            await new Promise(resolve => setTimeout(resolve, VALIDATION_RETRY_DELAY));
+                            continue;
                         }
-                        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                        fs.renameSync(tmpPath, filePath);
-                        console.log(`[I2VService] Saved stream: ${filePath}`);
-                        return { path: filePath, size, validation: check };
+                        console.log(`[I2VService] Download rejected by validator after ${MAX_RETRIES} attempts: ${check.reason}`);
+                        return null;
                     }
                     fs.unlinkSync(tmpPath);
+                    // Tiny payload (< 1 KB). Treat as "still warming up"
+                    // and retry — same as HTTP 404 below.
+                    if (attempt < MAX_RETRIES - 1) {
+                        console.log(`[I2VService] Download too small (${size} bytes), retry ${attempt + 1}/${MAX_RETRIES}...`);
+                        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                        continue;
+                    }
                 }
 
                 if (res.status === 404 || res.status === 403) {
@@ -450,6 +481,9 @@ class I2VService {
             }
         }
 
+        if (lastValidationReason) {
+            console.log(`[I2VService] Download exhausted retries; last validator reason: ${lastValidationReason}`);
+        }
         return null;
     }
 
