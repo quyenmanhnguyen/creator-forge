@@ -1,20 +1,23 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-04 (post HF-11 sprint — caption-repeat dedupe + ElevenLabs TTS provider both MERGED into main)
-> Main HEAD: `78b297f` — `feat(audio): add ElevenLabs TTS provider as alternative to edge-tts (#86)`
-> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → `91dc43a` (killByPort tree-kill, PR #85 sidecar fix) → `fe2316f` (PR #85 caption-dedupe) → `78b297f` (PR #86 ElevenLabs)
+> Last updated: 2026-05-04 (post HF-12 sprint — character anchor + scene_breakdown auto-fit fallback + ElevenLabs key promotion all MERGED into main)
+> Main HEAD: `dd0ecb4` — `fix(storyboard): character anchor + scene_breakdown auto-fit fallback + ElevenLabs key promotion (#89)`
+> Last sprint code commits: `78b297f` (HF-11 PR #86) → `6793e66` (PR #87 docs/checkpoint refresh) → `2e36b9f` (PR #88 ElevenLabs voices + Settings ⚙ field) → `dd0ecb4` (PR #89 HF-12 character anchor + autofit fallback + key promotion)
 
 ---
 
 ## Current state
 
-All HF-10 + HF-11 work is merged into `main`. No outstanding PRs to land before resuming.
+All HF-10 + HF-11 + HF-12 work is merged into `main`. No outstanding PRs to land before resuming.
 
 | PR | Title | State |
 | --- | --- | --- |
 | [#84](https://github.com/quyenmanhnguyen/creator-forge/pull/84) | feat(audio,captions): HF-10 — caption styling presets + speech-rate slider + voice expansion | **Merged** (`43268cf`) |
 | [#85](https://github.com/quyenmanhnguyen/creator-forge/pull/85) | fix(audio): dedupe per-scene narrations to prevent caption-repeat at end of video | **Merged** (`fe2316f`) |
 | [#86](https://github.com/quyenmanhnguyen/creator-forge/pull/86) | feat(audio): add ElevenLabs TTS provider as alternative to edge-tts | **Merged** (`78b297f`) |
+| [#87](https://github.com/quyenmanhnguyen/creator-forge/pull/87) | docs(checkpoint): refresh post-merge — HF-10 + HF-11 all merged into main | **Merged** (`6793e66`) |
+| [#88](https://github.com/quyenmanhnguyen/creator-forge/pull/88) | fix(audio): expose ElevenLabs voices + ELEVENLABS_API_KEY field in Settings ⚙ | **Merged** (`2e36b9f`) |
+| [#89](https://github.com/quyenmanhnguyen/creator-forge/pull/89) | fix(storyboard): character anchor + scene_breakdown auto-fit fallback + ElevenLabs key promotion | **Merged** (`dd0ecb4`) |
 
 **To resume:** `git checkout main && git pull --ff-only` — `main` is the source of truth.
 
@@ -41,8 +44,30 @@ npm start                   # spawns sidecar on 127.0.0.1:5050
 In the desktop window:
 - **Caption-dedupe smoke test (PR #85, free)**: Studio → write a short script → Compose Audio → enable `humanize_per_scene` → Generate Audio. With a 3-scene script the warnings list should NO LONGER show duplicate captions in the final SRT (compare against the user-supplied `final.mp4` from 2026-05-03 which had "Late night grocery run..." repeated near the end).
 - **ElevenLabs voice smoke test (PR #86, paid — burns ~70 chars from your ElevenLabs free quota)**: Compose Audio → flip **TTS provider** dropdown from `edge-tts` to `elevenlabs` → voice list refreshes to show the 12 curated voices (Rachel, Antoni, Sarah, ...) → pick **Rachel · F (calm en-US)** → paste *"Xin chào, đây là bản dịch tiếng Việt do ElevenLabs đọc."* → Generate Audio. Should produce a natural-sounding multilingual MP3, NOT robotic edge-tts.
+- **Character anchor smoke test (PR #89, paid for Grok)**: Storyboard → paste a 3-scene script → Break into scenes → fill `Character anchor` textarea with `"young woman, jet-black hair with wispy bangs, light peach camisole, dewy fair skin"` → Auto-fill from scenes → Generate selected. Every prompt sent to Grok will be prefixed with `Subject anchor: <cue>. ` so the same person appears across all scenes (defends against Grok drifting hair/face/makeup between variants even with a global ref image attached).
+- **Auto-fit fallback smoke test (PR #89, free)**: Storyboard → Break into scenes (no Video batch yet) → scroll to Compose audio. The `Auto-fit target (read-only)` field should read `No scene videos yet — using scene_breakdown estimate (X.Xs, N scenes). ...` — no longer blank, no longer requires a settled Video batch first. Generate Video batch and the same field flips to ffprobe-summed durations.
+- **ElevenLabs API key field (PR #88 + PR #89)**: Settings ⚙ → modal opens with **ElevenLabs API key** at the top alongside DeepSeek + YouTube (no longer hidden inside ▶ Optional providers). Save round-trips through `~/.config/Creator Forge/api-keys.json` and the sidecar restarts with the new env.
 
 **If `ELEVENLABS_API_KEY` is unset and you flip to `elevenlabs`:** the route returns a structured warning string (`"ELEVENLABS_API_KEY not set..."`) instead of a 500 — this is intentional graceful degradation, not a bug.
+
+---
+
+## HF-12 — Character anchor + auto-fit fallback + ElevenLabs key promotion (sprint complete, merged)
+
+User feedback after testing HF-11 PR #88 build on Windows: three pain points — (1) character / face / hair drifts across scenes despite ref image + Visual DNA being attached, (2) Compose audio's auto-fit target was blocked on Video batch settling first, even though Scene breakdown already had per-scene durations from words ÷ WPM, (3) ELEVENLABS_API_KEY field was hidden inside ▶ Optional providers and easy to miss. Quote: "sao k thấy nhập riêng ngay từ đầu cho bao quát mà click vào đã thấy có rồi k biết chạy được k".
+
+| PR | What it ships |
+| --- | --- |
+| **#87** docs/checkpoint refresh | Pure docs PR: rewrites CHECKPOINT.md to reflect HF-10 + HF-11 all merged into `main` (was originally drafted before PR #85 + PR #86 landed and showed them as "awaiting merge"). No code change. |
+| **#88** ElevenLabs Settings ⚙ + voice picker self-heal | (1) `ELEVENLABS_API_KEY` added to `keysStore.js` `ALLOWED_KEYS` whitelist + `KEY_INPUT_IDS` map, plus a `<label>` in the Settings ⚙ modal under "Optional providers" so users can save the key without env vars. (2) New `_psOnProviderChange()` handler — when user flips Compose audio's TTS provider dropdown, the renderer **paints from cache instantly** and **fetches `/producer/voices` in the background**; if the new payload is larger than the cached one (e.g. user upgraded sidecar in-place without Ctrl+R), it replaces the cache and re-renders. Self-healing — no full app restart needed. (3) +2 `test_keys_store.js` (12 → 14) + +2 `test_compose_voice_picker_helpers.js` (13 → 15). |
+| **#89** HF-12 character anchor + autofit fallback + key promotion | New pure-helper module `desktop/dist/storyboard_character_anchor_helpers.js` (UMD, framework-free, 6 exports: `normalizeCharacterAnchor`, `buildCharacterAnchorPrefix`, `applyCharacterAnchor`, `applyCharacterAnchorToRefItems`, `sumSceneDurations`, `resolveAutoFitTarget`). Three coordinated wiring edits: **(1)** new `<textarea id="sb-character-anchor">` between Visual DNA and Reference image (global) — when filled, `sbbRunImageBatchForRowIds()` calls `applyCharacterAnchor(prompts, anchor)` to prepend `Subject anchor: <cue>. ` to every prompt before the IPC fires (or `applyCharacterAnchorToRefItems(items, anchor)` for ref-image-edit paths). Empty anchor short-circuits per `(charHelpers && characterAnchor) ? helper() : raw` — byte-identical to pre-PR behavior. **(2)** new `state.lastScenesTotalDuration` cache; `renderSceneBreakdown()` captures `total_duration_s_estimate` from the response (or sums `duration_s` via `sumSceneDurations` as fallback) and calls `psRefreshReferenceVideos()`. New `psResolveAutoFitTarget()` invokes `resolveAutoFitTarget()`'s 4-priority chain (explicit override > settled scene videos ffprobe-summed > scene_breakdown estimate > none); `runComposeShort()` and `runRefineScript()` route through it. UI placeholders updated to spell out the priority. **(3)** ELEVENLABS_API_KEY row moved OUT of `<details>Optional providers` to top-level alongside DeepSeek + YouTube. Tests: new `test_storyboard_character_anchor_helpers.js` with **21** node:test cases covering normalize edge cases, prefix building, prompt + refImg application, scene-duration summing, and 4-priority resolution. |
+
+**Strict-bucket pytest at HF-12 head (`dd0ecb4`):** **271 passed** (unchanged — backend wasn't touched this sprint). `ruff check research` clean, `python -m compileall research` clean.
+
+**Out-of-scope this sprint (deferred):**
+- Scene-by-scene character similarity scoring (e.g. CLIP-similarity-against-ref-image rerank). The text-anchor approach is a defense-in-depth layer; if it still drifts visibly we'd add image-similarity rerank as a follow-up.
+- A separate `Visual DNA` editing modal — current single-line textarea is fine.
+- Anchor templates / library ("save as preset") — premature.
 
 ---
 
@@ -57,10 +82,13 @@ User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa 
 
 **Strict-bucket pytest at HF-11 head (`78b297f`):** **271 passed** (re-measured 2026-05-04 against the exact CI command) — the `Pytest — API tests (must pass)` bucket: `test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler`. `ruff check research` clean, `python -m compileall research` clean.
 
-**Out-of-scope this sprint (deferred per user):**
-- Real-ESRGAN upscaling ("bỏ upscale đi")
-- BGM picker / sidechain duck ("skip BGM lần này")
-- SSML pitch/volume on edge-tts (rolled into ElevenLabs scope instead since user opted to pay for higher-quality voice)
+**Out-of-scope HF-11 (deferred per user, partly addressed in HF-12):**
+- Real-ESRGAN upscaling ("bỏ upscale đi") — still deferred.
+- BGM picker / sidechain duck ("skip BGM lần này") — still deferred.
+- SSML pitch/volume on edge-tts (rolled into ElevenLabs scope instead since user opted to pay for higher-quality voice).
+- Character drift across scenes — addressed in HF-12 PR #89.
+- Compose audio gated on Video batch — addressed in HF-12 PR #89.
+- ElevenLabs key visibility — partly addressed in HF-11 PR #86 (env var) → HF-11 PR #88 (Settings ⚙ field, optional collapse) → HF-12 PR #89 (top-level).
 
 ---
 
@@ -68,17 +96,40 @@ User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa 
 
 | Metric | Value |
 | --- | --- |
-| **CI strict pytest bucket** | **271 passed** at HEAD `78b297f` (re-measured 2026-05-04). Bucket = `test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler`. `test_llm_helpers.py` is NOT in the strict CI bucket (it imports `from core import llm` which only resolves under the sidecar runtime, not pytest's default sys.path). |
+| **CI strict pytest bucket** | **271 passed** at HEAD `dd0ecb4` (re-measured 2026-05-04 post HF-12 merge — backend untouched this sprint, count is identical to HF-11 head). Bucket = `test_api_*.py` + `test_video_probe` + `test_pixelle_tts_providers` + `test_assembler`. `test_llm_helpers.py` is NOT in the strict CI bucket (it imports `from core import llm` which only resolves under the sidecar runtime, not pytest's default sys.path). |
 | **Full pytest (local, all deps)** | **~677 passed, 7 failed** — all 7 failures are `test_pixelle_grok_browser.py` (require Playwright Chromium binary, not a regression; pre-existing env gap). |
-| **Desktop offline test files** | **28 / 28 PASS** — `test_storyboard_batch_helpers.js`: 123 / 123; `test_storyboard_assemble_helpers.js`: 33 / 33; `test_research_sidecar_restart.js`: 16 / 16; `test_compose_voice_picker_helpers.js`: 13 / 13 (HF-11 ElevenLabs option). |
+| **Desktop offline test files** | **29 / 29 PASS** at HEAD `dd0ecb4` (was 28 — HF-12 PR #89 added `test_storyboard_character_anchor_helpers.js` with 21 cases). `test_storyboard_batch_helpers.js`: 123 / 123; `test_storyboard_assemble_helpers.js`: 33 / 33; `test_storyboard_character_anchor_helpers.js`: 21 / 21 (NEW); `test_research_sidecar_restart.js`: 16 / 16; `test_compose_voice_picker_helpers.js`: 15 / 15 (HF-11 ElevenLabs option, +2 in PR #88); `test_keys_store.js`: 14 / 14 (+2 ELEVENLABS_API_KEY whitelist in PR #88). |
 | `ruff check research` | clean |
 | `node --check` (Electron entry points + dist) | clean |
 | Pixelle heavy-import tests | not run in CI (require moviepy / edge-tts / mutagen — best-effort only). |
-| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) · **PR-85 sidecar fix: API key Save no longer throws "port still busy" in dev mode** · **HF-11 PR #85 caption-dedupe + PR #86 ElevenLabs:** verified via CI green (271 strict-bucket passed) — live audio smoke test still pending until user supplies `ELEVENLABS_API_KEY` (or skips ElevenLabs path). |
+| Live E2E verification | **PR-82: auto-retry small images + stale preview fix** · **PR-83: 8/8 assertions** (tiered reject reasons + retry boost) · **PR-85 sidecar fix: API key Save no longer throws "port still busy" in dev mode** · **HF-11 PR #85 caption-dedupe + PR #86 ElevenLabs:** verified via CI green (271 strict-bucket passed). · **HF-11 PR #88: 3/3 PASS** (Settings ⚙ ELEVENLABS_API_KEY field appears + persists; Compose audio voice list shows 12 ElevenLabs voices on dropdown flip; regression flip back to edge-tts restores 22-voice roster). · **HF-12 PR #89: 4/4 PASS** (ELEVENLABS_API_KEY at top-level; auto-fit summary reads literal `36.4s, 3 scenes` from scene_breakdown; helper-wrap captures `Subject anchor: <cue>. ` prefix on every `image:generate` prompt; empty anchor short-circuits helper). Recordings + screenshots in PR comments. |
 
 ---
 
-## Sprint History (PR-47 → PR-86)
+## Sprint History (PR-47 → PR-89)
+
+### PR #87 — docs(checkpoint): refresh post-merge (merged, `6793e66`)
+
+Pure docs PR: rewrites CHECKPOINT.md to reflect HF-10 + HF-11 all merged into `main`. The original draft was prepared before PR #85 + PR #86 landed and showed them as "awaiting merge" (stale). No code change.
+
+### PR #88 — fix(audio): expose ElevenLabs voices + ELEVENLABS_API_KEY field in Settings ⚙ (merged, `2e36b9f`)
+
+User report after testing HF-11 build: "sao không có bảng để nhập api key" + voice list showed `no voices for elevenlabs` even though PR #86 shipped 12 curated voices. Two coordinated fixes:
+
+1. **Settings ⚙ ELEVENLABS_API_KEY field.** `ALLOWED_KEYS` whitelist in `keysStore.js` gains `ELEVENLABS_API_KEY` (silently dropped on save before this); `KEY_INPUT_IDS` map in `creator-forge.js` gains the renderer side; new `<label>` in the Settings ⚙ modal (originally inside `<details>Optional providers`, later promoted top-level by PR #89). Round-trips through `~/.config/Creator Forge/api-keys.json` and the sidecar restarts with the new env.
+2. **Voice picker self-heal.** New `_psOnProviderChange()` handler — when user flips Compose audio's TTS provider dropdown, the renderer **paints from cache instantly** and **fetches `/producer/voices` in the background**. If the new payload is larger than the cached one (e.g. user upgraded sidecar in-place without Ctrl+R), it replaces the cache and re-renders. Self-healing — no full app restart needed.
+
+Tests: +2 `test_keys_store.js` (12 → 14) + +2 `test_compose_voice_picker_helpers.js` (13 → 15). E2E verified on Devin VM with sentinel key — round-trip through Settings ⚙ Save / Cancel / reopen works; voice list populates 12 ElevenLabs voices on first dropdown flip.
+
+### PR #89 — fix(storyboard): character anchor + scene_breakdown auto-fit fallback + ElevenLabs key promotion (merged, `dd0ecb4`)
+
+User feedback after testing HF-11 PR #88 build on Windows: "cái tính năng đồng nhất style nhân vật từ prompt và ảnh tham chiếu vào không ổn thấy đầu ra khác quá, cái text to speech mà script được chỉnh lại phù hợp với video thì không hẳn là phải tham chiếu từ video riêng mà là tổng thể như chiều dài của video prompt của video và một chút prompt ảnh nữa". Three coordinated edits:
+
+1. **Character anchor.** New pure-helper module `desktop/dist/storyboard_character_anchor_helpers.js` (UMD, framework-free, 6 exports). New `<textarea id="sb-character-anchor">` between Visual DNA and Reference image (global). When filled, `sbbRunImageBatchForRowIds()` calls `applyCharacterAnchor(prompts, anchor)` to prepend `Subject anchor: <cue>. ` to every prompt before the IPC fires (or `applyCharacterAnchorToRefItems(items, anchor)` for ref-image-edit paths). Empty anchor short-circuits the helper call entirely per `(charHelpers && characterAnchor) ? helper() : raw` — byte-identical to pre-PR behavior. The anchor is **prepended verbatim**, period-terminated, then a single space, then the original prompt. Cap: 480 chars (silently truncated with whitespace cleanup).
+2. **Auto-fit 4-priority chain.** New `resolveAutoFitTarget()` helper + new `state.lastScenesTotalDuration` renderer cache. `renderSceneBreakdown()` captures `total_duration_s_estimate` from the response (or sums `duration_s` via `sumSceneDurations` as fallback) and calls `psRefreshReferenceVideos()`. New `psResolveAutoFitTarget()` invokes the helper with priority: explicit `Target duration override` (s) > settled scene videos (ffprobe-summed) > scene_breakdown estimate (sum of per-scene `duration_s` from words ÷ WPM) > none. `runComposeShort()` and `runRefineScript()` route through it instead of computing raw video durations directly. UI placeholders rewritten to spell out the chain.
+3. **ELEVENLABS_API_KEY top-level promotion.** Row moved OUT of `<details>Optional providers` to alongside DeepSeek + YouTube. The collapse now contains only Google/Gemini + RunningHub.
+
+Tests: new `test_storyboard_character_anchor_helpers.js` with **21** node:test cases covering normalize edge cases (whitespace collapse, trailing-period strip, 480-char cap), prefix building (with/without ref-image hint), prompt application (no-op on empty), refImg application, scene-duration summing, and 4-priority resolution (explicit > video > breakdown > none). E2E verified via mock-sidecar + helper-wrap CDP harness — all 4 test assertions PASS (see PR #89 comment + recording).
 
 ### PR #85 — fix(audio): dedupe per-scene narrations (merged, `fe2316f`)
 
@@ -253,7 +304,7 @@ Key additions since PR-75:
 - +5 `test_llm_helpers` + +4 `test_api_producer` (HF-11 PR #85): `_dedupe_scene_narrations` + `refine_per_scene_narrations` dedupe paths; `_dedupe_per_scene_narrations` route safety net + structured warnings.
 - +11 `test_pixelle_tts_providers` (HF-11 PR #86): `ElevenLabsAdapter.synthesize` mocked POST, missing-key `RuntimeError`, HTTP-error unpacking, `synthesize_with_timing` `WordBoundary` conversion, `make_tts_adapter("elevenlabs")` routing, `_list_tts_providers` env-presence reporting.
 
-### Desktop offline tests (28 files, all PASS)
+### Desktop offline tests (29 files, all PASS at `dd0ecb4`)
 
 ```
 test_account_service_path.js              test_research_sidecar_health_timeout.js
@@ -261,14 +312,17 @@ test_auth_service_keep_alive.js           test_research_sidecar_lookup.js
 test_auth_service_relogin_path.js         test_research_sidecar_port_bind.js   ← PR-72 NEW (9 tests)
 test_auth_session_status.js               test_research_sidecar_restart.js
 test_compose_voice_picker_helpers.js      test_storyboard_account_manager_helpers.js
+  ↑ 15 / 15 (HF-11 ElevenLabs filter, +2 in PR #88)
 test_e2e_compose_script.js                test_storyboard_assemble_helpers.js  ← 33 tests (was 21)
 test_fetch_python_runtime.js              test_storyboard_batch_helpers.js     ← 123 tests (was 116)
 test_grok_profile_dir.js                  test_storyboard_bridge.js
-test_i2v_service_process_one.js           test_storyboard_compose_helpers.js
-test_image_service_config.js              test_storyboard_compose_table_helpers.js
-test_keys_store.js                        test_storyboard_login_banner_helpers.js
-test_multi_account_fan_out.js             test_storyboard_progress_helpers.js
-test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.js
+test_i2v_service_process_one.js           test_storyboard_character_anchor_helpers.js  ← HF-12 NEW (21 tests)
+test_image_service_config.js              test_storyboard_compose_helpers.js
+test_keys_store.js                        test_storyboard_compose_table_helpers.js
+  ↑ 14 / 14 (+2 ELEVENLABS_API_KEY whitelist in PR #88)
+test_multi_account_fan_out.js             test_storyboard_login_banner_helpers.js
+test_refimg_service_process_one.js        test_storyboard_progress_helpers.js
+                                          test_storyboard_video_compose_helpers.js
                                           test_video_service_process_one.js
                                           test_video_validation_helpers.js
 ```
@@ -313,6 +367,10 @@ test_refimg_service_process_one.js        test_storyboard_video_compose_helpers.
 | Burn caption presets (HF-10) | `research/core/pixelle/assembler.py` → `CAPTION_STYLE_PRESETS`, `CAPTION_FONT_SIZES`, `CAPTION_POSITIONS`, `build_force_style()` |
 | Per-scene narration dedupe (HF-11 PR #85) | `research/core/llm.py` (`_dedupe_scene_narrations`, applied inside `refine_per_scene_narrations`) + `research/api/routes/producer.py` (`_dedupe_per_scene_narrations` route safety net) |
 | ElevenLabs TTS provider (HF-11 PR #86) | `research/core/pixelle/tts.py` (`ElevenLabsAdapter`, `make_tts_adapter("elevenlabs")`) + `research/api/routes/producer.py` (`KNOWN_TTS_PROVIDERS`, `_AUDIO_FORMAT_BY_PROVIDER`, `_list_tts_providers`) + `desktop/dist/creator-forge.html` (`ps-tts-provider` option) |
+| ELEVENLABS_API_KEY whitelist + Settings ⚙ field (HF-11 PR #88, promoted to top-level by HF-12 PR #89) | `desktop/electron/keysStore.js` (`ALLOWED_KEYS`) + `desktop/dist/creator-forge.js` (`KEY_INPUT_IDS`) + `desktop/dist/creator-forge.html` (`#key-elevenlabs` row, top-level alongside DeepSeek + YouTube) |
+| Voice picker self-heal on provider flip (HF-11 PR #88) | `desktop/dist/creator-forge.js` (`_psOnProviderChange` — paint from cache + background refetch + replace-if-larger) |
+| Character anchor (HF-12 PR #89) | `desktop/dist/storyboard_character_anchor_helpers.js` (UMD pure helpers — `normalizeCharacterAnchor`, `buildCharacterAnchorPrefix`, `applyCharacterAnchor`, `applyCharacterAnchorToRefItems`) + `desktop/dist/creator-forge.html` (`#sb-character-anchor` textarea between Visual DNA and Reference image) + `desktop/dist/creator-forge.js` (`sbbRunImageBatchForRowIds` calls helper before IPC) |
+| Auto-fit 4-priority chain (HF-12 PR #89) | `desktop/dist/storyboard_character_anchor_helpers.js` (`sumSceneDurations`, `resolveAutoFitTarget`) + `desktop/dist/creator-forge.js` (`state.lastScenesTotalDuration`, `renderSceneBreakdown` captures `total_duration_s_estimate`, `psResolveAutoFitTarget`, `psRefreshReferenceVideos`, `runComposeShort` + `runRefineScript` routes through resolver) |
 
 ---
 
@@ -348,8 +406,12 @@ API keys are persisted per-user via the ⚙ Settings dialog at `userData/api-key
 - **`/producer/refine_script` banned-token list** lives in `producer.py` (`BANNED_TOKENS`). Extending it requires a test asserting the new token doesn't appear in `refined_script` under real-LLM path.
 - **Thumbnail size** (96×132) is hardcoded CSS. If the storyboard panel width changes, revisit to maintain portrait aspect ratio.
 - **LLM diversity rule** (Hard rule #6) only ensures the prompt ships — adherence is non-deterministic. Next escalation: similarity-score first-N-words across `IMAGE PROMPT`s and reroll outliers in a post-processing pass.
-- **CDP-driven testing recipe** (HF-8): launch Electron with `--remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222`, drive `window.StoryboardAssembleHelpers` / `window.StoryboardBatchHelpers` from a CDP client. Use before reaching for full E2E with credentials.
+- **CDP-driven testing recipe** (HF-8): launch Electron with `--remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222`, drive `window.StoryboardAssembleHelpers` / `window.StoryboardBatchHelpers` / `window.StoryboardCharacterAnchorHelpers` from a CDP client. Use before reaching for full E2E with credentials.
+- **Helper-wrap testing pattern (HF-12).** `window.electronAPI` is **frozen** by Electron's contextBridge — `Object.defineProperty` throws `Cannot redefine property`, so IPC stubbing at the renderer level is impossible. But `window.*Helpers` UMD modules ARE mutable. Wrap their functions to capture inputs+outputs at the boundary just before IPC fires; the helper return value IS the IPC payload. This is how HF-12 PR #89 character-anchor + autofit-fallback was end-to-end verified without burning Grok credits. See `.agents/skills/testing-app/SKILL.md` for the pattern.
+- **Mock sidecar pattern (HF-12).** When a renderer flow depends on `/producer/scene_breakdown` (DeepSeek-backed), replace the sidecar with a FastAPI mock on `127.0.0.1:5050` returning canned responses. Mock MUST implement `/healthz` returning `{"service": "creator-forge.research", ...}` so `desktop/electron/researchSidecar.js:188` reuse-external-sidecar probe accepts it. Otherwise Electron tries to spawn its own and fails because the port is busy.
 - `CREATOR_FORGE_RESEARCH_HEALTH_TIMEOUT_MS` env knob for slow Windows cold-start. 180000 (3 min) is a safe upper bound.
 - **Burn caption styling** (HF-10): presets live in `assembler.py:CAPTION_STYLE_PRESETS`. To add a new preset, add a key to the dict, add the value to `CaptionStyle` Literal in both `assembler.py` and `producer.py:AssembleRequest.caption_style`, and add the option to `desktop/dist/creator-forge.html` (`pa-caption-style` select). Test via `test_assembler.py::test_build_force_style_*`.
 - **Voice list** (HF-10): 22 edge-tts voices in `voices.py:VOICES`. To add more, append a `Voice(...)` entry and add a matching `<option>` to `desktop/dist/creator-forge.html` (`ps-voice` select). Edge-tts voices are validated by name on the backend; unknown names get a warning but still pass through.
 - **TTS rate** (HF-10): `AudioOnlyRequest.rate` accepts edge-tts format strings like `"+20%"`, `"-10%"`. The UI slider maps integer -50…+100 to this format. Rate only affects edge-tts; Piper-tts ignores it silently.
+- **Character anchor cap** (HF-12): 480 chars in `normalizeCharacterAnchor`. Trailing `.` stripped before re-adding (so `Subject anchor: <cue>. ` is always single-period-terminated). If you change the prefix template, update `buildCharacterAnchorPrefix` AND the 21 unit tests in `test_storyboard_character_anchor_helpers.js`.
+- **Auto-fit priority chain** (HF-12): explicit `Target duration override` > settled scene videos (ffprobe-summed) > scene_breakdown estimate (sum of `duration_s`) > none. `0` in the override field means "no scaling — let TTS run native" (NOT "auto-fit"). `psResolveAutoFitTarget()` is the single source of truth — `runComposeShort` and `runRefineScript` both route through it. Don't reimplement the chain inline.
