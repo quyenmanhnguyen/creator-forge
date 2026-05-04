@@ -351,7 +351,7 @@ def refine_per_scene_narrations(
     out_raw = parsed.get("narrations")
     fallbacks = [it["original_narration"] for it in items]
     if not isinstance(out_raw, list):
-        return fallbacks
+        return _dedupe_scene_narrations(fallbacks, fallbacks)
     out: list[str] = []
     for i in range(n):
         v = out_raw[i] if i < len(out_raw) else None
@@ -362,6 +362,52 @@ def refine_per_scene_narrations(
         else:
             txt = str(v).strip()
         out.append(txt if txt else fallbacks[i])
+    return _dedupe_scene_narrations(out, fallbacks)
+
+
+def _dedupe_scene_narrations(
+    narrations: list[str], fallbacks: list[str]
+) -> list[str]:
+    """Strip duplicate per-scene narrations after the LLM rewrite.
+
+    DeepSeek occasionally ignores the "do not repeat the same opening
+    words across scenes" rule and emits identical strings for two
+    different scenes — usually scene 1 and the last scene. When the
+    Compose-audio pipeline TTS-renders both, the same caption appears
+    once at the start and once at the end of the assembled video,
+    looking like a "captions loop back to the beginning" bug to the
+    user.
+
+    Strategy: walk the list once. If a narration's normalised text
+    matches one we've already kept, swap it for the corresponding
+    ``fallbacks`` entry (the original linear chunk). If the fallback
+    is also a duplicate of something we've already emitted, blank
+    the slot — the caller pads silence in that scene rather than
+    re-speaking the line. Empty strings are passed through (they
+    are already pad-silence sentinels).
+
+    Comparison is case-insensitive and whitespace-collapsed so
+    "Hello world" matches "  hello   world  ".
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for i, narration in enumerate(narrations):
+        text = (narration or "").strip()
+        norm = " ".join(text.lower().split())
+        if not norm:
+            out.append(text)
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            out.append(text)
+            continue
+        fallback = (fallbacks[i] if i < len(fallbacks) else "") or ""
+        fb_norm = " ".join(fallback.strip().lower().split())
+        if fb_norm and fb_norm not in seen:
+            seen.add(fb_norm)
+            out.append(fallback.strip())
+        else:
+            out.append("")
     return out
 
 
