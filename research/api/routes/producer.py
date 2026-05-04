@@ -843,9 +843,9 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 script, output_path=audio_path, voice=tts_voice
             )
         except Exception as exc:  # noqa: BLE001 — boundary catch.
-            # HF-13 — auto-fallback to edge-tts on fatal ElevenLabs
-            # error so the user still gets audio + captions even when
-            # their key/IP is rate-limited or revoked.
+            # HF-13 — auto-fallback to edge-tts on fatal ElevenLabs error.
+            # Also fallback when piper-tts raises FileNotFoundError (the
+            # .onnx voice model is missing from ~/.creator-forge/piper-voices/).
             if (
                 (engine_name or "").lower() == "elevenlabs"
                 and is_elevenlabs_fatal_error(exc)
@@ -862,6 +862,21 @@ def compose_short(req: ShortRequest) -> ShortResponse:
                 adapter = fb_adapter
                 tts_voice = fb_voice
                 engine_name = getattr(fb_adapter, "name", EdgeTTSAdapter.name)
+                tts_result = adapter.synthesize_with_timing(
+                    script, output_path=audio_path, voice=tts_voice
+                )
+            elif (
+                (engine_name or "").lower() == "piper-tts"
+                and isinstance(exc, FileNotFoundError)
+            ):
+                fb_voice = DEFAULT_EDGE_FALLBACK_VOICE
+                warnings.append(
+                    f"Piper voice file not found ({exc}) — falling back to "
+                    f"edge-tts voice {fb_voice!r}."
+                )
+                adapter = _tts_factory_func("edge-tts")
+                tts_voice = fb_voice
+                engine_name = EdgeTTSAdapter.name
                 tts_result = adapter.synthesize_with_timing(
                     script, output_path=audio_path, voice=tts_voice
                 )
@@ -1638,23 +1653,37 @@ def _synthesize_per_scene_audio(
             # this batch and retry the current scene with the fallback
             # adapter so we still surface audio for it.
             fallback_used = False
+            _is_piper_missing = (
+                isinstance(exc, FileNotFoundError)
+                and getattr(adapter, "name", "") == "piper-tts"
+            )
             if (
                 not swapped_to_fallback
                 and fallback_factory is not None
-                and is_elevenlabs_fatal_error(exc)
+                and (is_elevenlabs_fatal_error(exc) or _is_piper_missing)
             ):
                 try:
                     fb_adapter, fb_voice, fb_audio_format = fallback_factory()
                 except Exception as fb_exc:  # noqa: BLE001
+                    _fb_label = (
+                        "Piper TTS (voice file not found)"
+                        if _is_piper_missing
+                        else "ElevenLabs"
+                    )
                     warnings.append(
-                        "ElevenLabs hit a fatal error and the edge-tts "
+                        f"{_fb_label} hit a fatal error and the edge-tts "
                         f"fallback could not be built: {type(fb_exc).__name__}: {fb_exc}"
                     )
                 else:
                     swapped_to_fallback = True
                     fallback_used = True
+                    _fb_label = (
+                        "Piper TTS (voice file not found)"
+                        if _is_piper_missing
+                        else "ElevenLabs"
+                    )
                     warnings.append(
-                        "ElevenLabs returned a fatal error "
+                        f"{_fb_label} returned a fatal error "
                         f"({type(exc).__name__}: {exc}) — falling back to edge-tts "
                         f"voice {fb_voice!r} for scene {i + 1} and beyond."
                     )
@@ -1964,16 +1993,17 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
             primary_voice = req.voice
 
             def _build_fallback() -> tuple[Any, str, str]:
-                # HF-13 — only ElevenLabs benefits from auto-fallback;
-                # piper/edge-tts errors are usually request-level and
-                # should surface as scene-level failures (silence pad).
-                if (primary_engine or "").lower() != "elevenlabs":
-                    raise RuntimeError(
-                        f"no fallback registered for engine {primary_engine!r}"
+                # HF-13 — ElevenLabs: auto-fallback on auth/quota/region errors.
+                # Piper-TTS: fallback when the .onnx voice file is missing —
+                # every scene will hit the same FileNotFoundError so a sticky
+                # swap to edge-tts is better than silence-padding all scenes.
+                if (primary_engine or "").lower() in ("elevenlabs", "piper-tts"):
+                    return _resolve_edge_fallback(
+                        primary_voice=primary_voice,
+                        primary_engine=primary_engine,
                     )
-                return _resolve_edge_fallback(
-                    primary_voice=primary_voice,
-                    primary_engine=primary_engine,
+                raise RuntimeError(
+                    f"no fallback registered for engine {primary_engine!r}"
                 )
 
             per_scene_results, combined_captions = _synthesize_per_scene_audio(
@@ -2061,11 +2091,10 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                     script, output_path=audio_path, voice=tts_voice
                 )
             except Exception as exc:  # noqa: BLE001 — boundary catch.
-                # HF-13 — same auto-fallback contract as the per-scene
-                # path: when the user picked elevenlabs and the API
-                # returned a fatal error (auth / quota / region), we
-                # transparently retry the entire single-pass synth on
-                # edge-tts so the call still produces audio.
+                # HF-13 — auto-fallback to edge-tts on fatal ElevenLabs error
+                # (auth / quota / region) OR on piper-tts FileNotFoundError
+                # (missing .onnx voice file). Both retry the full single-pass
+                # synth with edge-tts so the call still produces audio.
                 if (
                     (engine_name or "").lower() == "elevenlabs"
                     and is_elevenlabs_fatal_error(exc)
@@ -2084,6 +2113,24 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                     adapter = fb_adapter
                     tts_voice = fb_voice
                     engine_name = getattr(fb_adapter, "name", EdgeTTSAdapter.name)
+                    tts_result = adapter.synthesize_with_timing(
+                        script, output_path=audio_path, voice=tts_voice
+                    )
+                elif (
+                    (engine_name or "").lower() == "piper-tts"
+                    and isinstance(exc, FileNotFoundError)
+                ):
+                    fb_voice = DEFAULT_EDGE_FALLBACK_VOICE
+                    warnings.append(
+                        f"Piper voice file not found ({exc}) — falling back to "
+                        f"edge-tts voice {fb_voice!r} for the full script."
+                    )
+                    fb_adapter = _tts_factory_func("edge-tts")
+                    if req.rate and hasattr(fb_adapter, "rate"):
+                        fb_adapter.rate = req.rate
+                    adapter = fb_adapter
+                    tts_voice = fb_voice
+                    engine_name = EdgeTTSAdapter.name
                     tts_result = adapter.synthesize_with_timing(
                         script, output_path=audio_path, voice=tts_voice
                     )

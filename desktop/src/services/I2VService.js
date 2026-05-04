@@ -666,6 +666,11 @@ class I2VService {
             }
         }
 
+        // When the generation returned a URL but the file wasn't saved
+        // (download failed, timed out, or failed the size/validity check),
+        // set a descriptive error so the renderer shows something useful
+        // rather than the generic "possibly moderated" fallback message.
+        const _downloadFailed = result.videoUrl && !savedFile;
         const jobResult = {
             imagePath: item.imagePath,
             prompt: item.prompt,
@@ -675,7 +680,10 @@ class I2VService {
             savedFile,
             outputPath: savedFile || null,
             success: !!savedFile,
-            error: result.error,
+            error: result.error ||
+                (_downloadFailed
+                    ? 'Video URL received but download or validation failed — file may be corrupt or too small. Try Retry.'
+                    : null),
         };
 
         if (onProgress) {
