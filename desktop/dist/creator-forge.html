@@ -429,7 +429,15 @@
         .swc-table .thumb-cell video {
             width: 96px;
             height: 132px;
-            object-fit: cover;
+            /* HF-17 — was ``object-fit: cover`` which cropped 16:9 /
+               1:1 sources into a 96×132 portrait box, making every
+               output *look* 9:16 in the table even when Grok actually
+               produced a landscape frame. Switching to ``contain``
+               letterboxes against the dark cell background so the
+               thumbnail's aspect mirrors the saved file's real shape
+               and the user can verify their dropdown choice at a
+               glance. */
+            object-fit: contain;
             border-radius: 4px;
             background: var(--bg-0);
             border: 1px solid var(--border);
@@ -1425,10 +1433,22 @@
                         </select>
                     </label>
                     <label># scenes (blank = auto)
-                        <input id="sb-n-scenes" type="number" placeholder="auto" min="3" max="60" />
+                        <input id="sb-n-scenes" type="number" placeholder="auto" min="3" max="200" />
                     </label>
                     <label>Words per minute
                         <input id="sb-wpm" type="number" value="150" min="90" max="200" />
+                    </label>
+                    <!-- HF-17 — short-form pipeline. Default 30 s of
+                         narration per scene matches a short-form
+                         creator's expectation (≈ 6-10 s clip + a
+                         beat). Lowering it (e.g. 8) yields more
+                         denser scenes, raising it (e.g. 60)
+                         produces longer-form scenes. The legacy
+                         default was 90 s/scene, which under-counted
+                         scenes ~5× for typical scripts. Range
+                         clamped server-side to [4, 120]. -->
+                    <label title="Target spoken-narration duration per scene. Lower = more scenes, denser cuts. Higher = fewer, longer scenes. Blank uses the server default (30 s).">Seconds per scene
+                        <input id="sb-seconds-per-scene" type="number" placeholder="auto (30)" min="4" max="120" step="1" />
                     </label>
                     <label class="form-row-full">Script
                         <textarea id="sb-script" rows="10" placeholder="paste a long-form script (or click 'Send script → Storyboard' in Studio)"></textarea>

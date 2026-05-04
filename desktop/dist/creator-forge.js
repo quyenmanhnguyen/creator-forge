@@ -948,6 +948,17 @@
         if (nField && nField.trim().length) {
             params.n_scenes = asInt(nField, 12);
         }
+        // HF-17 — let the user override "seconds per scene" so a
+        // 28-min script doesn't land at 13 scenes (the old 90 s/scene
+        // default). Blank => server picks DEFAULT_SECONDS_PER_SCENE
+        // (30). Forward-compat: older sidecars ignore the field.
+        const spsField = (($('sb-seconds-per-scene') || {}).value || '').trim();
+        if (spsField.length) {
+            const sps = parseFloat(spsField);
+            if (Number.isFinite(sps) && sps > 0) {
+                params.seconds_per_scene = sps;
+            }
+        }
         // PR-A — long-running endpoint (30–120s typical), so use
         // the progress UI instead of the static loading spinner.
         // Phases are timed approximations of the backend's pipeline
@@ -3908,6 +3919,16 @@
         const config = Number.isFinite(rawDuration) && rawDuration > 0
             ? { videoLength: rawDuration }
             : {};
+        // HF-17 — wire the Aspect-ratio dropdown into the video IPC too
+        // (it was previously only wired into the image IPC). Without
+        // this, I2V_CONFIG.aspectRatio (``"2:3"``) leaked through and
+        // every generated clip came out portrait regardless of the
+        // user's selection — directly contradicting the dropdown
+        // choice. VideoService / I2VService already accept
+        // ``config.aspectRatio`` and fall back to their built-in
+        // defaults when missing, so the field is safe on older shells.
+        const videoAspect = asNonEmpty(($('sbb-aspect') || {}).value || '');
+        if (videoAspect) config.aspectRatio = videoAspect;
 
         let resp;
         try {
