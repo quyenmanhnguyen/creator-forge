@@ -17,12 +17,16 @@ import pytest
 
 from research.core.pixelle import tts as tts_mod
 from research.core.pixelle.tts import (
+    DEFAULT_EDGE_FALLBACK_VOICE,
     DEFAULT_TTS_PROVIDER,
+    ELEVENLABS_TO_EDGE_VOICE_MAP,
     KNOWN_TTS_PROVIDERS,
     EdgeTTSAdapter,
     ElevenLabsAdapter,
     PiperTTSAdapter,
     _elevenlabs_alignment_to_word_boundaries,
+    edge_voice_for_elevenlabs,
+    is_elevenlabs_fatal_error,
     make_tts_adapter,
     resolve_piper_voice_path,
 )
@@ -472,3 +476,84 @@ def test_elevenlabs_alignment_helper_groups_punctuation_with_word() -> None:
     assert out[0].end_s == pytest.approx(0.3)
     assert out[1].start_s == pytest.approx(0.4)
     assert out[1].end_s == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
+# HF-13 — fatal-error detection + edge-tts fallback voice mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # 401 free-tier-revoked — the exact bug report.
+        "ElevenLabs 401: Free Tier usage disabled — Unusual activity detected",
+        "ElevenLabs 401 Unauthorized: invalid_api_key",
+        "ELEVENLABS_API_KEY not set",
+        # 403 region / quota.
+        "ElevenLabs 403 Forbidden: detected_unusual_activity",
+        "ElevenLabs 422: voice_not_found",
+        "ElevenLabs 429: quota_exceeded — tier_quota_exceeded",
+        "ElevenLabs 422 Unprocessable Entity: model_not_found",
+        "ElevenLabs 429: too_many_concurrent_requests",
+    ],
+)
+def test_is_elevenlabs_fatal_error_detects_known_fatal_messages(msg: str) -> None:
+    """Every documented ElevenLabs error pattern must trip the predicate
+    so the route layer falls back to edge-tts on the next scene."""
+    assert is_elevenlabs_fatal_error(msg) is True
+    # Same predicate must also accept exceptions, not just strings.
+    assert is_elevenlabs_fatal_error(RuntimeError(msg)) is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # Empty / unrelated — must not trip a fallback.
+        "",
+        "edge-tts: connection reset",
+        "Piper voice file missing: en_US-amy-medium.onnx",
+        "ffmpeg returned non-zero exit code",
+        # Mentions ElevenLabs but is a transient network blip — keep
+        # retrying the same provider, don't burn the fallback.
+        "ElevenLabs 500: temporary server error",
+        "ElevenLabs 503: service unavailable",
+    ],
+)
+def test_is_elevenlabs_fatal_error_passes_through_recoverable_errors(msg: str) -> None:
+    """Transient / unrelated errors stay on the primary provider — the
+    sticky fallback is meant to break the *fatal* loop, not poach
+    edge-tts on a 500."""
+    assert is_elevenlabs_fatal_error(msg) is False
+
+
+def test_is_elevenlabs_fatal_error_handles_none() -> None:
+    """Defensive: None / blank strings must not crash the predicate."""
+    assert is_elevenlabs_fatal_error(None) is False  # type: ignore[arg-type]
+
+
+def test_edge_voice_for_elevenlabs_known_id_returns_mapped_voice() -> None:
+    """Every voice id in the map round-trips to a non-blank edge-tts
+    short_name. Default fallback is en-US-AriaNeural."""
+    rachel = "21m00Tcm4TlvDq8ikWAM"
+    assert edge_voice_for_elevenlabs(rachel) == ELEVENLABS_TO_EDGE_VOICE_MAP[rachel]
+    assert edge_voice_for_elevenlabs(rachel).startswith("en-")
+
+
+def test_edge_voice_for_elevenlabs_unknown_id_returns_default() -> None:
+    """Unknown / blank ids resolve to ``DEFAULT_EDGE_FALLBACK_VOICE`` so
+    the route layer never crashes on a freshly-cloned voice id."""
+    assert edge_voice_for_elevenlabs("totally-unknown-id-xyz") == DEFAULT_EDGE_FALLBACK_VOICE
+    assert edge_voice_for_elevenlabs("") == DEFAULT_EDGE_FALLBACK_VOICE
+    assert edge_voice_for_elevenlabs(None) == DEFAULT_EDGE_FALLBACK_VOICE  # type: ignore[arg-type]
+
+
+def test_elevenlabs_voice_map_values_look_like_edge_tts_short_names() -> None:
+    """Every mapped fallback voice must follow the ``<locale>-<Name>Neural``
+    shape so edge-tts can synthesize without a 400 from the upstream
+    provider. Catches a regression where someone pastes an ElevenLabs
+    voice id into the *value* column by accident."""
+    for elevenlabs_id, edge_voice in ELEVENLABS_TO_EDGE_VOICE_MAP.items():
+        assert elevenlabs_id, "blank ElevenLabs voice id in map"
+        assert edge_voice.endswith("Neural"), f"{edge_voice!r} not a Neural voice"
+        assert "-" in edge_voice, f"{edge_voice!r} missing locale prefix"

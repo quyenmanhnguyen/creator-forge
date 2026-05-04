@@ -523,6 +523,113 @@ def _elevenlabs_error_message(resp) -> str:
     return f"ElevenLabs HTTP {resp.status_code}: {snippet or '<no body>'}"
 
 
+# ---------------------------------------------------------------------------
+# Fatal-error detection + edge-tts fallback voice mapping
+# ---------------------------------------------------------------------------
+#
+# When the ElevenLabs API returns 401 ("Unusual activity detected. Free Tier
+# usage disabled"), 403 (forbidden), or any of the documented quota / voice
+# errors, retrying the same request will keep failing — the user's IP / key
+# is the problem, not the request shape. We surface a typed predicate so the
+# Producer route can fall back to ``edge-tts`` automatically and still emit
+# *some* audio rather than an empty response.
+
+ELEVENLABS_FATAL_FRAGMENTS: tuple[str, ...] = (
+    # 401 — auth / free-tier-revoked
+    "401",
+    "unauthorized",
+    "invalid_api_key",
+    "missing_api_key",
+    "elevenlabs_api_key not set",
+    "free tier usage disabled",
+    "unusual activity",
+    "detected_unusual_activity",
+    # 403 — forbidden / region locked
+    "403",
+    "forbidden",
+    # 422 / 400 — model / voice / quota errors
+    "voice_not_found",
+    "voice id not found",
+    "quota_exceeded",
+    "quota exceeded",
+    "max_character_limit_exceeded",
+    "concurrent_requests_exceeded",
+    "too_many_concurrent_requests",
+    "model_not_found",
+    "tier_quota_exceeded",
+)
+
+
+def is_elevenlabs_fatal_error(exc: BaseException | str) -> bool:
+    """Return True when an ElevenLabs error is unrecoverable for *this* request.
+
+    "Fatal" means retrying the same call against the same key/IP/voice will
+    keep failing — the safe move is to swap to a different provider rather
+    than burn N retries. We pattern-match on the error message because the
+    underlying ``requests.HTTPError`` subclasses don't carry a structured
+    ElevenLabs error code; the route emits ``"ElevenLabs <status>: <message>"``
+    via :func:`_elevenlabs_error_message` so the prefix + body fragments are
+    enough to disambiguate.
+
+    Accepts either an exception or a raw message string so callers can
+    feed a captured warning line back through the same predicate.
+    """
+    msg = str(exc).lower() if exc is not None else ""
+    if not msg:
+        return False
+    if "elevenlabs" not in msg and "eleven_labs" not in msg and "elevenlabs_api_key" not in msg:
+        return False
+    return any(frag in msg for frag in ELEVENLABS_FATAL_FRAGMENTS)
+
+
+# Map an ElevenLabs voice id to an edge-tts voice short name with the same
+# locale + gender so the fallback narration still sounds reasonable. Keep
+# this in sync with the curated list in :mod:`core.pixelle.voices`. Falls
+# back to ``en-US-AriaNeural`` (calm female en-US) for unknown ids.
+ELEVENLABS_TO_EDGE_VOICE_MAP: dict[str, str] = {
+    # Rachel · F · en-US (calm, narrator)
+    "21m00Tcm4TlvDq8ikWAM": "en-US-AriaNeural",
+    # Antoni · M · en-US (well-rounded)
+    "ErXwobaYiN019PkySvjV": "en-US-GuyNeural",
+    # Sarah · F · en-US (soft, news)
+    "EXAVITQu4vr4xnSDxMaL": "en-US-JennyNeural",
+    # Domi · F · en-US (confident)
+    "AZnzlk1HvdrTNbZXh": "en-US-SaraNeural",
+    # Adam · M · en-US (deep, narrator)
+    "pNInz6obpgDQGBFOQs8c": "en-US-DavisNeural",
+    # Arnold · M · en-US (crisp)
+    "VR6AewLTigWG4xSOukaG": "en-US-GuyNeural",
+    # Charlotte · F · en-US (seductive)
+    "XB0fDUnXU5powFXDhCwa": "en-US-AmberNeural",
+    # Charlie · M · en-AU (casual)
+    "IKne3meq5aSn9XLyUdCD": "en-GB-RyanNeural",
+    # Matilda · F · en-US (warm)
+    "XrExE9yKIg1WjnnlVkGX": "en-US-AriaNeural",
+    # Josh · M · en-US (deep)
+    "TxGEqnHWrfWFTfGW9XjX": "en-US-DavisNeural",
+    # Dorothy · F · en-GB (pleasant)
+    "ThT5KcBeYPX3keUQqHPh": "en-GB-LibbyNeural",
+    # Grace · F · en-US (gentle)
+    "oWAxZDx7w5VEj9dCyTzz": "en-US-JennyNeural",
+}
+
+DEFAULT_EDGE_FALLBACK_VOICE = "en-US-AriaNeural"
+
+
+def edge_voice_for_elevenlabs(elevenlabs_voice_id: str | None) -> str:
+    """Return the edge-tts short_name we should fall back to for *id*.
+
+    Unknown / blank ids resolve to :data:`DEFAULT_EDGE_FALLBACK_VOICE`. The
+    route layer uses this when ElevenLabs hits a fatal error so the
+    swap-in adapter speaks at roughly the same locale + gender the user
+    originally selected.
+    """
+    key = (elevenlabs_voice_id or "").strip()
+    if not key:
+        return DEFAULT_EDGE_FALLBACK_VOICE
+    return ELEVENLABS_TO_EDGE_VOICE_MAP.get(key, DEFAULT_EDGE_FALLBACK_VOICE)
+
+
 def _elevenlabs_alignment_to_word_boundaries(alignment: dict) -> list[WordBoundary]:
     """Convert ElevenLabs' per-character alignment payload to the
     pipeline's :class:`WordBoundary` list.

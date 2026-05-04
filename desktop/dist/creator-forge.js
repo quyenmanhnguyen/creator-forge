@@ -2983,6 +2983,136 @@
     }
 
     /**
+     * HF-13 — bulk-rewrite the image_prompts in every storyboard scene
+     * via DeepSeek so explicit anatomy / fabric vocabulary is replaced
+     * with editorial equivalents (\"form-fitting silk slip\" instead of
+     * \"see-through wet-look transparent fabric revealing nipples\")
+     * while pose / lighting / camera / mood are preserved verbatim.
+     *
+     * Used to rescue rows that keep landing in the ``fallback`` bucket
+     * because Grok / generic CDN moderation returns ~80 KB blurred
+     * placeholders for explicit prompts. After softening:
+     *
+     * - ``state.lastScenes[].image_prompt`` is overwritten in place so
+     *   the next \"Generate images\" run uses the softened text.
+     * - ``state.lastScenes[].image_prompts[]`` (per-variant array) is
+     *   overwritten in lock-step when the variant count matches.
+     * - ``sbbState.imageRows[].prompt`` is updated for every row that
+     *   maps to a softened variant; rows currently in flight are
+     *   skipped (the next batch run picks up the new prompt).
+     * - The image table is re-rendered so the user can see the new
+     *   prompt text.
+     *
+     * Falls back gracefully when the LLM is unreachable or
+     * ``DEEPSEEK_API_KEY`` is missing — the response includes the
+     * originals unchanged + a warning that the renderer surfaces in
+     * the result banner.
+     */
+    async function sbbSoftenPrompts() {
+        const banner = $('sbb-image-result');
+        if (!api || !api.producer || typeof api.producer.softenPrompts !== 'function') {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="error">electronAPI.producer.softenPrompts is unavailable — desktop shell needs the new preload.</div>',
+            );
+            return;
+        }
+        const scenes = Array.isArray(state.lastScenes) ? state.lastScenes : [];
+        if (!scenes.length) {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="empty">No scenes in memory — run "Break into scenes" above first.</div>',
+            );
+            return;
+        }
+        // Collect every prompt across scenes — the singular
+        // image_prompt + every per-variant image_prompts[] entry.
+        // Track the (scene_index, variant_index | -1 for singular)
+        // tuple so we can splice the rewrites back into the right
+        // slot after the call.
+        const slots = [];
+        const prompts = [];
+        scenes.forEach((s, sceneIdx) => {
+            if (!s || typeof s !== 'object') return;
+            if (typeof s.image_prompt === 'string' && s.image_prompt.trim()) {
+                slots.push({ sceneIdx, variantIdx: -1 });
+                prompts.push(s.image_prompt.trim());
+            }
+            if (Array.isArray(s.image_prompts)) {
+                s.image_prompts.forEach((p, variantIdx) => {
+                    if (typeof p === 'string' && p.trim()) {
+                        slots.push({ sceneIdx, variantIdx });
+                        prompts.push(p.trim());
+                    }
+                });
+            }
+        });
+        if (!prompts.length) {
+            if (banner) banner.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="empty">No image prompts to soften — every scene is blank.</div>',
+            );
+            return;
+        }
+        showLoading('sbb-image-result', `Softening ${prompts.length} image prompt(s) via DeepSeek…`);
+        let data;
+        try {
+            data = await api.producer.softenPrompts({
+                prompts,
+                language: 'Vietnamese',
+            });
+        } catch (err) {
+            showError('sbb-image-result', err);
+            return;
+        }
+        const usedLlm = !!(data && data.used_llm);
+        const warnings = (data && Array.isArray(data.warnings)) ? data.warnings : [];
+        const rewritten = (data && Array.isArray(data.softened_prompts)) ? data.softened_prompts : [];
+        if (usedLlm && rewritten.length === prompts.length) {
+            // Splice back into state.lastScenes in the same shape we
+            // pulled the originals from.
+            for (let i = 0; i < slots.length; i += 1) {
+                const { sceneIdx, variantIdx } = slots[i];
+                const next = (rewritten[i] || '').trim() || prompts[i];
+                const scene = scenes[sceneIdx];
+                if (!scene || typeof scene !== 'object') continue;
+                if (variantIdx === -1) {
+                    scene.image_prompt = next;
+                } else if (Array.isArray(scene.image_prompts) && variantIdx < scene.image_prompts.length) {
+                    scene.image_prompts[variantIdx] = next;
+                }
+            }
+            // Mirror into the image-batch rows so the user sees the
+            // new prompt text in the table immediately. Match by
+            // scene_id + variant_idx; rows in flight are left alone
+            // (their next attempt picks up the fresh state.lastScenes).
+            for (const row of sbbState.imageRows) {
+                if (!row || row.status === 'generating') continue;
+                const scene = scenes.find((s) => s && s.scene_id === row.scene_id);
+                if (!scene) continue;
+                const variantIdx = typeof row.variant_idx === 'number' ? row.variant_idx : 0;
+                const variantList = Array.isArray(scene.image_prompts) ? scene.image_prompts : [];
+                const next = (typeof variantList[variantIdx] === 'string' && variantList[variantIdx].trim())
+                    ? variantList[variantIdx].trim()
+                    : (typeof scene.image_prompt === 'string' ? scene.image_prompt.trim() : '');
+                if (next) row.prompt = next;
+            }
+            sbbRepaintImage();
+        }
+        const target = $('sbb-image-result');
+        if (target) {
+            const head = usedLlm
+                ? `<div class="info">Softened ${rewritten.length} prompt(s) via DeepSeek. Run "Generate images" / "🔄 Retry failed" to re-render with the new prompts.</div>`
+                : '<div class="info">Prompts unchanged (LLM did not run).</div>';
+            const warnHtml = warnings.length
+                ? `<div class="warn">${warnings.map(escapeHtml).join('<br>')}</div>`
+                : '';
+            target.innerHTML = head + warnHtml;
+            scrollResultIntoView(target);
+        }
+    }
+
+    /**
      * HF-5 #10 — repaint the small status pill that lives in the section
      * header next to the Generate / Retry / Open-folder buttons. Format:
      *
@@ -3947,6 +4077,9 @@
         // bucket on the last batch. Settled rows are skipped.
         'storyboard-batch-retry-failed-image': async () => sbbRetryFailed('image'),
         'storyboard-batch-retry-failed-video': async () => sbbRetryFailed('video'),
+        // HF-13 — rewrite stuck image_prompts via DeepSeek so Grok /
+        // CDN moderation stops returning <100KB blurred placeholders.
+        'storyboard-soften-prompts': async () => sbbSoftenPrompts(),
         // HF-5 #11 — open the active output folder in the OS file browser.
         'storyboard-batch-open-output-image': async () => sbbOpenOutputFolder('image'),
         'storyboard-batch-open-output-video': async () => sbbOpenOutputFolder('video'),

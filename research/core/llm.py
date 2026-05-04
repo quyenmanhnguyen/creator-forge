@@ -128,6 +128,53 @@ def parse_llm_json(raw: str) -> dict:
 # here mirror the H2Dev "PROMPT NGÁCH NHỎ PHẬT PHÁP" workflow:
 # Topic → Title → 8-part Outline → Long-form Script → Humanize Rewrite.
 
+# HF-13 — shared "natural spoken style" block reused across every script /
+# narration prompt. Keeps the AI-tells blacklist + spoken-style cues in
+# one place so the long-form writer, the humanise rewriter, and the
+# per-scene narration refiner all push toward the same voice. Without
+# this the writer step produces "in conclusion / furthermore / let's
+# dive in" boilerplate that survives the rewrite step intact, and the
+# user gets a script that "đầu ra script không hay không tự nhiên".
+_NATURAL_SPEECH_STYLE_BLOCK = (
+    "WRITE LIKE A REAL PERSON SPEAKING ON CAMERA — not like an AI essay:\n"
+    "- Use everyday spoken phrasing. Use contractions where they fit"
+    " (\"it's\", \"don't\", \"you're\", or the chosen language's"
+    " equivalent). For Vietnamese: prefer câu nói tự nhiên hằng ngày,"
+    " bỏ kiểu sách giáo khoa.\n"
+    "- Vary sentence length and rhythm. Mix short punchy lines (3-7"
+    " words) with longer ones. Two same-shape sentences in a row is"
+    " a smell — break it up.\n"
+    "- Address the viewer directly (\"you\" / \"bạn\") several times.\n"
+    "- BANNED AI-TELLS — never use these or their close translations:"
+    " \"in conclusion\", \"in summary\", \"furthermore\", \"moreover\","
+    " \"as a result\", \"that being said\", \"it's important to note\","
+    " \"this is an example of\", \"let's dive in\", \"let's dive into\","
+    " \"in this video\", \"today we'll explore\", \"as we can see\","
+    " \"navigating the\", \"the journey of\", \"unleash\", \"unlock\","
+    " \"delve into\", \"in the realm of\", \"tapestry\", \"meticulous\","
+    " \"meticulously\", \"a testament to\", \"plays a pivotal role\","
+    " \"crucial role\", \"crucially\", \"underscore\", \"underscores\","
+    " \"navigates the complex\", \"the world of\", \"in today's\","
+    " \"in our modern\", \"empower\", \"empowering\", \"in essence\","
+    " \"to put it simply\". Vietnamese tells to BAN equally: \"có thể"
+    " nói rằng\", \"điều này cho thấy\", \"như chúng ta đã biết\","
+    " \"trong thế giới hiện đại\", \"đóng vai trò quan trọng\", \"vô"
+    " cùng quan trọng\", \"không thể phủ nhận\", \"trên hành trình\","
+    " \"khám phá thế giới\", \"đắm chìm\", \"khẳng định\", \"vô vàn\".\n"
+    "- No bullet lists, no markdown bullets, no numbered headers"
+    " inside the body. The audience HEARS this — list-y prose sounds"
+    " robotic when read aloud.\n"
+    "- Avoid stacking three+ adjectives on the same noun (\"a vast,"
+    " sprawling, intricate landscape\"). One vivid word beats three"
+    " generic ones.\n"
+    "- Concrete sensory details beat abstract claims (\"the kitchen"
+    " smelled of burnt rice\" beats \"the atmosphere was tense\")."
+    " Anchor in things you can see, hear, smell, touch.\n"
+    "- Don't announce the emotion — let the moment carry it. Bad:"
+    " \"this was heartbreaking\". Good: show what made it"
+    " heartbreaking and let the listener feel it.\n"
+)
+
 
 def topic_ideas(seed: str, *, language: str, n: int = 20) -> dict:
     """Step 1 — generate ``n`` video topic ideas for ``seed`` niche/keyword.
@@ -217,12 +264,11 @@ def long_script_chunked(
     sys_template = (
         "You are a long-form YouTube narration writer. Expand the outline"
         " parts below into a full script.\n"
-        "RULES:\n"
+        + _NATURAL_SPEECH_STYLE_BLOCK
+        + "STRUCTURAL RULES:\n"
         f"- Each PART: minimum {target_per_part} characters in {language}.\n"
         "- Repeat the core emotion in different phrasings (avoid identical sentences).\n"
         "- Use lived-in details (drawers, late-night moments, hospital bills, etc.).\n"
-        "- Write conversationally — like telling a story to one person.\n"
-        "- Address the viewer directly several times.\n"
         "- No emojis, no special bullet symbols.\n"
         f"- Output is naturally read-aloud {language}, not a list.\n"
         "- Mark each PART with a ## PART N — <role> markdown header.\n"
@@ -315,7 +361,8 @@ def refine_per_scene_narrations(
     sys = (
         "You rewrite voice-over narration so it fits each scene of a"
         " short video.\n"
-        "INPUTS:\n"
+        + _NATURAL_SPEECH_STYLE_BLOCK
+        + "INPUTS:\n"
         "- An ORIGINAL_SCRIPT: the storyline / tone source of truth.\n"
         "- An array of SCENES, one per scene in playback order. Each"
         " scene has: index (0-based), target_duration_s (real duration"
@@ -325,7 +372,7 @@ def refine_per_scene_narrations(
         " scene), and original_narration (the linear chunk the renderer"
         " split off the original script — use it as a starting point,"
         " refine it).\n"
-        "RULES:\n"
+        "STRUCTURAL RULES:\n"
         "- Output exactly one refined narration per scene, IN ORDER.\n"
         "- Each narration MUST fit roughly within its target_words"
         " budget (\u00b120%); if you can't say it cleanly in the"
@@ -333,8 +380,9 @@ def refine_per_scene_narrations(
         "- Each narration should describe / complement what the scene's"
         " image_prompt shows, while staying faithful to the storyline"
         " in ORIGINAL_SCRIPT.\n"
-        "- Maintain emotional continuity scene-to-scene (do not repeat"
-        " the same opening words across scenes).\n"
+        "- Maintain emotional continuity scene-to-scene. Each scene"
+        " must START with a different opening (no two scenes begin"
+        " with the same word or filler phrase).\n"
         "- No section headers, no scene labels, no markdown — just the"
         " narration sentence(s) themselves.\n"
         f"- Write all narrations in {language}.\n"
@@ -468,14 +516,15 @@ def refine_script_for_narration(
         "You convert raw input (which may be a storyline, a JSON blob,"
         " an image-prompt dump, or a messy draft) into a CLEAN voice-over"
         " narration ready for text-to-speech.\n"
-        "INPUTS:\n"
+        + _NATURAL_SPEECH_STYLE_BLOCK
+        + "INPUTS:\n"
         "- RAW_INPUT: anything the user pasted in (treat as best-effort"
         " source material -- extract the underlying storyline; if it's"
         " purely prompt syntax with no narrative, fall back to the"
         " image_prompts).\n"
         "- IMAGE_PROMPTS: per-scene visual descriptions in playback"
         " order. Use them to ground the narration in what's on screen.\n"
-        "RULES:\n"
+        "STRUCTURAL RULES:\n"
         "- Output ONE flowing narration. No section headers. No scene"
         " labels. No JSON. No bracketed lists. No prompt syntax (no"
         " 'negative_prompt', no 'avoid', no comma-separated keyword"
@@ -509,20 +558,160 @@ def refine_script_for_narration(
 
 
 def humanize_rewrite(script: str, *, language: str) -> str:
-    """Step 5 — rewrite to remove AI tells without shrinking length."""
+    """Step 5 — rewrite to remove AI tells without shrinking length.
+
+    HF-13 — uses :data:`_NATURAL_SPEECH_STYLE_BLOCK` as the spine of the
+    rewrite instructions so the same banned-phrases / spoken-style cues
+    apply here as in the long-form writer step. We bump temperature to
+    0.85 (was 0.6) so the rewrite has enough headroom to actually rewrite
+    same-shape sentences instead of echoing them with synonyms swapped.
+    """
     sys = (
         "Rewrite the script below to sound more natural and human, while"
         " keeping the structure and length.\n"
-        "GOALS:\n"
-        "- Remove AI-sounding phrasing\n"
-        "- Vary sentence rhythm — fewer same-shape sentences in a row\n"
-        "- Strengthen emotional flow — make it feel earned, not announced\n"
-        "- Add natural lived-in details where helpful\n"
-        "- Keep the same PART structure and headers\n"
-        "RULES:\n"
+        + _NATURAL_SPEECH_STYLE_BLOCK
+        + "STRUCTURAL RULES:\n"
         "- Do NOT summarise or shorten any PART\n"
         "- Do NOT remove paragraphs\n"
         "- Do NOT change the title or section markers\n"
+        "- Keep the same PART structure and headers\n"
+        "- Strengthen emotional flow — make it feel earned, not announced\n"
+        "- Add natural lived-in details where helpful\n"
         f"- Write the entire output in {language}."
     )
-    return chat(script, system=sys, temperature=0.6)
+    return chat(script, system=sys, temperature=0.85)
+
+
+# ---------------------------------------------------------------------------
+# HF-13 — image prompt softener
+# ---------------------------------------------------------------------------
+#
+# Grok / generic CDN moderation returns a small (≤ ~80 KB) blurred
+# placeholder when the prompt asks for content the safety filter
+# blocks — explicit anatomy, see-through fabric naming nipples,
+# wet-look transparent garments, etc. Retrying the same prompt keeps
+# producing the same placeholder. The fix is to *rewrite the prompt*
+# to keep the artistic intent (pose, lighting, mood, framing) but
+# drop the body-part / fabric vocabulary that trips the filter.
+#
+# This helper is intentionally minimal: list of input prompts in,
+# list of softened prompts out (same length, same order). The route
+# layer (``/producer/soften_prompts``) wires it to a UI button so
+# the user can one-click rescue a row that keeps failing the
+# 100 KB image gate.
+
+# Words / phrases we instruct DeepSeek to avoid even after softening.
+# Kept here (not in the prompt body) so tests can sanity-check the
+# softener output. Plain lowercase tokens — case-insensitive
+# substring match by callers if they want to verify a "soft enough"
+# rewrite.
+_IMAGE_PROMPT_BLOCKED_TOKENS: tuple[str, ...] = (
+    # Explicit anatomy
+    "nipple", "nipples", "areola", "underboob", "sideboob", "cleavage",
+    "naked", "nude", "topless", "bare breasts", "exposed breasts",
+    "genital", "genitals", "vulva", "labia", "vagina",
+    "buttocks", "buttock", "anus",
+    # Explicit fabric / fit calls that consistently trigger filters
+    "see-through", "see through", "sheer mesh",
+    "transparent fabric", "translucent fabric",
+    "wet-look transparent", "wet look transparent",
+    "nearly invisible", "barely covering",
+    "thong", "g-string", "g string",
+    "skintight bralette", "wet bralette",
+    # Sexual descriptors
+    "seductive", "erotic", "erotically", "lustful",
+    "provocative pose", "suggestive pose",
+    # Age qualifiers (must never appear regardless of intent)
+    "underage", "minor", "child", "teen", "teenager", "schoolgirl",
+)
+
+
+def soften_image_prompts(
+    prompts: list[str],
+    *,
+    language: str = "English",
+) -> list[str]:
+    """Rewrite image prompts to be safe-for-CDN while preserving aesthetic intent.
+
+    Each input prompt is rewritten so that:
+
+    * Explicit body-part vocabulary (``nipple``, ``underboob``,
+      ``naked``, etc.) is removed.
+    * See-through / transparent / barely-covering fabric calls are
+      rewritten to fashion-magazine equivalents (\"form-fitting
+      satin\" / \"silk slip\" / \"draped chiffon\") that read as
+      tasteful editorial wardrobe rather than nudity-by-implication.
+    * Pose / lighting / camera / mood / setting / colour-palette
+      details are preserved verbatim — these are what carry the
+      artistic intent and are not what the moderator was rejecting.
+    * Style tags at the end (``high-detail, cinematic, 4K``, etc.)
+      are preserved verbatim.
+
+    The input list length is the source of truth — the LLM is asked
+    for exactly ``len(prompts)`` rewrites in the same order. If the
+    response is malformed we fall back to the original prompts so
+    callers always get a usable list back (and a warning surfaces
+    via the route layer).
+
+    ``language`` controls the rewrite language; pass the user's UI
+    language so the softener doesn't accidentally Anglicise prompts
+    written in Vietnamese / Korean / etc.
+
+    Raises ``RuntimeError(ERR_NO_DEEPSEEK_KEY)`` when the API key is
+    missing — callers fall back to the originals and surface the
+    sentinel as a warning string so the renderer can localise it.
+    """
+    n = len(prompts)
+    if n == 0:
+        return []
+    sys = (
+        "You rewrite image-generation prompts so they pass content"
+        " moderation while preserving every artistic decision the"
+        " original prompt encoded.\n"
+        "GOALS:\n"
+        "- Keep camera angle, framing, pose, lighting, environment,"
+        " colour palette, mood, time of day, and any style tags"
+        " (\"high-detail, cinematic, 4K\", etc.) VERBATIM.\n"
+        "- Replace explicit anatomy / fabric language with"
+        " fashion-editorial equivalents that imply rather than"
+        " state. \"wet-look transparent mesh revealing nipples\""
+        " becomes something like \"form-fitting silk slip with a"
+        " soft wet shimmer\". \"underboob / sideboob\" framing"
+        " becomes \"flattering neckline\" or just gets dropped.\n"
+        "- Subjects must be adult. Never reference age. If the"
+        " original used age-coded words (schoolgirl, teen, etc.)\n"
+        "  rewrite to a clear adult equivalent (\"young woman\","
+        " \"woman in her 20s\").\n"
+        "BANNED TOKENS — none of these (or close translations) may"
+        " appear in any output prompt: "
+        f"{', '.join(_IMAGE_PROMPT_BLOCKED_TOKENS)}.\n"
+        "STRUCTURAL RULES:\n"
+        f"- Output exactly {n} prompts, one per input, IN ORDER.\n"
+        "- Each output is a single paragraph of comma-separated"
+        " phrases (same shape as the input). No bullet lists.\n"
+        "- Never add disclaimers / apologies / commentary. The"
+        " output is the prompt itself.\n"
+        f"- Keep the prompts in {language}.\n"
+        "OUTPUT FORMAT: a single JSON object with one key"
+        " \"prompts\" whose value is an array of"
+        f" {n} strings, in the same order as the input."
+    )
+    user_payload = {"PROMPTS": [str(p or "") for p in prompts]}
+    raw = chat_json(json.dumps(user_payload, ensure_ascii=False), system=sys)
+    parsed = parse_llm_json(raw)
+    out_raw = parsed.get("prompts")
+    if not isinstance(out_raw, list):
+        return [str(p or "") for p in prompts]
+    out: list[str] = []
+    for i in range(n):
+        v = out_raw[i] if i < len(out_raw) else None
+        if isinstance(v, str):
+            txt = v.strip()
+        elif v is None:
+            txt = ""
+        else:
+            txt = str(v).strip()
+        if not txt:
+            txt = str(prompts[i] or "")
+        out.append(txt)
+    return out
