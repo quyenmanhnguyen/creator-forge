@@ -45,6 +45,13 @@
         // current Batch panel setting (which the user may bump
         // mid-session).
         lastImagesPerScene: 4,
+        // HF-12 — sum of per-scene ``duration_s`` from the last
+        // scene_breakdown response. Compose audio + Refine script
+        // fall back to this value when no Video batch rows have
+        // settled yet, so the SRT can scale to the planned total
+        // before the user burns Grok credits on Image / Video
+        // batches. ``0`` means no scene_breakdown ran yet.
+        lastScenesTotalDuration: 0,
     };
 
     // ─── Tabs ──────────────────────────────────────────────────────────────
@@ -951,6 +958,18 @@
         // panel reuses the same script that was just broken into scenes.
         state.lastScenes = scenes.slice();
         state.lastSceneScript = asNonEmpty($('sb-script').value) || '';
+        // HF-12 — cache the sidecar's authoritative total estimate (or
+        // sum the per-scene durations as a fallback). Compose audio
+        // and Refine script use this for auto-fit when no Video
+        // batch rows have settled yet, so the user can write
+        // narration before burning Grok credits.
+        const charHelpers = (typeof window !== 'undefined' && window.StoryboardCharacterAnchorHelpers) || null;
+        const echoedTotal = Number(data && data.total_duration_s_estimate);
+        if (Number.isFinite(echoedTotal) && echoedTotal > 0) {
+            state.lastScenesTotalDuration = echoedTotal;
+        } else if (charHelpers && typeof charHelpers.sumSceneDurations === 'function') {
+            state.lastScenesTotalDuration = charHelpers.sumSceneDurations(scenes);
+        }
         // PR-27: capture the Visual DNA the backend used (either
         // echoed from our override or auto-extracted from the script
         // when ``images_per_scene > 1``). Re-roll reads from this
@@ -976,6 +995,11 @@
         // in flight are NOT clobbered (initImageRowsFromScenes only
         // runs when the table is empty or the scene set changed).
         sbbSyncFromScenes(scenes);
+        // HF-12 — repaint the Compose audio auto-fit summary now that
+        // we have scene durations to fall back to. Without this the
+        // user has to click "Refresh from Video batch" before they
+        // see the new "scene_breakdown estimate" line.
+        try { psRefreshReferenceVideos(); } catch (_) { /* renderer not ready yet */ }
         let html = '';
         html += `<div class="stats-row">
             <span>Template<b>${escapeHtml(data.template_label || data.template_key || '')}</b></span>
@@ -1139,39 +1163,84 @@
     // back-compat and tests but is no longer reachable from the UI.
 
     /**
-     * Pull settled scene-video paths from ``sbbState.videoRows`` and
-     * paint a short summary in the Compose panel's reference field. The
-     * path list is what ``runComposeShort`` will send to /producer/audio
-     * as ``scene_videos[]`` so the SRT timing is auto-fit to the
-     * assembled video. Idempotent — safe to call from anywhere
-     * sbbState.videoRows mutates.
+     * HF-12 — resolve the auto-fit target for Compose audio / Refine
+     * script. Settled scene-video paths come first (sidecar ffprobes
+     * the summed duration), then the cached scene_breakdown estimate
+     * (sum of per-scene ``duration_s`` from words ÷ WPM), then a
+     * "no auto-fit" fallback. Returns a structured payload so
+     * callers can decide whether to forward ``scene_videos[]`` or
+     * a plain ``target_duration_s`` to the sidecar.
+     *
+     * @returns {{source: string, sceneVideos: string[],
+     *            targetDurationS: number, summaryText: string}}
      */
-    function psRefreshReferenceVideos() {
+    function psResolveAutoFitTarget() {
         const helpers = paHelpers();
         let paths = [];
         if (helpers && typeof helpers.pullScenePathsFromBatch === 'function') {
             paths = helpers.pullScenePathsFromBatch(sbbState && sbbState.videoRows);
         }
+        const charHelpers = (typeof window !== 'undefined' && window.StoryboardCharacterAnchorHelpers) || null;
+        if (!charHelpers || typeof charHelpers.resolveAutoFitTarget !== 'function') {
+            // Defensive: helper script failed to load — fall back to
+            // the legacy "videos or none" behaviour without crashing.
+            return {
+                source: paths.length ? 'videos' : 'none',
+                sceneVideos: paths,
+                targetDurationS: 0,
+                summaryText: paths.length
+                    ? `${paths.length} scene video${paths.length === 1 ? '' : 's'} ready — captions will auto-fit their summed duration (override below).`
+                    : 'no scene videos yet — generate the Video batch above to enable auto-fit',
+            };
+        }
+        const targetRaw = ($('ps-target-duration') && $('ps-target-duration').value) || '';
+        const override = parseFloat(targetRaw);
+        return charHelpers.resolveAutoFitTarget({
+            sceneVideoPaths: paths,
+            scenes: Array.isArray(state.lastScenes) ? state.lastScenes : [],
+            totalDurationEstimate: state.lastScenesTotalDuration || 0,
+            targetOverrideS: Number.isFinite(override) ? override : 0,
+        });
+    }
+
+    /**
+     * Pull settled scene-video paths from ``sbbState.videoRows`` and
+     * paint a short summary in the Compose panel's auto-fit field. The
+     * path list is what ``runComposeShort`` will send to /producer/audio
+     * as ``scene_videos[]`` so the SRT timing is auto-fit to the
+     * assembled video. HF-12 — when no scene videos have settled yet,
+     * the summary surfaces the scene_breakdown estimate so the user
+     * can compose narration before burning Grok credits. Idempotent —
+     * safe to call from anywhere sbbState.videoRows or
+     * state.lastScenes mutates.
+     */
+    function psRefreshReferenceVideos() {
+        const target = psResolveAutoFitTarget();
         const summary = $('ps-reference-summary');
         if (summary) {
-            if (!paths.length) {
+            if (target.source === 'none') {
                 summary.value = '';
-                summary.placeholder = 'no scene videos yet — generate the Video batch above to enable auto-fit';
+                summary.placeholder = 'no scene videos and no scene_breakdown yet — run "Break into scenes" above to enable auto-fit';
             } else {
-                summary.value = `${paths.length} scene video${paths.length === 1 ? '' : 's'} ready — captions will auto-fit their summed duration (override below).`;
+                summary.value = target.summaryText;
             }
         }
-        return paths;
+        return target.sceneVideos;
     }
 
     async function composeRefreshReference() {
-        const paths = psRefreshReferenceVideos();
-        const target = $('ps-result');
-        if (target) {
-            if (paths.length === 0) {
-                target.innerHTML = `<div class="info">No settled video rows found. Generate the Video batch above first; ffprobe needs at least one mp4/mov/m4v/webm to scale the SRT.</div>`;
+        const target = psResolveAutoFitTarget();
+        psRefreshReferenceVideos();
+        const out = $('ps-result');
+        if (out) {
+            if (target.source === 'videos') {
+                out.innerHTML = `<div class="info">Compose audio will scale captions to fit ${target.sceneVideos.length} scene video${target.sceneVideos.length === 1 ? '' : 's'} (ffprobe-summed). Override via the "Target duration" field above.</div>`;
+            } else if (target.source === 'scene_breakdown') {
+                out.innerHTML = `<div class="info">No scene videos yet — Compose audio will scale captions to the scene_breakdown estimate (${target.targetDurationS.toFixed(1)}s). Generate the Video batch above to switch to ffprobe-measured duration, or override via the "Target duration" field.</div>`;
+            } else if (target.source === 'override') {
+                out.innerHTML = `<div class="info">Manual target duration: ${target.targetDurationS.toFixed(1)}s.</div>`;
             } else {
-                target.innerHTML = `<div class="info">Compose audio will scale captions to fit ${paths.length} scene video${paths.length === 1 ? '' : 's'} (auto-fit). Override via the "Target duration" field above.</div>`;
+                out.innerHTML = `<div class="info">No auto-fit source available. Run "Break into scenes" above first, or generate the Video batch, or type a target duration override.</div>`;
             }
         }
     }
@@ -1202,16 +1271,19 @@
         };
         const outDir = asNonEmpty($('ps-output-dir').value);
         if (outDir) params.output_dir = outDir;
-        // PR-A — auto-sync SRT to the assembled video. Always send the
-        // settled scene videos so the sidecar can ffprobe-sum their
-        // durations; an explicit numeric ``Target duration override``
-        // wins (skips ffprobe and uses the literal seconds).
-        const sceneVideos = psRefreshReferenceVideos();
-        if (sceneVideos.length) params.scene_videos = sceneVideos;
-        const targetRaw = ($('ps-target-duration') && $('ps-target-duration').value) || '';
-        const target = parseFloat(targetRaw);
-        if (Number.isFinite(target) && target > 0) {
-            params.target_duration_s = target;
+        // PR-A / HF-12 — auto-sync SRT. Priority: explicit override >
+        // settled scene-video paths (sidecar ffprobes the sum) >
+        // scene_breakdown estimate (sum of per-scene duration_s
+        // from words ÷ WPM, so users can compose narration before
+        // burning Grok credits on Image / Video batches) > none.
+        const autoFit = psResolveAutoFitTarget();
+        psRefreshReferenceVideos();
+        if (autoFit.source === 'override') {
+            params.target_duration_s = autoFit.targetDurationS;
+        } else if (autoFit.source === 'videos') {
+            params.scene_videos = autoFit.sceneVideos;
+        } else if (autoFit.source === 'scene_breakdown') {
+            params.target_duration_s = autoFit.targetDurationS;
         }
         // Per-scene narration: when the storyboard has been broken into
         // scenes, send each scene's narration as its own slot so the
@@ -3456,14 +3528,28 @@
         // checkbox state survives a re-render.
         if (sbbState.proMode) config.enablePro = true;
 
+        // HF-12 — apply the Storyboard Character anchor verbatim to
+        // every prompt so Grok's imagine / imagine-image-edit model
+        // sees the same identity cue on every variant. Visual DNA
+        // covers style; this covers WHO. The helper is a no-op when
+        // the textarea is empty so existing flows are unaffected.
+        const charHelpers = (typeof window !== 'undefined' && window.StoryboardCharacterAnchorHelpers) || null;
+        const characterAnchor = (($('sb-character-anchor') || {}).value || '').trim();
+        const finalPlainPrompts = (charHelpers && characterAnchor)
+            ? charHelpers.applyCharacterAnchor(plainPlan.prompts, characterAnchor)
+            : plainPlan.prompts;
+        const finalRefItems = (charHelpers && characterAnchor)
+            ? charHelpers.applyCharacterAnchorToRefItems(refPlan.items, characterAnchor)
+            : refPlan.items;
+
         const tasks = [];
-        if (plainPlan.prompts.length) {
-            tasks.push(api.image.generate({ prompts: plainPlan.prompts, config })
+        if (finalPlainPrompts.length) {
+            tasks.push(api.image.generate({ prompts: finalPlainPrompts, config })
                 .then((resp) => ({ kind: 'image', resp, plan: plainPlan }))
                 .catch((err) => ({ kind: 'image', err, plan: plainPlan })));
         }
-        if (refPlan.items.length) {
-            tasks.push(api.refimg.generate({ items: refPlan.items, config })
+        if (finalRefItems.length) {
+            tasks.push(api.refimg.generate({ items: finalRefItems, config })
                 .then((resp) => ({ kind: 'refimg', resp, plan: refPlan }))
                 .catch((err) => ({ kind: 'refimg', err, plan: refPlan })));
         }
@@ -3757,13 +3843,18 @@
             });
         }
         // Auto-fit target: scene videos auto-fill from settled rows of
-        // the Video batch above. Explicit override wins.
-        const sceneVideos = psRefreshReferenceVideos();
-        if (sceneVideos.length) params.scene_videos = sceneVideos;
-        const targetRaw = ($('ps-target-duration') && $('ps-target-duration').value) || '';
-        const target = parseFloat(targetRaw);
-        if (Number.isFinite(target) && target > 0) {
-            params.target_duration_s = target;
+        // the Video batch above. Explicit override wins. HF-12 — when
+        // no Video batch rows have settled, fall back to the
+        // scene_breakdown estimate so Refine script can size the
+        // narration before the user burns Grok credits.
+        const autoFit = psResolveAutoFitTarget();
+        psRefreshReferenceVideos();
+        if (autoFit.source === 'override') {
+            params.target_duration_s = autoFit.targetDurationS;
+        } else if (autoFit.source === 'videos') {
+            params.scene_videos = autoFit.sceneVideos;
+        } else if (autoFit.source === 'scene_breakdown') {
+            params.target_duration_s = autoFit.targetDurationS;
         }
         showLoading('ps-result', 'Refining script for narration (DeepSeek LLM)...');
         try {
