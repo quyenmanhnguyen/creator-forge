@@ -1438,13 +1438,20 @@ def _ffmpeg_concat_audio_segments(
 
     work_dir = output_path.parent
     list_path = work_dir / f"_scene_audio_list_{int(time.time() * 1000)}.txt"
-    silence_paths: list[Path] = []
+    # HF-13a — ``None`` is the no-pad sentinel here, NOT ``Path("")``.
+    # ``Path("")`` silently resolves to ``Path(".")`` which is truthy,
+    # which used to slip through the ``if sil and str(sil)`` check below
+    # and stamp ``file '.'`` into the concat list. ffmpeg then bailed on
+    # the directory entry and only scene 1's audio survived in the
+    # final mp3 — the bug that made every per-scene call lose scenes
+    # 2..N even when the per-scene synthesis itself succeeded.
+    silence_paths: list[Path | None] = []
 
     try:
         # 1. Generate silence pads (one file per non-zero pad).
         for i, pad_s in enumerate(silence_pads_s):
             if pad_s <= 0.001:
-                silence_paths.append(Path(""))
+                silence_paths.append(None)
                 continue
             silence_path = work_dir / f"_silence_{i}_{int(time.time() * 1000)}.{audio_format}"
             silence_paths.append(silence_path)
@@ -1481,9 +1488,13 @@ def _ffmpeg_concat_audio_segments(
         # 2. Build the concat list interleaving real segments and silence pads.
         concat_lines: list[str] = []
         for seg, sil in zip(segments, silence_paths):
-            if seg and str(seg):
+            # HF-13a — a missing segment slot is ``Path("")`` (a
+            # placeholder used by the per-scene loop when synthesis
+            # fails and we don't have a recorded scene path); skip it
+            # so we don't write ``file '.'`` into the list.
+            if seg and str(seg) and str(seg) != ".":
                 concat_lines.append(_concat_list_line(seg))
-            if sil and str(sil):
+            if sil is not None and str(sil) and str(sil) != ".":
                 concat_lines.append(_concat_list_line(sil))
         list_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
@@ -1530,7 +1541,7 @@ def _ffmpeg_concat_audio_segments(
             pass
         for sil in silence_paths:
             try:
-                if sil and str(sil) and Path(sil).exists():
+                if sil is not None and str(sil) and str(sil) != "." and Path(sil).exists():
                     Path(sil).unlink()
             except OSError:
                 pass
@@ -1546,7 +1557,7 @@ def _synthesize_per_scene_audio(
     audio_format: Literal["mp3", "wav"],
     warnings: list[str],
     fallback_factory: Any = None,
-) -> tuple[list[_PerSceneSynthResult], list[Caption]]:
+) -> tuple[list[_PerSceneSynthResult], list[Caption], str, str]:
     """Run TTS per-scene and pad each segment to its scene_video duration.
 
     Returns ``(per_scene_results, combined_captions)`` where
@@ -1580,6 +1591,13 @@ def _synthesize_per_scene_audio(
     combined_captions: list[Caption] = []
     cumulative_offset_s = 0.0
     swapped_to_fallback = False
+    # HF-13a — track the engine + voice that ACTUALLY produced audio so
+    # the route can report ``engine="edge-tts"`` (not the original
+    # "elevenlabs") in the response after a fatal-error swap. Without
+    # this the response confusingly reads ``engine="elevenlabs"`` even
+    # though the bytes on disk came from edge-tts.
+    effective_engine_name = getattr(adapter, "name", "") or ""
+    effective_voice = voice
 
     for i, raw_narration in enumerate(scene_narrations):
         narration = (raw_narration or "").strip()
@@ -1661,6 +1679,10 @@ def _synthesize_per_scene_audio(
                     adapter = fb_adapter
                     voice = fb_voice
                     audio_format = fb_audio_format
+                    effective_engine_name = (
+                        getattr(fb_adapter, "name", "") or effective_engine_name
+                    )
+                    effective_voice = fb_voice
                     scene_path = output_dir / f"voice_scene_{i + 1:02d}.{audio_format}"
                     try:
                         tts_result = adapter.synthesize_with_timing(
@@ -1787,7 +1809,7 @@ def _synthesize_per_scene_audio(
         )
         cumulative_offset_s += final_seg
 
-    return results, combined_captions
+    return results, combined_captions, effective_engine_name, effective_voice
 
 
 @router.post("/audio", response_model=AudioOnlyResponse)
@@ -1976,7 +1998,12 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                     primary_engine=primary_engine,
                 )
 
-            per_scene_results, combined_captions = _synthesize_per_scene_audio(
+            (
+                per_scene_results,
+                combined_captions,
+                effective_engine,
+                effective_voice,
+            ) = _synthesize_per_scene_audio(
                 effective_scene_narrations,
                 adapter=adapter,
                 voice=req.voice,
@@ -1986,6 +2013,14 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                 warnings=warnings,
                 fallback_factory=_build_fallback,
             )
+            # HF-13a — propagate the engine actually used by the
+            # per-scene path so the response reflects the post-swap
+            # state (e.g. "edge-tts" after the sticky fallback fires)
+            # instead of the originally-requested "elevenlabs".
+            if effective_engine:
+                engine_name = effective_engine
+            if effective_voice:
+                tts_voice = effective_voice
         except Exception as exc:  # noqa: BLE001 — boundary catch.
             msg = f"Per-scene TTS failed: {type(exc).__name__}: {exc}"
             logger.warning(msg)
