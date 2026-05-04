@@ -1,8 +1,67 @@
 # Creator-Forge — CHECKPOINT
 
-> Last updated: 2026-05-03 (post PR-85 — fix killByPort Windows tree-kill on API key Save)
-> Main HEAD: `PR-85` — `fix(sidecar): use /F /T /PID tree-kill in killByPort on Windows`
-> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → PR-85 (local fix)
+> Last updated: 2026-05-03 (post HF-11 sprint — caption-repeat dedupe + ElevenLabs TTS provider, both PRs OPEN awaiting merge)
+> Main HEAD: `91dc43a` — `fix(sidecar): use /F /T /PID tree-kill in killByPort on Windows (#85)`
+> Last sprint code commits: `bff32f9` (PR-82) → `c84dd17` (PR-83) → `43268cf` (PR-84/HF-10) → `91dc43a` (killByPort tree-kill) → **PR #85 + PR #86 (HF-11, awaiting merge)**
+
+---
+
+## ⚠ Action required to resume on a clean main
+
+Two HF-11 PRs are open + green; main does NOT yet contain them.
+
+| PR | Title | State | CI | Mergeable |
+| --- | --- | --- | --- | --- |
+| [#85](https://github.com/quyenmanhnguyen/creator-forge/pull/85) | fix(audio): dedupe per-scene narrations to prevent caption-repeat at end of video | OPEN | 2/2 ✓ | yes |
+| [#86](https://github.com/quyenmanhnguyen/creator-forge/pull/86) | feat(audio): add ElevenLabs TTS provider as alternative to edge-tts | OPEN | 2/2 ✓ | yes |
+
+**To resume:** click **Merge pull request** on each, then `git checkout main && git pull --ff-only` locally.
+
+## Run-locally checklist (after merge)
+
+```powershell
+# Windows PowerShell — only needed if you'll test the ElevenLabs provider:
+$env:ELEVENLABS_API_KEY = "sk_..."   # get from https://elevenlabs.io/app/settings/api-keys
+# (Or: open the desktop app → Settings ⚙ → Secrets → save with scope=user — auto-injected on sidecar restart.)
+```
+
+```bash
+# macOS / Linux equivalent:
+export ELEVENLABS_API_KEY=sk_...
+```
+
+Then:
+```bash
+git pull --ff-only
+cd desktop && npm install   # only if package.json changed (HF-11 didn't)
+npm start                   # spawns sidecar on 127.0.0.1:5050
+```
+
+In the desktop window:
+- **Caption-dedupe smoke test (PR #85, free)**: Studio → write a short script → Compose Audio → enable `humanize_per_scene` → Generate Audio. With a 3-scene script the warnings list should NO LONGER show duplicate captions in the final SRT (compare against the user-supplied `final.mp4` from 2026-05-03 which had "Late night grocery run..." repeated near the end).
+- **ElevenLabs voice smoke test (PR #86, paid — burns ~70 chars from your ElevenLabs free quota)**: Compose Audio → flip **TTS provider** dropdown from `edge-tts` to `elevenlabs` → voice list refreshes to show the 12 curated voices (Rachel, Antoni, Sarah, ...) → pick **Rachel · F (calm en-US)** → paste *"Xin chào, đây là bản dịch tiếng Việt do ElevenLabs đọc."* → Generate Audio. Should produce a natural-sounding multilingual MP3, NOT robotic edge-tts.
+
+**If `ELEVENLABS_API_KEY` is unset and you flip to `elevenlabs`:** the route returns a structured warning string (`"ELEVENLABS_API_KEY not set..."`) instead of a 500 — this is intentional graceful degradation, not a bug.
+
+---
+
+## HF-11 — Caption-repeat fix + ElevenLabs TTS provider (sprint complete pre-merge)
+
+User feedback after HF-10 final.mp4: "cái lời cho voice text to speech chưa đủ hay, thô kệch quá, và video gần cuối nó bị lặp lại text đoạn đầu". Scope after clarification: skip upscale + skip BGM, focus on caption-repeat fix + ElevenLabs (with API key).
+
+| PR | What it ships |
+| --- | --- |
+| **#85** caption-dedupe | Two-layer guard against duplicate per-scene narrations: **(1)** `core/llm.refine_per_scene_narrations` post-processes the LLM output through new `_dedupe_scene_narrations` helper — duplicate slots swap for `original_narration` fallback, or blank to silence-pad if fallback also collides. **(2)** `routes/producer._dedupe_per_scene_narrations` is the safety net AFTER `humanize_per_scene` — catches duplicates from any source (LLM, upstream chunker, user paste) and emits a structured warning naming the scene index. Both compare case-insensitively + whitespace-collapsed. Tests: +5 `test_llm_helpers` + +4 `test_api_producer`. |
+| **#86** ElevenLabs adapter | New `ElevenLabsAdapter` in `core/pixelle/tts.py`: `.synthesize()` POSTs `/v1/text-to-speech/{voice_id}` (mp3 stream); `.synthesize_with_timing()` POSTs `/with-timestamps` and converts per-character `normalized_alignment` to `WordBoundary` objects (whitespace-bounded grouping; punctuation stays attached to preceding word — matches Edge-TTS contract). Reads `ELEVENLABS_API_KEY` from env; missing key → `RuntimeError` with link to https://elevenlabs.io/app/settings/api-keys. HTTP errors unpacked to `"ElevenLabs <status>: <message>"`. `KNOWN_TTS_PROVIDERS` gains `"elevenlabs"`; `make_tts_adapter("elevenlabs")` routes to new adapter. 12 curated voices added to `VOICES` (Rachel, Antoni, Sarah, Domi, Adam, Arnold, Charlotte, Charlie, Matilda, Josh, Dorothy, Grace) — `short_name` is the raw ElevenLabs voice id so existing voice-picker plumbing passes it straight to the API. `_AUDIO_FORMAT_BY_PROVIDER` maps `elevenlabs → mp3`. `_list_tts_providers()` reports `elevenlabs` with `is_configured` following env presence. HTML `ps-tts-provider` dropdown gains `elevenlabs` option. Tests: +11 `test_pixelle_tts_providers` + 1 line in `test_api_producer` providers-set assertion. |
+
+**Strict-bucket pytest:** 261 (PR #85) → **275 (PR #86)** all passing. `ruff` clean, `node --check` clean, JS voice-picker tests 13/13 unchanged.
+
+**Out-of-scope this sprint (deferred per user):**
+- Real-ESRGAN upscaling ("bỏ upscale đi")
+- BGM picker / sidechain duck ("skip BGM lần này")
+- SSML pitch/volume on edge-tts (rolled into ElevenLabs scope instead since user opted to pay for higher-quality voice)
+
+---
 
 ---
 
@@ -20,9 +79,17 @@
 
 ---
 
-## Sprint History (PR-47 → PR-85)
+## Sprint History (PR-47 → PR-86)
 
-### PR-85 — fix(sidecar): `killByPort` Windows tree-kill on API key Save
+### PR-85 (current) — fix(audio): dedupe per-scene narrations
+
+See "HF-11" section above. Awaiting merge.
+
+### PR-86 (current) — feat(audio): add ElevenLabs TTS provider
+
+See "HF-11" section above. Awaiting merge.
+
+### `91dc43a` — fix(sidecar): `killByPort` Windows tree-kill on API key Save
 
 User report: "Keys saved, sidecar restart failed: research sidecar restart: port :5050 still busy after shutdown attempt" — occurs every time user clicks Save in the Settings ⚙ dialog while running in dev mode (`npm run dev`).
 
