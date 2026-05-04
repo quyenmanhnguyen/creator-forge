@@ -48,9 +48,23 @@ from typing import Any
 # ─── Tunables ────────────────────────────────────────────────────────────────
 
 DEFAULT_WORDS_PER_MIN = 150  # spoken English ≈ 140–160 WPM
-DEFAULT_WORDS_PER_SCENE = 220  # ≈ 90 s of speech per scene at 150 WPM
+# HF-17 — short-form pipeline default. The downstream Storyboard
+# generates ~6 s i2v / t2v clips per scene, so ~90 s of speech per
+# scene (the legacy ``DEFAULT_WORDS_PER_SCENE = 220``) under-estimates
+# scene count by ~5×. Calibrated for the Storyboard's default 6-10 s
+# scene clips: 30 s of speech ≈ 75 words at 150 WPM.
+DEFAULT_SECONDS_PER_SCENE = 30
+DEFAULT_WORDS_PER_SCENE = round(
+    DEFAULT_SECONDS_PER_SCENE * (DEFAULT_WORDS_PER_MIN / 60)
+)
+MIN_SECONDS_PER_SCENE = 4
+MAX_SECONDS_PER_SCENE = 120
 MIN_SCENE_COUNT = 3
-MAX_SCENE_COUNT = 60
+# HF-17 — bumped from 60 → 200 so a 28-min long-form script can land
+# at ~10 s/scene without hitting the cap. The cap still protects
+# against pathological inputs that would burn LLM tokens on hundreds
+# of scenes.
+MAX_SCENE_COUNT = 200
 
 
 @dataclass(frozen=True)
@@ -255,17 +269,32 @@ def estimate_scene_count(
     words_per_scene: int = DEFAULT_WORDS_PER_SCENE,
     min_scenes: int = MIN_SCENE_COUNT,
     max_scenes: int = MAX_SCENE_COUNT,
+    seconds_per_scene: float | None = None,
+    words_per_minute: int = DEFAULT_WORDS_PER_MIN,
 ) -> int:
     """Estimate how many scenes a script of this length deserves.
 
-    Defaults to ``words_per_scene=220`` (≈ 90 s of speech), clamped to
-    ``[min_scenes, max_scenes]``. Returns ``min_scenes`` for empty
-    scripts so the UI never offers ``0`` scenes.
+    Two ways to express the desired scene length:
+    * ``words_per_scene`` (raw, default ``DEFAULT_WORDS_PER_SCENE``).
+    * ``seconds_per_scene`` (HF-17 — preferred, derived from the
+      configured TTS cadence). When provided this *overrides*
+      ``words_per_scene`` so the UI's "Seconds per scene" control
+      lines up directly with the Storyboard's per-scene clip
+      duration regardless of WPM.
+
+    Returns ``min_scenes`` for empty scripts so the UI never offers
+    ``0`` scenes; clamps to ``[min_scenes, max_scenes]`` otherwise.
+    The lower bound on the divisor (60 in legacy code, ~10 here) is
+    relaxed so the new short-form default (≈75 words/scene) actually
+    bites.
     """
+    if seconds_per_scene is not None and seconds_per_scene > 0:
+        wpm = max(1, int(words_per_minute or DEFAULT_WORDS_PER_MIN))
+        words_per_scene = max(1, round(float(seconds_per_scene) * wpm / 60.0))
     words = count_words(script)
     if words <= 0:
         return min_scenes
-    raw = round(words / max(60, int(words_per_scene)))
+    raw = round(words / max(1, int(words_per_scene)))
     return max(min_scenes, min(max_scenes, int(raw)))
 
 

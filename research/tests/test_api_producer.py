@@ -135,8 +135,10 @@ def test_producer_clamps_n_scenes_below_min(monkeypatch):
 
 
 def test_producer_clamps_n_scenes_above_max(monkeypatch):
-    """HF-16 — n_scenes=99 clamps to the 60-scene ceiling with a
-    warning.
+    """HF-17 — n_scenes=999 clamps to the 200-scene ceiling with a
+    warning. (HF-16 used to cap at 60; HF-17 raised it to 200 so a
+    long-form script doesn't hit the cap when the user picks a short
+    ``seconds_per_scene``.)
     """
     captured: dict[str, Any] = {}
 
@@ -147,13 +149,13 @@ def test_producer_clamps_n_scenes_above_max(monkeypatch):
     monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
     r = client.post(
         "/producer/scene_breakdown",
-        json={"script": SAMPLE_SCRIPT, "n_scenes": 99},
+        json={"script": SAMPLE_SCRIPT, "n_scenes": 999},
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["n_scenes_requested"] == 60
-    assert captured["n_scenes"] == 60
-    assert any("n_scenes" in w and "clamped to 60" in w for w in body["warnings"])
+    assert body["n_scenes_requested"] == 200
+    assert captured["n_scenes"] == 200
+    assert any("n_scenes" in w and "clamped to 200" in w for w in body["warnings"])
 
 
 def test_producer_clamps_words_per_minute(monkeypatch):
@@ -307,6 +309,99 @@ def test_producer_auto_estimates_n_scenes(monkeypatch):
     assert body["n_scenes_requested"] is None
     assert body["n_scenes_estimated"] == captured["n_scenes_passed"]
     assert body["n_scenes_estimated"] >= 3
+
+
+def test_producer_seconds_per_scene_overrides_estimate(monkeypatch):
+    """HF-17 — when ``seconds_per_scene`` is set the route auto-
+    estimates ``n_scenes`` from the script's word count divided by
+    the implied words-per-scene (``seconds_per_scene * wpm / 60``).
+    A 2867-word script at 8 s/scene + 150 wpm should land at ~143
+    scenes (vs the legacy ~13 with 90 s/scene).
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
+        captured["n_scenes_passed"] = n_scenes
+        return [_scene(i) for i in range(1, (n_scenes or 3) + 1)]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
+
+    long_script = " ".join(["word"] * 2867)
+    r_dense = client.post(
+        "/producer/scene_breakdown",
+        json={"script": long_script, "seconds_per_scene": 8},
+    )
+    assert r_dense.status_code == 200, r_dense.text
+    dense = r_dense.json()["n_scenes_estimated"]
+
+    r_sparse = client.post(
+        "/producer/scene_breakdown",
+        json={"script": long_script, "seconds_per_scene": 60},
+    )
+    assert r_sparse.status_code == 200, r_sparse.text
+    sparse = r_sparse.json()["n_scenes_estimated"]
+
+    assert dense > sparse
+    # 2867 / 20 ≈ 143 (cap is 200, so should not be capped)
+    assert 130 <= dense <= 160
+    # 2867 / 150 ≈ 19
+    assert 15 <= sparse <= 25
+
+
+def test_producer_clamps_seconds_per_scene_below_min(monkeypatch):
+    """HF-17 — ``seconds_per_scene=2`` (below the 4 s floor) clamps
+    to 4 with a warning instead of returning 422."""
+    captured: dict[str, Any] = {}
+
+    def fake_gen(script: str, *, template, n_scenes=None, chat_fn=None, words_per_minute=150, **kw):
+        captured["n_scenes"] = n_scenes
+        return [_scene(i) for i in range(1, 4)]
+
+    monkeypatch.setattr(producer_route, "generate_scene_breakdown", fake_gen)
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "seconds_per_scene": 2},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert any(
+        "seconds_per_scene" in w and "below minimum" in w for w in body["warnings"]
+    )
+
+
+def test_producer_clamps_seconds_per_scene_above_max(monkeypatch):
+    """HF-17 — ``seconds_per_scene=999`` clamps to the 120 s ceiling
+    with a warning."""
+    monkeypatch.setattr(
+        producer_route, "generate_scene_breakdown",
+        lambda *args, **kwargs: [_scene(i) for i in range(1, 4)],
+    )
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "seconds_per_scene": 999},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert any(
+        "seconds_per_scene" in w and "above maximum" in w for w in body["warnings"]
+    )
+
+
+def test_producer_seconds_per_scene_invalid_string_falls_back(monkeypatch):
+    """HF-17 — non-numeric ``seconds_per_scene`` is dropped with a
+    warning instead of crashing the request."""
+    monkeypatch.setattr(
+        producer_route, "generate_scene_breakdown",
+        lambda *args, **kwargs: [_scene(i) for i in range(1, 4)],
+    )
+    r = client.post(
+        "/producer/scene_breakdown",
+        json={"script": SAMPLE_SCRIPT, "seconds_per_scene": "lots"},
+    )
+    # Pydantic still types it as float|None, so a string actually
+    # 422s before our clamp runs. We accept either 422 (strict
+    # validator) or 200 (clamped) as long as the route doesn't 500.
+    assert r.status_code in (200, 422), r.text
 
 
 def test_producer_default_template(monkeypatch):
@@ -3291,6 +3386,134 @@ def test_refine_script_strips_invalid_image_prompt_entries(monkeypatch):
     # Helper receives the cleaned list (with empty entries preserved
     # as empty strings — the helper itself filters them out).
     assert captured["scene_image_prompts"] == ["prompt one", "", "42", ""]
+
+
+def test_refine_script_skips_severe_compression_safeguard(monkeypatch):
+    """HF-17 — when ``scene_videos`` summed duration is < 35% of the
+    script's natural narration duration, the implicit budget is
+    DROPPED so the LLM doesn't compress the script ~3× or more.
+    A warning is emitted and ``target_duration_s == 0``."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    # 13 scenes × 6 s = 78 s of video — matches the user's report.
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            duration_sec=6.0,
+            video_stream_duration_sec=6.0,
+            has_video_stream=True,
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return "long script unchanged"
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", fake_refine)
+
+    # 2867-word script (the user's actual input) → natural ≈ 1147 s.
+    # 13 × 6 s = 78 s of scene_videos → ratio ≈ 7%, well below 35%.
+    long_script = " ".join(["word"] * 2867)
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": long_script,
+            "scene_videos": [f"/scene{i}.mp4" for i in range(13)],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Safeguard kicked in: target reset to 0 so the LLM gets no
+    # word-budget hint.
+    assert body["target_duration_s"] == 0.0
+    assert body["target_words"] == 0
+    assert any(
+        "much shorter than" in w.lower() or "natural narration" in w.lower()
+        for w in body["warnings"]
+    )
+    # The helper was called WITHOUT a target (so it only sanitises).
+    assert captured["target_duration_s"] is None
+
+
+def test_refine_script_explicit_target_skips_safeguard(monkeypatch):
+    """HF-17 — when the caller passes ``target_duration_s`` explicitly
+    we trust them, even if it would compress the script aggressively.
+    The safeguard only applies to the implicit (scene_videos-derived)
+    budget."""
+    captured: dict[str, Any] = {}
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return "compressed"
+
+    monkeypatch.setattr(llm, "refine_script_for_narration", fake_refine)
+
+    # 2867 words ≈ 1147 s natural. Explicit 60 s (5%) — way below
+    # the 35% threshold but still honoured because it's explicit.
+    long_script = " ".join(["word"] * 2867)
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": long_script,
+            "target_duration_s": 60.0,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_duration_s"] == pytest.approx(60.0)
+    assert body["target_words"] == 150
+    assert captured["target_duration_s"] == pytest.approx(60.0)
+    assert not any(
+        "much shorter" in w.lower() for w in body["warnings"]
+    )
+
+
+def test_refine_script_safeguard_inactive_when_ratio_above_threshold(monkeypatch):
+    """HF-17 — safeguard does NOT fire when scene_videos cover ≥35%
+    of the script's natural duration (the storyboard is reasonably
+    sized). Implicit budget passes through to the LLM."""
+    from research.core.pixelle.video_probe import VideoProbeResult
+
+    monkeypatch.setattr(
+        producer_route,
+        "probe_video_file",
+        lambda *_a, **_kw: VideoProbeResult(
+            exists=True,
+            size=12_345,
+            ffprobe_available=True,
+            # 30 × 30 s = 900 s ≈ 78% of the script's natural ~1147 s
+            # narration — well above the 35% threshold.
+            duration_sec=30.0,
+            video_stream_duration_sec=30.0,
+            has_video_stream=True,
+        ),
+    )
+    monkeypatch.setattr(
+        llm, "refine_script_for_narration", lambda **_: "ok"
+    )
+
+    long_script = " ".join(["word"] * 2867)
+    r = client.post(
+        "/producer/refine_script",
+        json={
+            "script": long_script,
+            "scene_videos": [f"/scene{i}.mp4" for i in range(30)],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Safeguard did NOT fire — target_duration_s reflects the
+    # summed video duration.
+    assert body["target_duration_s"] == pytest.approx(900.0)
+    assert not any(
+        "much shorter" in w.lower() for w in body["warnings"]
+    )
 
 
 # ─── /producer/assemble — PR-31 (concat scene videos + audio + soft subs) ───

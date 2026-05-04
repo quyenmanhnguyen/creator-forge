@@ -4,8 +4,12 @@ from __future__ import annotations
 import pytest
 
 from core.pixelle.scene_breakdown import (
+    DEFAULT_SECONDS_PER_SCENE,
+    DEFAULT_WORDS_PER_SCENE,
     MAX_SCENE_COUNT,
+    MAX_SECONDS_PER_SCENE,
     MIN_SCENE_COUNT,
+    MIN_SECONDS_PER_SCENE,
     SCENE_TEMPLATES,
     TEMPLATE_KEYS,
     LongFormScene,
@@ -66,12 +70,63 @@ def test_estimate_scene_count_clamped_to_bounds() -> None:
 
 
 def test_estimate_scene_count_long_form_4200_words() -> None:
-    """4200-word script → multiple scenes (real-world calibration)."""
+    """4200-word script → multiple scenes (real-world calibration).
+
+    HF-17 — default words-per-scene moved from 220 (≈ 90 s/scene) to
+    ``DEFAULT_WORDS_PER_SCENE`` ≈ 75 (≈ 30 s/scene), matching the
+    Storyboard's short-form pipeline. 4200 words / 75 ≈ 56 scenes.
+    """
     script = " ".join(["word"] * 4200)
     n = estimate_scene_count(script)
     assert MIN_SCENE_COUNT <= n <= MAX_SCENE_COUNT
-    # 4200 / 220 ≈ 19, fits comfortably in [3, 60].
-    assert 12 <= n <= 30
+    expected = round(4200 / DEFAULT_WORDS_PER_SCENE)
+    assert abs(n - expected) <= 1
+
+
+def test_estimate_scene_count_seconds_per_scene_overrides_default() -> None:
+    """HF-17 — explicit ``seconds_per_scene`` overrides the legacy
+    words-per-scene heuristic. With wpm=150, 8 s/scene ⇒ 20 words/
+    scene, so 2867 words ⇒ ~143 scenes (well within the new
+    ``MAX_SCENE_COUNT=200`` cap)."""
+    script = " ".join(["word"] * 2867)
+    dense = estimate_scene_count(script, seconds_per_scene=8.0)
+    sparse = estimate_scene_count(script, seconds_per_scene=60.0)
+    assert dense > sparse
+    # 2867 / (8 * 150 / 60) = 2867 / 20 ≈ 143
+    assert 130 <= dense <= 160
+    # 2867 / (60 * 150 / 60) = 2867 / 150 ≈ 19
+    assert 15 <= sparse <= 25
+
+
+def test_estimate_scene_count_short_form_density_matches_legacy_user_complaint() -> None:
+    """HF-17 regression — the user's 2867-word script used to land
+    at 13 scenes (220 words/scene ≈ 90 s of speech). With the new
+    default ``DEFAULT_SECONDS_PER_SCENE = 30`` it should now land in
+    the 35-50 range so the Storyboard's 6-10 s clips actually cover
+    the whole script."""
+    script = " ".join(["word"] * 2867)
+    legacy = estimate_scene_count(script, words_per_scene=220)
+    new_default = estimate_scene_count(
+        script, seconds_per_scene=DEFAULT_SECONDS_PER_SCENE
+    )
+    assert legacy <= 14  # the original buggy estimate
+    assert new_default >= 30  # ≥ 2× denser
+    assert new_default > legacy * 2
+
+
+def test_estimate_scene_count_seconds_per_scene_respects_cap() -> None:
+    """HF-17 — ridiculously short ``seconds_per_scene`` clamps to
+    ``MAX_SCENE_COUNT`` instead of returning thousands of scenes."""
+    script = " ".join(["word"] * 100_000)
+    n = estimate_scene_count(script, seconds_per_scene=1.0)
+    assert n == MAX_SCENE_COUNT
+
+
+def test_seconds_per_scene_bounds_constants() -> None:
+    """Constants exist and have sensible relative ordering."""
+    assert MIN_SECONDS_PER_SCENE < DEFAULT_SECONDS_PER_SCENE < MAX_SECONDS_PER_SCENE
+    assert MIN_SECONDS_PER_SCENE >= 1
+    assert MAX_SECONDS_PER_SCENE <= 600  # sanity
 
 
 # ─── Template registry ───────────────────────────────────────────────────────

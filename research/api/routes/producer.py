@@ -36,7 +36,10 @@ from research.core import llm
 from research.core.pixelle import (
     DEFAULT_EDGE_FALLBACK_VOICE,
     DEFAULT_PROVIDER_NAME,
+    DEFAULT_SECONDS_PER_SCENE,
+    MAX_SECONDS_PER_SCENE,
     MAX_VARIANTS_PER_SCENE,
+    MIN_SECONDS_PER_SCENE,
     SCENE_TEMPLATES,
     STYLES,
     TEMPLATE_KEYS,
@@ -125,9 +128,23 @@ class SceneBreakdownRequest(BaseModel):
     n_scenes: int | None = Field(
         None,
         description=(
-            "Force the scene count. ``None`` = auto-estimate from the script length. "
-            "Out-of-range values are clamped to [3, 60] with a warning instead of "
-            "returning 422 (HF-16) so a stale UI never blocks the user."
+            "Force the scene count. ``None`` = auto-estimate from the script "
+            "length using ``seconds_per_scene``. Out-of-range values are "
+            "clamped to [3, MAX_SCENE_COUNT] (200) with a warning instead "
+            "of returning 422 (HF-16/HF-17) so a stale UI never blocks "
+            "the user."
+        ),
+    )
+    seconds_per_scene: float | None = Field(
+        None,
+        description=(
+            "HF-17 — target spoken-narration duration *per scene* in "
+            "seconds. Used to auto-estimate ``n_scenes`` when the latter "
+            "is unset. Defaults to ``DEFAULT_SECONDS_PER_SCENE`` (30) — "
+            "calibrated for the Storyboard's short-form pipeline that "
+            "renders ~6-10 s clips per scene. Clamped to "
+            f"[{MIN_SECONDS_PER_SCENE}, {MAX_SECONDS_PER_SCENE}] with a "
+            "warning instead of returning 422."
         ),
     )
     words_per_minute: int = Field(
@@ -210,9 +227,34 @@ class SceneBreakdownRequest(BaseModel):
 
         _clamp("words_per_minute", 90, 200, default=150)
         _clamp("images_per_scene", 1, MAX_VARIANTS_PER_SCENE, default=1)
-        # n_scenes is optional — only clamp when set.
+        # n_scenes is optional — only clamp when set. Range matches
+        # MAX_SCENE_COUNT (HF-17 raised the cap from 60 → 200).
         if data.get("n_scenes") is not None:
-            _clamp("n_scenes", 3, 60)
+            _clamp("n_scenes", 3, 200)
+        # HF-17 — seconds_per_scene is also optional. Float-aware clamp
+        # so the user can pass e.g. 6.5 s without triggering an error.
+        sps = data.get("seconds_per_scene")
+        if sps is not None:
+            try:
+                f = float(sps)
+            except (TypeError, ValueError):
+                data["seconds_per_scene"] = None
+                warnings.append(
+                    f"seconds_per_scene={sps!r} not a number; using default."
+                )
+            else:
+                if f < MIN_SECONDS_PER_SCENE:
+                    data["seconds_per_scene"] = float(MIN_SECONDS_PER_SCENE)
+                    warnings.append(
+                        f"seconds_per_scene={f} below minimum "
+                        f"{MIN_SECONDS_PER_SCENE}; clamped."
+                    )
+                elif f > MAX_SECONDS_PER_SCENE:
+                    data["seconds_per_scene"] = float(MAX_SECONDS_PER_SCENE)
+                    warnings.append(
+                        f"seconds_per_scene={f} above maximum "
+                        f"{MAX_SECONDS_PER_SCENE}; clamped."
+                    )
 
         # template_key fallback so a stale UI value (or extra whitespace)
         # never blocks the call. The strict validator below catches the
@@ -312,7 +354,18 @@ def scene_breakdown(req: SceneBreakdownRequest) -> SceneBreakdownResponse:
     warnings: list[str] = list(req.clamp_warnings_)
 
     words = count_words(script)
-    auto_n = estimate_scene_count(script)
+    # HF-17 — pass seconds_per_scene + words_per_minute so the auto-
+    # estimate matches the Storyboard's ≈6-10 s scene clips. Falls
+    # back to the legacy words-per-scene heuristic when the field
+    # isn't supplied (older renderers).
+    seconds_per_scene = req.seconds_per_scene
+    if seconds_per_scene is None:
+        seconds_per_scene = float(DEFAULT_SECONDS_PER_SCENE)
+    auto_n = estimate_scene_count(
+        script,
+        seconds_per_scene=seconds_per_scene,
+        words_per_minute=req.words_per_minute,
+    )
     n_scenes_requested = req.n_scenes
     n_scenes = n_scenes_requested if n_scenes_requested is not None else auto_n
     total_duration_estimate = estimate_total_duration_s(
@@ -2617,14 +2670,53 @@ def refine_script(req: RefineScriptRequest) -> RefineScriptResponse:
     raw_script = req.script.strip()
     warnings: list[str] = []
     original_length = len(raw_script)
+    original_words = count_words(raw_script)
+    # Natural narration duration of the *raw* script at 150 WPM. Used
+    # as the floor for HF-17's compression-ratio safeguard so a stale
+    # / sparse Storyboard (e.g. 13 × 6 s = 78 s of video for a 28 min
+    # script) can't silently shrink the script to 5 % of its length.
+    natural_duration_s = (original_words / 150.0) * 60.0 if original_words else 0.0
 
     target_duration_s = 0.0
-    if req.target_duration_s is not None and req.target_duration_s > 0:
+    explicit_target = (
+        req.target_duration_s is not None and req.target_duration_s > 0
+    )
+    if explicit_target:
         target_duration_s = float(req.target_duration_s)
     elif req.scene_videos:
         target_duration_s = _sum_scene_video_duration(
             req.scene_videos, warnings=warnings
         )
+
+    # HF-17 — compression-ratio safeguard. The route used to size
+    # ``target_words`` to whatever the summed video duration was, so a
+    # 78-second video budget (13 short scenes) would compress a
+    # 28-minute script down to ~196 words (a 17× reduction). When the
+    # caller did NOT pass an explicit ``target_duration_s`` and the
+    # implicit budget would shrink the script below 35 % of its
+    # natural narration length, we ignore the implicit budget and
+    # fall back to "no budget hint" so the LLM only sanitises (no
+    # aggressive trimming). The user gets a warning explaining what
+    # happened and the suggested actions: regenerate the storyboard
+    # with more / longer scenes, or set ``target_duration_s``
+    # explicitly to override.
+    MIN_RATIO = 0.35
+    if (
+        not explicit_target
+        and target_duration_s > 0
+        and natural_duration_s > 0
+        and target_duration_s < natural_duration_s * MIN_RATIO
+    ):
+        warnings.append(
+            "Refine-script: video duration "
+            f"({target_duration_s:.1f}s) is much shorter than the "
+            f"script's natural narration ({natural_duration_s:.1f}s "
+            f"at 150 WPM, ratio {target_duration_s / natural_duration_s:.0%}). "
+            "Skipping the auto-shrink so the LLM doesn't compress your "
+            "script ~3× or more. Generate more / longer scenes, or pass "
+            "``target_duration_s`` explicitly to force a target."
+        )
+        target_duration_s = 0.0
 
     target_words = (
         max(20, int(round(target_duration_s * 2.5))) if target_duration_s > 0 else 0

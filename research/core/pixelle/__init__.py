@@ -53,11 +53,14 @@ from core.pixelle.prompting import (
     split_script_into_scenes,
 )
 from core.pixelle.scene_breakdown import (
+    DEFAULT_SECONDS_PER_SCENE,
     DEFAULT_WORDS_PER_MIN,
     DEFAULT_WORDS_PER_SCENE,
     MAX_SCENE_COUNT,
+    MAX_SECONDS_PER_SCENE,
     MAX_VARIANTS_PER_SCENE,
     MIN_SCENE_COUNT,
+    MIN_SECONDS_PER_SCENE,
     SCENE_TEMPLATES,
     TEMPLATE_KEYS,
     VISUAL_DNA_MAX_CHARS,
@@ -130,11 +133,14 @@ from core.pixelle.visual_providers import (
 
 __all__ = [
     "DEFAULT_PROVIDER_NAME",
+    "DEFAULT_SECONDS_PER_SCENE",
     "DEFAULT_WORDS_PER_MIN",
     "DEFAULT_WORDS_PER_SCENE",
     "MAX_SCENE_COUNT",
+    "MAX_SECONDS_PER_SCENE",
     "MAX_VARIANTS_PER_SCENE",
     "MIN_SCENE_COUNT",
+    "MIN_SECONDS_PER_SCENE",
     "PRESET_NAMES",
     "PRESET_STYLES",
     "PROVIDER_NAMES",
