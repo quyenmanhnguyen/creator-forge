@@ -1069,6 +1069,11 @@
                     <input type="password" id="key-youtube" autocomplete="off" spellcheck="false" placeholder="AIza…" />
                     <span class="cf-keys-hint">Required for Research → niche / keywords / outlier / cloner.</span>
                 </label>
+                <label class="cf-keys-row">
+                    <span>ElevenLabs API key</span>
+                    <input type="password" id="key-elevenlabs" autocomplete="off" spellcheck="false" placeholder="sk_…" />
+                    <span class="cf-keys-hint">Hosted TTS provider — paid (multilingual, incl. Vietnamese). Get one at <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener">elevenlabs.io/app/settings/api-keys</a>. Without this key the <b>elevenlabs</b> option in Compose audio's TTS provider dropdown returns a graceful warning.</span>
+                </label>
                 <details class="cf-keys-advanced">
                     <summary>Optional providers</summary>
                     <label class="cf-keys-row">
@@ -1080,11 +1085,6 @@
                         <span>RunningHub (ComfyUI) API key</span>
                         <input type="password" id="key-runninghub" autocomplete="off" spellcheck="false" placeholder="rh-…" />
                         <span class="cf-keys-hint">Optional ComfyUI image-gen provider.</span>
-                    </label>
-                    <label class="cf-keys-row">
-                        <span>ElevenLabs API key</span>
-                        <input type="password" id="key-elevenlabs" autocomplete="off" spellcheck="false" placeholder="sk_…" />
-                        <span class="cf-keys-hint">Optional hosted TTS provider — paid (multilingual, incl. Vietnamese). Get one at <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener">elevenlabs.io/app/settings/api-keys</a>. Without this key the <b>elevenlabs</b> option in Compose audio's TTS provider dropdown returns a graceful warning.</span>
                     </label>
                 </details>
             </div>
@@ -1435,6 +1435,9 @@
                     <label class="form-row-full" title="Style anchor appended verbatim to every variant prompt — auto-filled from the script after Break into scenes runs (when images per scene > 1). Edit and click 'Re-roll variants' to refresh prompts without re-running scene_breakdown.">Visual DNA <span class="muted" style="font-weight:400;">(style anchor — era · palette · lighting · lens · mood)</span>
                         <textarea id="sb-visual-dna" rows="3" placeholder="auto-filled by scene_breakdown when images per scene &gt; 1; edit to override and click 'Re-roll variants' to apply"></textarea>
                     </label>
+                    <label class="form-row-full" title="Character / identity anchor — prepended verbatim to every per-scene image prompt before they reach Grok so the same person appears in every scene. Use this when the model drifts (different face / hair / makeup across scenes) even with a global reference image attached. Visual DNA covers style; this covers WHO.">Character anchor <span class="muted" style="font-weight:400;">(identity lock — describe the person once, applied to every scene)</span>
+                        <textarea id="sb-character-anchor" rows="2" placeholder="optional — e.g. 'young woman, jet-black hair with wispy bangs, light peach camisole, dewy fair skin, glossy pink lips'. When filled, prepended verbatim to every image prompt + ref-image edit so Grok keeps the same character across all scenes."></textarea>
+                    </label>
                     <div class="form-row-full" data-region="ref-images" title="Reference images appended to every prompt as a character / style anchor. Per-scene rows can override this in the Batch panel. Routes those rows through Grok's imagine-image-edit model (refimg:generate) instead of the plain image:generate path.">
                         <label style="display:block;margin-bottom:6px;">Reference image (global) <span class="muted" style="font-weight:400;">(character / style anchor — applies to every variant unless a row overrides)</span></label>
                         <div class="ref-row">
@@ -1657,14 +1660,14 @@
                             <button type="button" class="secondary" data-run="producer-short-pick-output">Browse…</button>
                         </span>
                     </label>
-                    <label title="Override the SRT timing target in seconds. Blank = auto-fit to the scene videos generated above. 0 = no scaling (captions follow native TTS timing).">Target duration override (s)
-                        <input id="ps-target-duration" type="number" step="0.1" min="0" placeholder="blank = auto-fit to scene videos" />
+                    <label title="Override the SRT timing target in seconds. Blank = auto-fit. With scene videos available, ffprobe sums their durations. Without scene videos but with a scene_breakdown, sums the per-scene duration_s estimates from words ÷ WPM. 0 = no scaling (captions follow native TTS timing).">Target duration override (s)
+                        <input id="ps-target-duration" type="number" step="0.1" min="0" placeholder="blank = auto-fit (scene videos → scene_breakdown → none)" />
                     </label>
                     <label class="checkbox-row">
                         <input id="ps-write-srt" type="checkbox" checked /> Write captions.srt next to audio
                     </label>
-                    <label class="form-row-full" title="Auto-filled from the Video batch above whenever rows settle. ffprobe sums their durations and scales the SRT so subtitles cover the assembled video. Read-only summary; clear via 'Refresh from Video batch' below.">Reference scene videos (auto-fit target)
-                        <input id="ps-reference-summary" type="text" readonly placeholder="no scene videos yet — generate the Video batch above to enable auto-fit" />
+                    <label class="form-row-full" title="Auto-fit target source. Priority: settled scene videos (ffprobe-summed) > scene_breakdown estimate (sum of per-scene duration_s from words ÷ WPM) > none. Read-only summary refreshed when Video batch rows settle or scene_breakdown completes.">Auto-fit target (read-only)
+                        <input id="ps-reference-summary" type="text" readonly placeholder="no scene videos and no scene_breakdown yet — run 'Break into scenes' above to enable auto-fit" />
                     </label>
                     <label class="form-row-full">Script
                         <textarea id="ps-script" rows="6" placeholder="paste narration script (or use the script above)"></textarea>
@@ -1782,6 +1785,7 @@
     <!-- PR-A: long-running progress UI helpers (scene_breakdown). -->
     <script src="storyboard_progress_helpers.js"></script>
     <script src="compose_voice_picker_helpers.js"></script>
+    <script src="storyboard_character_anchor_helpers.js"></script>
     <script src="creator-forge.js"></script>
 </body>
 </html>
