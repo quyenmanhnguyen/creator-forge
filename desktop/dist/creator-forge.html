@@ -1588,13 +1588,14 @@
                     Video Assembly. Override below if the target should be a custom length.
                 </div>
                 <div class="form-grid">
-                    <label title="Edge-TTS = online (Microsoft, free, requires internet). Piper-TTS = local / offline (~25MB per voice; install `pip install piper-tts` and place a voice .onnx under ~/.creator-forge/piper-voices/).">TTS provider
+                    <label title="Edge-TTS = online (Microsoft, free, requires internet). Piper-TTS = local / offline (~25MB per voice; install `pip install piper-tts` and place a voice .onnx under ~/.creator-forge/piper-voices/). ElevenLabs = hosted, paid, highest quality + native multilingual (incl. Vietnamese); requires ELEVENLABS_API_KEY env var on the sidecar.">TTS provider
                         <select id="ps-tts-provider">
                             <option value="edge-tts" selected>edge-tts (online · default)</option>
                             <option value="piper-tts">piper-tts (offline · local)</option>
+                            <option value="elevenlabs">elevenlabs (hosted · paid · ELEVENLABS_API_KEY)</option>
                         </select>
                     </label>
-                    <label title="Voice id. For edge-tts: short name like en-US-AriaNeural. For piper-tts: short name like vi_VN-vais1000-medium (resolves to ~/.creator-forge/piper-voices/&lt;name&gt;.onnx) or absolute path to an .onnx file.">Voice
+                    <label title="Voice id. For edge-tts: short name like en-US-AriaNeural. For piper-tts: short name like vi_VN-vais1000-medium (resolves to ~/.creator-forge/piper-voices/&lt;name&gt;.onnx) or absolute path to an .onnx file. For elevenlabs: voice id from https://elevenlabs.io/app/voice-lab (e.g. 21m00Tcm4TlvDq8ikWAM = Rachel).">Voice
                         <select id="ps-voice">
                             <optgroup label="English (US)">
                                 <option value="en-US-AriaNeural">Aria · F (edge-tts)</option>

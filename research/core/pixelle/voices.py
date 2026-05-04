@@ -1,6 +1,6 @@
 """Curated TTS voice list for the Producer page picker.
 
-Two providers are supported:
+Three providers are supported:
 
 - ``edge-tts``  — Microsoft Edge TTS (online, free). Several hundred voices
   available; this is a hand-picked top selection covering EN/KO/JA/VI/ZH/ES
@@ -13,6 +13,14 @@ Two providers are supported:
   resolves it under ``~/.creator-forge/piper-voices/<short_name>.onnx``.
   We expose a small starter list — users can drop more voices into that
   folder and pick them by typing the id (handled at the route layer).
+
+- ``elevenlabs`` — ElevenLabs hosted TTS (paid, requires
+  ``ELEVENLABS_API_KEY``). Highest perceived quality + native multilingual
+  support (incl. Vietnamese) via ``eleven_multilingual_v2`` — so a single
+  curated voice works across many locales. The ``short_name`` is the
+  ElevenLabs voice id (e.g. ``21m00Tcm4TlvDq8ikWAM`` for Rachel) and is
+  passed verbatim into the API call. Voice ids are stable; the curated
+  list below covers ElevenLabs' own free-tier shared voices.
 
 The order in ``VOICES`` is the order the UI shows. ``provider`` is exposed
 as a tag on every voice so the renderer's voice-picker can filter by the
@@ -81,6 +89,24 @@ VOICES: tuple[Voice, ...] = (
     Voice("en_GB-alan-medium",     "English (UK) · Alan (Piper · M)",    "en-GB", "M", "piper-tts"),
     Voice("ja_JP-takumi-medium",   "日本語 · Takumi (Piper · M)",         "ja-JP", "M", "piper-tts"),
     Voice("ko_KR-ngfei-medium",    "한국어 · ngfei (Piper · F)",          "ko-KR", "F", "piper-tts"),
+
+    # ── ElevenLabs (hosted, paid; ELEVENLABS_API_KEY required) ───────
+    # Curated set of ElevenLabs' own free-tier shared voices. All
+    # render in any language supported by ``eleven_multilingual_v2``
+    # (incl. Vietnamese) — the locale below is the voice's *primary*
+    # locale, the language is determined by the input text.
+    Voice("21m00Tcm4TlvDq8ikWAM", "ElevenLabs · Rachel · F (calm en-US)",      "en-US", "F", "elevenlabs"),
+    Voice("ErXwobaYiN019PkySvjV", "ElevenLabs · Antoni · M (well-rounded)",    "en-US", "M", "elevenlabs"),
+    Voice("EXAVITQu4vr4xnSDxMaL", "ElevenLabs · Sarah · F (soft, news)",       "en-US", "F", "elevenlabs"),
+    Voice("AZnzlk1HvdrTNbZXh",    "ElevenLabs · Domi · F (confident)",         "en-US", "F", "elevenlabs"),
+    Voice("pNInz6obpgDQGBFOQs8c", "ElevenLabs · Adam · M (deep, narrator)",    "en-US", "M", "elevenlabs"),
+    Voice("VR6AewLTigWG4xSOukaG", "ElevenLabs · Arnold · M (crisp)",           "en-US", "M", "elevenlabs"),
+    Voice("XB0fDUnXU5powFXDhCwa", "ElevenLabs · Charlotte · F (seductive)",    "en-US", "F", "elevenlabs"),
+    Voice("IKne3meq5aSn9XLyUdCD", "ElevenLabs · Charlie · M (casual en-AU)",   "en-AU", "M", "elevenlabs"),
+    Voice("XrExE9yKIg1WjnnlVkGX", "ElevenLabs · Matilda · F (warm)",           "en-US", "F", "elevenlabs"),
+    Voice("TxGEqnHWrfWFTfGW9XjX", "ElevenLabs · Josh · M (deep en-US)",        "en-US", "M", "elevenlabs"),
+    Voice("ThT5KcBeYPX3keUQqHPh", "ElevenLabs · Dorothy · F (pleasant)",       "en-GB", "F", "elevenlabs"),
+    Voice("oWAxZDx7w5VEj9dCyTzz", "ElevenLabs · Grace · F (gentle en-US)",     "en-US", "F", "elevenlabs"),
 )
 
 
