@@ -541,7 +541,7 @@ def test_voices_returns_curated_list():
     # Top-level shape: ``providers`` lists every distinct provider tag,
     # so the UI can render the TTS provider dropdown without hard-coding
     # the list. The default filter (no query param) returns ``provider=None``.
-    assert set(body["providers"]) == {"edge-tts", "piper-tts"}
+    assert set(body["providers"]) == {"edge-tts", "piper-tts", "elevenlabs"}
     assert body["provider"] is None
     assert body.get("warnings", []) == []
 

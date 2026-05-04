@@ -20,7 +20,9 @@ from research.core.pixelle.tts import (
     DEFAULT_TTS_PROVIDER,
     KNOWN_TTS_PROVIDERS,
     EdgeTTSAdapter,
+    ElevenLabsAdapter,
     PiperTTSAdapter,
+    _elevenlabs_alignment_to_word_boundaries,
     make_tts_adapter,
     resolve_piper_voice_path,
 )
@@ -42,10 +44,21 @@ def _write_silent_wav(path: Path, *, seconds: float = 0.5, rate: int = 16_000) -
 # ---------------------------------------------------------------------------
 
 
-def test_known_providers_includes_edge_and_piper() -> None:
+def test_known_providers_includes_edge_piper_elevenlabs() -> None:
     assert "edge-tts" in KNOWN_TTS_PROVIDERS
     assert "piper-tts" in KNOWN_TTS_PROVIDERS
+    assert "elevenlabs" in KNOWN_TTS_PROVIDERS
     assert DEFAULT_TTS_PROVIDER == "edge-tts"
+
+
+def test_make_tts_adapter_elevenlabs() -> None:
+    adapter = make_tts_adapter("elevenlabs")
+    assert isinstance(adapter, ElevenLabsAdapter)
+    assert adapter.name == "elevenlabs"
+
+
+def test_make_tts_adapter_elevenlabs_normalises_case() -> None:
+    assert isinstance(make_tts_adapter("  ElevenLabs "), ElevenLabsAdapter)
 
 
 def test_make_tts_adapter_edge_default() -> None:
@@ -229,3 +242,233 @@ def test_probe_wav_duration_returns_seconds_for_real_wav(tmp_path: Path) -> None
     _write_silent_wav(p, seconds=1.25)
     d = tts_mod._probe_wav_duration(p)
     assert 1.0 <= d <= 1.5, d
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabsAdapter — HTTP plumbing monkey-patched
+# ---------------------------------------------------------------------------
+
+
+class _FakeElevenLabsResponse:
+    """Minimal stand-in for ``requests.Response`` covering the surface
+    the adapter touches (``status_code``, ``json()``, ``text``,
+    ``iter_content``)."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        json_body: dict | None = None,
+        audio_bytes: bytes = b"",
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self._json = json_body
+        self._audio = audio_bytes
+        self.text = text or ""
+
+    def json(self) -> dict:
+        if self._json is None:
+            raise ValueError("no json body")
+        return self._json
+
+    def iter_content(self, chunk_size: int = 8192):
+        # Single-chunk yield is enough for the test contract.
+        if self._audio:
+            yield self._audio
+
+
+def test_elevenlabs_adapter_rejects_blank_text(tmp_path: Path) -> None:
+    adapter = ElevenLabsAdapter(api_key="test-key")
+    with pytest.raises(ValueError):
+        adapter.synthesize(text="   ", output_path=tmp_path / "x.mp3", voice="vID")
+
+
+def test_elevenlabs_adapter_rejects_blank_voice(tmp_path: Path) -> None:
+    adapter = ElevenLabsAdapter(api_key="test-key")
+    with pytest.raises(ValueError):
+        adapter.synthesize(text="hello", output_path=tmp_path / "x.mp3", voice="")
+
+
+def test_elevenlabs_adapter_missing_api_key_raises() -> None:
+    """Reading ``api_key`` with neither constructor arg nor env var
+    raises a RuntimeError pointing at the dashboard URL — the route
+    surfaces this verbatim as a warning so users know how to fix it."""
+    import os
+
+    saved = os.environ.pop("ELEVENLABS_API_KEY", None)
+    try:
+        adapter = ElevenLabsAdapter()  # no api_key, no env
+        with pytest.raises(RuntimeError) as ei:
+            _ = adapter.api_key
+        assert "ELEVENLABS_API_KEY" in str(ei.value)
+        assert "elevenlabs.io" in str(ei.value)
+    finally:
+        if saved is not None:
+            os.environ["ELEVENLABS_API_KEY"] = saved
+
+
+def test_elevenlabs_adapter_synthesize_writes_audio_and_sends_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``synthesize`` POSTs to ``/v1/text-to-speech/{voice_id}``,
+    streams audio bytes to ``output_path``, and returns a TTSResult
+    with engine='elevenlabs'."""
+    captured: dict[str, object] = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        captured["headers"] = kwargs.get("headers")
+        captured["json"] = kwargs.get("json")
+        return _FakeElevenLabsResponse(
+            status_code=200, audio_bytes=b"\xff\xfb\x90\x00fakeMP3", text=""
+        )
+
+    import requests
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    # ``_probe_mp3_duration`` is best-effort and returns 0.0 for our
+    # fake bytes (no real mp3 decoder will parse them). We assert
+    # >= 0 so the test doesn't depend on whether mutagen is installed
+    # in the CI image — the duration probe is exercised by the
+    # EdgeTTSAdapter / Piper tests already.
+    monkeypatch.setattr(
+        "research.core.pixelle.tts._probe_mp3_duration", lambda _p: 1.234
+    )
+
+    out = tmp_path / "voice.mp3"
+    adapter = ElevenLabsAdapter(api_key="test-key")
+    result = adapter.synthesize(
+        text="Hello world", output_path=out, voice="21m00Tcm4TlvDq8ikWAM"
+    )
+    assert result.engine == "elevenlabs"
+    assert result.voice == "21m00Tcm4TlvDq8ikWAM"
+    assert result.duration_seconds >= 0.0  # probe is best-effort
+    assert out.exists()
+    assert out.read_bytes() == b"\xff\xfb\x90\x00fakeMP3"
+
+    # Endpoint shape: voice id appears in the URL path; mp3 output_format
+    # is on the query string; xi-api-key + accept headers are sent;
+    # JSON body carries text + model_id + voice_settings.
+    assert captured["url"] == (
+        "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM"
+    )
+    assert captured["params"] == {"output_format": "mp3_44100_128"}
+    headers = captured["headers"]
+    assert headers["xi-api-key"] == "test-key"
+    assert headers["accept"] == "audio/mpeg"
+    body = captured["json"]
+    assert body["text"] == "Hello world"
+    assert body["model_id"] == "eleven_multilingual_v2"
+    assert "voice_settings" in body
+    assert body["voice_settings"]["stability"] == pytest.approx(0.5)
+    assert body["voice_settings"]["use_speaker_boost"] is True
+
+
+def test_elevenlabs_adapter_propagates_http_error_with_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4xx/5xx response with a documented ``detail.message`` JSON
+    body becomes a RuntimeError carrying that message — so the route
+    can surface "ElevenLabs 401: Invalid API key" as a user-readable
+    warning instead of a generic stacktrace."""
+
+    def fake_post(url, **kwargs):
+        return _FakeElevenLabsResponse(
+            status_code=401,
+            json_body={
+                "detail": {
+                    "status": "invalid_api_key",
+                    "message": "Invalid API key. Please verify your key.",
+                }
+            },
+        )
+
+    import requests
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    adapter = ElevenLabsAdapter(api_key="bad-key")
+    with pytest.raises(RuntimeError) as ei:
+        adapter.synthesize(
+            text="hi", output_path=tmp_path / "voice.mp3", voice="vID"
+        )
+    msg = str(ei.value)
+    assert "401" in msg
+    assert "Invalid API key" in msg
+
+
+def test_elevenlabs_adapter_synthesize_with_timing_decodes_audio_and_parses_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``synthesize_with_timing`` calls the ``/with-timestamps``
+    endpoint, base64-decodes ``audio_base64`` to disk, and converts
+    ``normalized_alignment``'s per-character timing into the
+    pipeline's :class:`WordBoundary` list (one per whitespace-bounded
+    word)."""
+    import base64
+
+    fake_audio = b"\xff\xfb\x90\x00fakeMP3PAYLOAD"
+    body = {
+        "audio_base64": base64.b64encode(fake_audio).decode("ascii"),
+        "normalized_alignment": {
+            "characters":               ["H", "i", " ", "y", "o", "u"],
+            "character_start_times_seconds": [0.00, 0.10, 0.20, 0.25, 0.30, 0.40],
+            "character_end_times_seconds":   [0.10, 0.20, 0.25, 0.30, 0.40, 0.50],
+        },
+    }
+
+    def fake_post(url, **kwargs):
+        # Sanity: route hits the with-timestamps endpoint, not the
+        # plain /text-to-speech/{voice_id}.
+        assert url.endswith("/with-timestamps")
+        return _FakeElevenLabsResponse(status_code=200, json_body=body)
+
+    import requests
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    out = tmp_path / "voice.mp3"
+    adapter = ElevenLabsAdapter(api_key="test-key")
+    result = adapter.synthesize_with_timing(
+        text="Hi you", output_path=out, voice="vID"
+    )
+    assert result.engine == "elevenlabs"
+    assert out.read_bytes() == fake_audio
+    # Two words: "Hi" (0.00 → 0.20) and "you" (0.25 → 0.50).
+    assert len(result.word_boundaries) == 2
+    w0, w1 = result.word_boundaries
+    assert w0.text == "Hi"
+    assert w0.start_s == pytest.approx(0.0)
+    assert w0.end_s == pytest.approx(0.20)
+    assert w1.text == "you"
+    assert w1.start_s == pytest.approx(0.25)
+    assert w1.end_s == pytest.approx(0.50)
+
+
+def test_elevenlabs_alignment_helper_handles_empty_payload() -> None:
+    """Missing / malformed alignment shapes return [] — callers fall
+    back to the sentence-fallback caption builder."""
+    assert _elevenlabs_alignment_to_word_boundaries({}) == []
+    assert _elevenlabs_alignment_to_word_boundaries({"characters": []}) == []
+    # Mismatched lengths are tolerated; we use ``min(len,...)``.
+    assert _elevenlabs_alignment_to_word_boundaries({
+        "characters": ["A"],
+        "character_start_times_seconds": [0.0],
+        "character_end_times_seconds": [],
+    }) == []
+
+
+def test_elevenlabs_alignment_helper_groups_punctuation_with_word() -> None:
+    """Punctuation is non-whitespace so it stays attached to the
+    preceding word — matches Edge-TTS's WordBoundary contract."""
+    out = _elevenlabs_alignment_to_word_boundaries({
+        "characters":                    ["H", "i", "!", " ", "Y", "o", "u", "?"],
+        "character_start_times_seconds": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+        "character_end_times_seconds":   [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    })
+    assert [w.text for w in out] == ["Hi!", "You?"]
+    assert out[0].start_s == pytest.approx(0.0)
+    assert out[0].end_s == pytest.approx(0.3)
+    assert out[1].start_s == pytest.approx(0.4)
+    assert out[1].end_s == pytest.approx(0.8)

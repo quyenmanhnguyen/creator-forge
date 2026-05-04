@@ -22,6 +22,7 @@ Robust failure mode (matches PR-1/2/3/4/5/6):
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -1067,12 +1068,13 @@ def _default_audio_output_dir() -> Path:
     return base / f"audio-{int(time.time() * 1000)}"
 
 
-# ``edge-tts`` writes mp3, ``piper-tts`` writes wav. The route reflects
-# the actual format back in the response so the renderer doesn't have
-# to guess from the extension.
+# ``edge-tts`` and ``elevenlabs`` write mp3, ``piper-tts`` writes wav.
+# The route reflects the actual format back in the response so the
+# renderer doesn't have to guess from the extension.
 _AUDIO_FORMAT_BY_PROVIDER: dict[str, Literal["mp3", "wav"]] = {
     "edge-tts": "mp3",
     "piper-tts": "wav",
+    "elevenlabs": "mp3",
 }
 
 
@@ -2588,6 +2590,21 @@ def _list_tts_providers() -> list[dict]:
             None
             if piper_bin
             else "`piper` binary not on PATH — `pip install piper-tts` or download a release."
+        ),
+    })
+    # elevenlabs: hosted, requires ELEVENLABS_API_KEY env var. The
+    # ``requests`` package is a hard sidecar dep so we don't probe it.
+    # Configured = key present; the actual API call surfaces
+    # auth/quota errors as warnings on /producer/audio.
+    elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    out.append({
+        "name": "elevenlabs",
+        "label": "ElevenLabs (hosted, paid, multilingual incl. VI)",
+        "is_configured": bool(elevenlabs_key),
+        "missing_reason": (
+            None
+            if elevenlabs_key
+            else "ELEVENLABS_API_KEY env var not set — get a key from https://elevenlabs.io/app/settings/api-keys."
         ),
     })
     return out

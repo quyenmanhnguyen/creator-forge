@@ -1,20 +1,29 @@
 """Text-to-speech adapters for the Pixelle pipeline.
 
 The :class:`TTSAdapter` protocol is the single seam used by the Producer
-page. Today only Edge-TTS is implemented (free, no key, decent quality).
+page. Three engines are wired today:
+
+- ``edge-tts``  — Microsoft Edge TTS (free, online, no key).
+- ``piper-tts`` — Piper neural TTS (free, offline, ~25 MB / voice).
+- ``elevenlabs`` — ElevenLabs hosted TTS (paid, ``ELEVENLABS_API_KEY``
+  env var). Highest perceived quality + native multilingual support
+  (incl. Vietnamese) via the ``eleven_multilingual_v2`` model.
+
 IndexTTS / ChatTTS / Kokoro can be added later by implementing the same
 protocol — pages need not change.
 
-The Edge-TTS adapter exposes two flavours:
+Each adapter exposes two flavours:
 
-- :meth:`EdgeTTSAdapter.synthesize` — fire-and-forget, just writes the mp3.
-- :meth:`EdgeTTSAdapter.synthesize_with_timing` — also captures per-word
-  timing (``WordBoundary`` events) so the subtitle module can build SRT
-  without needing a separate alignment pass.
+- :meth:`synthesize` — fire-and-forget, just writes the audio file.
+- :meth:`synthesize_with_timing` — also captures per-word timing
+  (``WordBoundary`` events) so the subtitle module can build SRT without
+  a separate alignment pass.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -310,12 +319,286 @@ def resolve_piper_voice_path(
     )
 
 
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io"
+ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2"
+ELEVENLABS_DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
+ELEVENLABS_API_KEY_ENV = "ELEVENLABS_API_KEY"
+
+
+class ElevenLabsAdapter:
+    """ElevenLabs hosted TTS adapter (https://elevenlabs.io).
+
+    Uses the ``eleven_multilingual_v2`` model by default which speaks
+    EN/JA/KO/ZH/ES/FR/DE/PT/HI/PL/IT/AR/RU/TR/UK/VI/ID/TH/ML/CS/SV/RO
+    natively, so the same curated voice list works across every locale
+    we expose in the Producer page picker. The ``voice`` argument
+    passed to :meth:`synthesize` / :meth:`synthesize_with_timing` is
+    the ElevenLabs voice id (e.g. ``"21m00Tcm4TlvDq8ikWAM"`` for
+    Rachel) — :mod:`core.pixelle.voices` exposes a curated set whose
+    ``short_name`` is the raw id so the renderer's voice dropdown can
+    pass it straight through.
+
+    Authentication: reads ``ELEVENLABS_API_KEY`` from the process env
+    at synth time. Missing key raises :class:`RuntimeError` with a
+    pointer; the route layer surfaces this as a warning rather than
+    500-ing the whole call (mirrors ``DEEPSEEK_API_KEY`` handling
+    elsewhere in the codebase).
+
+    Output format: mp3 at 44.1 kHz / 128 kbps. Word boundaries come
+    from the ``with-timestamps`` endpoint's ``normalized_alignment``
+    payload (per-character start/end times) — we group consecutive
+    non-whitespace characters into words so the assembled SRT lines
+    up with what listeners actually hear.
+
+    The ``stability`` / ``similarity_boost`` / ``style`` fields are
+    settable on the adapter for callers that want to tweak the
+    voice settings without changing the public protocol; they map
+    1-to-1 onto the API's ``voice_settings`` block. Defaults match
+    ElevenLabs' "Default" preset.
+    """
+
+    name = "elevenlabs"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        model_id: str = ELEVENLABS_DEFAULT_MODEL,
+        output_format: str = ELEVENLABS_DEFAULT_OUTPUT_FORMAT,
+        stability: float = 0.5,
+        similarity_boost: float = 0.75,
+        style: float = 0.0,
+        use_speaker_boost: bool = True,
+        timeout_s: float = 60.0,
+    ) -> None:
+        # Captured at construction so tests can inject a fake key
+        # without touching os.environ; the route layer reads the env
+        # var fresh on each request and passes it in.
+        self._api_key = api_key
+        self.model_id = model_id
+        self.output_format = output_format
+        self.stability = float(stability)
+        self.similarity_boost = float(similarity_boost)
+        self.style = float(style)
+        self.use_speaker_boost = bool(use_speaker_boost)
+        self.timeout_s = float(timeout_s)
+
+    @property
+    def api_key(self) -> str:
+        key = (self._api_key or os.environ.get(ELEVENLABS_API_KEY_ENV) or "").strip()
+        if not key:
+            raise RuntimeError(
+                f"{ELEVENLABS_API_KEY_ENV} not set. Get a key from "
+                "https://elevenlabs.io/app/settings/api-keys and either "
+                "store it via the desktop app's Secrets panel or export "
+                f"{ELEVENLABS_API_KEY_ENV}=... in the sidecar environment."
+            )
+        return key
+
+    def synthesize(self, text: str, *, output_path: Path, voice: str) -> TTSResult:
+        if not text.strip():
+            raise ValueError("TTS text must be non-empty")
+        if not (voice or "").strip():
+            raise ValueError("ElevenLabs voice id must be non-empty")
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._post_audio_to(output_path=output_path, text=text, voice=voice)
+        duration = _probe_mp3_duration(output_path)
+        return TTSResult(
+            audio_path=output_path,
+            duration_seconds=duration,
+            voice=voice,
+            engine=self.name,
+        )
+
+    def synthesize_with_timing(
+        self, text: str, *, output_path: Path, voice: str
+    ) -> TTSResult:
+        if not text.strip():
+            raise ValueError("TTS text must be non-empty")
+        if not (voice or "").strip():
+            raise ValueError("ElevenLabs voice id must be non-empty")
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        boundaries = self._post_audio_with_timestamps_to(
+            output_path=output_path, text=text, voice=voice
+        )
+        duration = _probe_mp3_duration(output_path)
+        return TTSResult(
+            audio_path=output_path,
+            duration_seconds=duration,
+            voice=voice,
+            engine=self.name,
+            word_boundaries=boundaries,
+        )
+
+    # ------------------------------------------------------------------
+    # HTTP plumbing — kept on the instance so tests can monkey-patch
+    # ``requests.post`` (or swap the whole helper) without async fixtures.
+    # ------------------------------------------------------------------
+
+    def _post_audio_to(self, *, output_path: Path, text: str, voice: str) -> None:
+        import requests
+
+        url = f"{ELEVENLABS_API_BASE}/v1/text-to-speech/{voice}"
+        params = {"output_format": self.output_format}
+        resp = requests.post(
+            url,
+            params=params,
+            headers={
+                "xi-api-key": self.api_key,
+                "accept": "audio/mpeg",
+                "content-type": "application/json",
+            },
+            json=self._payload(text),
+            timeout=self.timeout_s,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(_elevenlabs_error_message(resp))
+        with output_path.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    fh.write(chunk)
+
+    def _post_audio_with_timestamps_to(
+        self, *, output_path: Path, text: str, voice: str
+    ) -> list[WordBoundary]:
+        import requests
+
+        url = f"{ELEVENLABS_API_BASE}/v1/text-to-speech/{voice}/with-timestamps"
+        params = {"output_format": self.output_format}
+        resp = requests.post(
+            url,
+            params=params,
+            headers={
+                "xi-api-key": self.api_key,
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            json=self._payload(text),
+            timeout=self.timeout_s,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(_elevenlabs_error_message(resp))
+        body = resp.json()
+        audio_b64 = body.get("audio_base64") or ""
+        if not audio_b64:
+            raise RuntimeError(
+                "ElevenLabs with-timestamps response missing 'audio_base64'"
+            )
+        output_path.write_bytes(base64.b64decode(audio_b64))
+        alignment = body.get("normalized_alignment") or body.get("alignment") or {}
+        return _elevenlabs_alignment_to_word_boundaries(alignment)
+
+    def _payload(self, text: str) -> dict:
+        return {
+            "text": text,
+            "model_id": self.model_id,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+                "style": self.style,
+                "use_speaker_boost": self.use_speaker_boost,
+            },
+        }
+
+
+def _elevenlabs_error_message(resp) -> str:
+    """Best-effort extraction of a human-readable error from an
+    ElevenLabs error response. Falls back to status + body snippet
+    when the JSON shape doesn't match the documented contract."""
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            msg = detail.get("message") or detail.get("status")
+            if msg:
+                return f"ElevenLabs {resp.status_code}: {msg}"
+        if isinstance(detail, str):
+            return f"ElevenLabs {resp.status_code}: {detail}"
+    snippet = (resp.text or "")[:200].strip()
+    return f"ElevenLabs HTTP {resp.status_code}: {snippet or '<no body>'}"
+
+
+def _elevenlabs_alignment_to_word_boundaries(alignment: dict) -> list[WordBoundary]:
+    """Convert ElevenLabs' per-character alignment payload to the
+    pipeline's :class:`WordBoundary` list.
+
+    The ``with-timestamps`` endpoint returns three parallel arrays:
+
+    * ``characters`` — list of single-character strings.
+    * ``character_start_times_seconds`` — float seconds since audio
+      start, one per character.
+    * ``character_end_times_seconds`` — same length, end times.
+
+    We group consecutive non-whitespace characters into words. The
+    word's ``start_s`` is the first character's start time; its
+    ``end_s`` is the last character's end time. Empty / whitespace-only
+    runs are dropped. Returns an empty list when the payload is
+    missing or malformed (callers fall back to
+    :func:`subtitles.fallback_captions_from_text`).
+    """
+    chars = alignment.get("characters")
+    starts = alignment.get("character_start_times_seconds")
+    ends = alignment.get("character_end_times_seconds")
+    if (
+        not isinstance(chars, list)
+        or not isinstance(starts, list)
+        or not isinstance(ends, list)
+    ):
+        return []
+    n = min(len(chars), len(starts), len(ends))
+    if n == 0:
+        return []
+
+    words: list[WordBoundary] = []
+    buf: list[str] = []
+    word_start: float | None = None
+    last_end: float = 0.0
+    for i in range(n):
+        ch = chars[i] if isinstance(chars[i], str) else ""
+        try:
+            s = float(starts[i])
+            e = float(ends[i])
+        except (TypeError, ValueError):
+            continue
+        if ch.strip():
+            if word_start is None:
+                word_start = s
+            buf.append(ch)
+            last_end = e
+            continue
+        # Whitespace / control char → flush current word.
+        if buf and word_start is not None:
+            words.append(
+                WordBoundary(
+                    start_s=float(word_start),
+                    end_s=float(last_end),
+                    text="".join(buf),
+                )
+            )
+        buf = []
+        word_start = None
+    if buf and word_start is not None:
+        words.append(
+            WordBoundary(
+                start_s=float(word_start),
+                end_s=float(last_end),
+                text="".join(buf),
+            )
+        )
+    return words
+
+
 # ---------------------------------------------------------------------------
 # Provider registry / factory
 # ---------------------------------------------------------------------------
 
 
-KNOWN_TTS_PROVIDERS: tuple[str, ...] = ("edge-tts", "piper-tts")
+KNOWN_TTS_PROVIDERS: tuple[str, ...] = ("edge-tts", "piper-tts", "elevenlabs")
 DEFAULT_TTS_PROVIDER: str = "edge-tts"
 
 
@@ -332,6 +615,8 @@ def make_tts_adapter(provider: str | None) -> TTSAdapter:
         return EdgeTTSAdapter()
     if key == "piper-tts":
         return PiperTTSAdapter()
+    if key == "elevenlabs":
+        return ElevenLabsAdapter()
     # Unknown provider id — fall back to default rather than 4xx; UI
     # validation should catch this earlier and show a friendlier error.
     return EdgeTTSAdapter()
