@@ -116,10 +116,173 @@ def test_resolve_piper_voice_missing_raises(tmp_path: Path) -> None:
     voices_dir = tmp_path / "voices"
     voices_dir.mkdir()
     with pytest.raises(FileNotFoundError) as ei:
-        resolve_piper_voice_path("nope", voices_dir=voices_dir)
+        # ``auto_download=False`` keeps this test offline — short-name
+        # ``nope`` doesn't match the HF pattern anyway, so even with
+        # auto-download on it'd skip the network call, but we pass the
+        # flag explicitly so the assertion is unambiguous.
+        resolve_piper_voice_path(
+            "nope", voices_dir=voices_dir, auto_download=False
+        )
     # Message must point users at the download URL — keeps support trail
     # short.
     assert "huggingface.co/rhasspy/piper-voices" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# HF-15 — Piper voice auto-download (offline; we monkey-patch the
+# ``_download_to_path`` helper so the test never hits the network).
+# ---------------------------------------------------------------------------
+
+
+def test_piper_voice_hf_url_known_short_name() -> None:
+    # HF-15: en_US-amy-medium → en/en_US/amy/medium/en_US-amy-medium.onnx
+    assert tts_mod._piper_voice_hf_url("en_US-amy-medium") == (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+        "en/en_US/amy/medium/en_US-amy-medium.onnx"
+    )
+    # vi_VN-vais1000-medium → vi/vi_VN/vais1000/medium/...
+    assert tts_mod._piper_voice_hf_url("vi_VN-vais1000-medium") == (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+        "vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium.onnx"
+    )
+
+
+def test_piper_voice_hf_url_rejects_malformed() -> None:
+    # Non-piper short-names (e.g. raw filenames, edge-tts ids) return
+    # None so the auto-download stays an opt-in fast path.
+    assert tts_mod._piper_voice_hf_url("nope") is None
+    assert tts_mod._piper_voice_hf_url("en-US-AriaNeural") is None
+    assert tts_mod._piper_voice_hf_url("en_US-AMY-medium") is None  # uppercase name
+    assert tts_mod._piper_voice_hf_url("en_us-amy-medium") is None  # lowercase country
+
+
+def _patch_download(monkeypatch, fake) -> None:
+    """Patch ``_download_to_path`` on every module copy that holds it.
+
+    ``research/core/pixelle/__init__.py`` aliases ``core`` → ``research.core``
+    by registering both names in ``sys.modules``, which means
+    ``research.core.pixelle.tts`` and ``core.pixelle.tts`` are loaded as
+    *two* distinct module objects sharing the same source file. A
+    `monkeypatch` against one copy doesn't affect the other, so the
+    auto-download chain (whose globals point at whichever module the
+    function happened to be defined in) escapes the patch. We patch both
+    here so the unit test stays deterministic regardless of import order.
+    """
+    import sys as _sys
+
+    for mod_name in ("research.core.pixelle.tts", "core.pixelle.tts"):
+        mod = _sys.modules.get(mod_name)
+        if mod is not None:
+            monkeypatch.setattr(mod, "_download_to_path", fake)
+
+
+def test_resolve_piper_voice_auto_download_success(monkeypatch, tmp_path: Path) -> None:
+    """Auto-download writes both .onnx + .onnx.json then returns the path."""
+    voices_dir = tmp_path / "voices"
+
+    captured_urls: list[str] = []
+
+    def fake_dl(url: str, dest: Path, *, timeout: float) -> None:
+        captured_urls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate a real download by writing a non-empty file.
+        dest.write_bytes(b"\x00" * 32)
+
+    _patch_download(monkeypatch, fake_dl)
+
+    p = resolve_piper_voice_path(
+        "en_US-amy-medium", voices_dir=voices_dir, auto_download=True
+    )
+    assert p == voices_dir / "en_US-amy-medium.onnx"
+    assert (voices_dir / "en_US-amy-medium.onnx.json").exists()
+    # Both files were fetched, in order: .onnx first, then .onnx.json.
+    assert len(captured_urls) == 2
+    assert captured_urls[0].endswith("/en_US-amy-medium.onnx")
+    assert captured_urls[1].endswith("/en_US-amy-medium.onnx.json")
+
+
+def test_resolve_piper_voice_auto_download_failure_raises_file_not_found(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Network failure during auto-download falls through to the legacy
+    FileNotFoundError so HF-14's edge-tts fallback can take over."""
+    voices_dir = tmp_path / "voices"
+
+    def boom(url: str, dest: Path, *, timeout: float) -> None:
+        raise OSError("simulated network failure")
+
+    _patch_download(monkeypatch, boom)
+
+    with pytest.raises(FileNotFoundError):
+        resolve_piper_voice_path(
+            "en_US-amy-medium", voices_dir=voices_dir, auto_download=True
+        )
+
+
+def test_resolve_piper_voice_auto_download_env_disabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """``CREATOR_FORGE_PIPER_AUTO_DOWNLOAD=0`` skips network entirely."""
+    voices_dir = tmp_path / "voices"
+    voices_dir.mkdir()
+
+    called = {"count": 0}
+
+    def fake_dl(*args, **kwargs):
+        called["count"] += 1
+
+    _patch_download(monkeypatch, fake_dl)
+    monkeypatch.setenv("CREATOR_FORGE_PIPER_AUTO_DOWNLOAD", "0")
+
+    with pytest.raises(FileNotFoundError):
+        # ``auto_download=None`` → consult env (now disabled).
+        resolve_piper_voice_path("en_US-amy-medium", voices_dir=voices_dir)
+    assert called["count"] == 0  # never hit the network
+
+
+def test_resolve_piper_voice_auto_download_skipped_when_present(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A pre-existing ``.onnx`` short-circuits — no download attempt."""
+    voices_dir = tmp_path / "voices"
+    voices_dir.mkdir()
+    onnx = voices_dir / "en_US-amy-medium.onnx"
+    onnx.write_bytes(b"\x00" * 32)
+
+    called = {"count": 0}
+
+    def fake_dl(*args, **kwargs):
+        called["count"] += 1
+
+    _patch_download(monkeypatch, fake_dl)
+
+    p = resolve_piper_voice_path(
+        "en_US-amy-medium", voices_dir=voices_dir, auto_download=True
+    )
+    assert p == onnx
+    assert called["count"] == 0
+
+
+def test_piper_auto_download_enabled_env_parses_falsy() -> None:
+    """The env-var parser treats common falsy strings as off, otherwise on."""
+    import os
+
+    backup = os.environ.get("CREATOR_FORGE_PIPER_AUTO_DOWNLOAD")
+    try:
+        for v in ("0", "false", "no", "off", "FALSE", "Off", ""):
+            os.environ["CREATOR_FORGE_PIPER_AUTO_DOWNLOAD"] = v
+            assert not tts_mod._piper_auto_download_enabled(), v
+        for v in ("1", "true", "yes", "on", "anything"):
+            os.environ["CREATOR_FORGE_PIPER_AUTO_DOWNLOAD"] = v
+            assert tts_mod._piper_auto_download_enabled(), v
+        # Unset → default ON.
+        os.environ.pop("CREATOR_FORGE_PIPER_AUTO_DOWNLOAD", None)
+        assert tts_mod._piper_auto_download_enabled()
+    finally:
+        if backup is None:
+            os.environ.pop("CREATOR_FORGE_PIPER_AUTO_DOWNLOAD", None)
+        else:
+            os.environ["CREATOR_FORGE_PIPER_AUTO_DOWNLOAD"] = backup
 
 
 # ---------------------------------------------------------------------------

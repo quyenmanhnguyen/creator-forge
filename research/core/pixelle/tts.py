@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -284,8 +285,136 @@ class PiperTTSAdapter:
             )
 
 
+PIPER_VOICES_HF_BASE = (
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+)
+PIPER_AUTO_DOWNLOAD_ENV = "CREATOR_FORGE_PIPER_AUTO_DOWNLOAD"
+_PIPER_DOWNLOAD_TIMEOUT_S = 120.0
+_PIPER_VOICE_SHORT_NAME_RE = re.compile(
+    r"^(?P<lang>[a-z]{2,3})_(?P<country>[A-Z]{2,3})-(?P<name>[a-z0-9]+)-(?P<quality>x_low|low|medium|high)$"
+)
+
+
+def _piper_voice_hf_url(voice: str) -> str | None:
+    """Build the huggingface.co download URL for a Piper voice short-name.
+
+    Piper's HF layout is::
+
+        rhasspy/piper-voices/<lang>/<lang>_<COUNTRY>/<name>/<quality>/<short>.onnx
+
+    e.g. ``en_US-amy-medium`` lives under ``en/en_US/amy/medium/``.
+
+    Returns ``None`` for short-names that don't match the expected
+    ``<lang>_<COUNTRY>-<name>-<quality>`` pattern — auto-download stays
+    a best-effort enhancement and never blocks the FileNotFoundError
+    fallback path.
+    """
+    m = _PIPER_VOICE_SHORT_NAME_RE.match(voice)
+    if not m:
+        return None
+    lang = m.group("lang")
+    country = m.group("country")
+    name = m.group("name")
+    quality = m.group("quality")
+    return (
+        f"{PIPER_VOICES_HF_BASE}/{lang}/{lang}_{country}/{name}/{quality}/"
+        f"{voice}.onnx"
+    )
+
+
+def _piper_auto_download_enabled() -> bool:
+    """Return True when ``CREATOR_FORGE_PIPER_AUTO_DOWNLOAD`` is not falsy.
+
+    Default is enabled. Falsy values are ``0``/``false``/``no``/``off``
+    (case-insensitive) — anything else (including unset) means auto-download
+    is on. This is the inverse of how the rest of the codebase opts in to
+    optional features, but matches the user's expectation that "if I picked
+    Piper, the app should make Piper work without me hand-installing voices".
+    """
+    raw = os.environ.get(PIPER_AUTO_DOWNLOAD_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _download_to_path(url: str, dest: Path, *, timeout: float) -> None:
+    """Stream a URL to ``dest`` atomically. Raises on any HTTP / IO error.
+
+    Atomic = download to ``<dest>.part`` and rename on success so a
+    half-finished download never leaves a corrupt ``.onnx`` on disk that
+    would silently fail every subsequent ``piper`` invocation.
+    """
+    import shutil
+    import urllib.error
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "creator-forge-piper-fetch/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            if getattr(resp, "status", 200) >= 400:
+                raise urllib.error.HTTPError(
+                    url, resp.status, "http error", resp.headers, None
+                )
+            with tmp.open("wb") as fh:
+                shutil.copyfileobj(resp, fh, length=1024 * 256)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+    if not tmp.exists() or tmp.stat().st_size == 0:
+        raise OSError(f"piper voice download from {url} produced an empty file")
+    tmp.replace(dest)
+
+
+def auto_download_piper_voice(
+    voice: str,
+    *,
+    voices_dir: Path,
+    timeout: float = _PIPER_DOWNLOAD_TIMEOUT_S,
+) -> bool:
+    """Best-effort download of ``<voice>.onnx`` + ``<voice>.onnx.json`` from HF.
+
+    Returns ``True`` when both files now exist on disk under
+    ``voices_dir``, ``False`` on any failure (network, 404, malformed
+    short-name). Never raises — :func:`resolve_piper_voice_path` decides
+    whether to fall back to ``FileNotFoundError`` based on the boolean
+    return.
+    """
+    onnx_url = _piper_voice_hf_url(voice)
+    if not onnx_url:
+        return False
+    json_url = onnx_url + ".json"
+    onnx_path = voices_dir / f"{voice}.onnx"
+    json_path = voices_dir / f"{voice}.onnx.json"
+    try:
+        if not onnx_path.exists():
+            _download_to_path(onnx_url, onnx_path, timeout=timeout)
+        if not json_path.exists():
+            _download_to_path(json_url, json_path, timeout=timeout)
+    except Exception:
+        # Downloads are best-effort. Leave any partial files alone; the
+        # caller will surface a FileNotFoundError + the existing HF-14
+        # fallback to edge-tts will pick up the slack.
+        return onnx_path.exists() and json_path.exists()
+    return onnx_path.exists() and json_path.exists()
+
+
 def resolve_piper_voice_path(
-    voice: str, *, voices_dir: Path | None = None
+    voice: str,
+    *,
+    voices_dir: Path | None = None,
+    auto_download: bool | None = None,
 ) -> Path:
     """Resolve a Piper voice short-name (or path) to an ``.onnx`` model.
 
@@ -296,10 +425,17 @@ def resolve_piper_voice_path(
       ``voices_dir`` (default: ``~/.creator-forge/piper-voices/``) as
       ``<voices_dir>/<short>.onnx``.
 
-    Raises :class:`FileNotFoundError` if no matching ``.onnx`` exists —
-    we deliberately do NOT auto-download (network access in tests + the
-    Devin VM is unreliable; the desktop app downloads voices through a
-    separate, user-driven flow).
+    When the file is missing and ``auto_download`` is enabled (default:
+    follow the ``CREATOR_FORGE_PIPER_AUTO_DOWNLOAD`` env var, which
+    defaults to on), this helper streams ``<voice>.onnx`` and
+    ``<voice>.onnx.json`` from huggingface.co/rhasspy/piper-voices into
+    ``voices_dir`` before returning the resolved path. Download failures
+    are silent — the function falls through to the legacy
+    ``FileNotFoundError`` path so callers (e.g. the producer route) can
+    fall back to edge-tts via the existing HF-14 swap.
+
+    Raises :class:`FileNotFoundError` if no matching ``.onnx`` exists
+    after the (optional) auto-download attempt.
     """
     p = Path(voice).expanduser()
     if p.is_absolute() and p.suffix == ".onnx" and p.exists():
@@ -312,6 +448,21 @@ def resolve_piper_voice_path(
     candidate = base / f"{voice}.onnx"
     if candidate.exists():
         return candidate
+
+    do_download = (
+        auto_download
+        if auto_download is not None
+        else _piper_auto_download_enabled()
+    )
+    if do_download:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if auto_download_piper_voice(voice, voices_dir=base):
+            if candidate.exists():
+                return candidate
+
     raise FileNotFoundError(
         f"Piper voice '{voice}' not found at {candidate}. "
         "Download from https://huggingface.co/rhasspy/piper-voices and "

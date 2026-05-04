@@ -1282,6 +1282,50 @@ class AudioOnlyRequest(BaseModel):
             "and single-pass synthesis paths."
         ),
     )
+    # HF-15 — auto-fit audio to match ``target_duration_s`` so the
+    # final assembly never silently truncates the narration. When
+    # ``auto_fit_audio`` is true (default) and the synthesised audio
+    # is longer than the target, the route post-processes it with
+    # ffmpeg's ``atempo`` filter to compress the audio in place.
+    # Caption timestamps are scaled by the same factor so the SRT
+    # still aligns with the new (shorter) audio. Out-of-range tempos
+    # (>``auto_fit_max_tempo`` or <``auto_fit_min_tempo``) are
+    # surfaced as a warning instead of producing chipmunk audio —
+    # the user is asked to trim their script. Single-pass mode only;
+    # per-scene mode pads silence to fit so it doesn't need this.
+    auto_fit_audio: bool = Field(
+        True,
+        description=(
+            "When true (default), single-pass narration that runs "
+            "longer than ``target_duration_s`` is time-stretched in "
+            "place via ffmpeg ``atempo`` to fit the target. When "
+            "false, the legacy behaviour is preserved: audio keeps "
+            "its natural duration and ``/producer/assemble`` may "
+            "truncate the tail to the summed scene-video length."
+        ),
+    )
+    auto_fit_max_tempo: float = Field(
+        1.5,
+        gt=1.0,
+        le=2.0,
+        description=(
+            "Maximum atempo factor for ``auto_fit_audio``. Values "
+            "above this fall back to a warning + untouched audio so "
+            "speech doesn't sound like a chipmunk. atempo's per-filter "
+            "ceiling is 2.0; 1.5 keeps voice quality natural."
+        ),
+    )
+    auto_fit_min_tempo: float = Field(
+        0.85,
+        ge=0.5,
+        lt=1.0,
+        description=(
+            "Minimum atempo factor for ``auto_fit_audio`` (used only "
+            "when narration is *shorter* than the target and the "
+            "user wants to slow it down). Defaults to 0.85, which "
+            "keeps speech natural without sounding drugged."
+        ),
+    )
 
     _strip_script = field_validator("script", mode="before")(classmethod(lambda cls, v: _strip(v)))
     _strip_voice = field_validator("voice", mode="before")(classmethod(lambda cls, v: _strip(v)))
@@ -1360,6 +1404,12 @@ class AudioOnlyResponse(BaseModel):
     # responses (pre-PR-A clients) keep parsing.
     target_duration_s: float = 0.0
     captions_scaled: bool = False
+    # HF-15 — atempo factor that was applied to the audio so the
+    # renderer can show "audio sped up 1.18× to fit 12.0s video".
+    # 1.0 means no time-stretching happened; values < 1.0 mean the
+    # audio was slowed down; > 1.0 means it was sped up.
+    audio_tempo_applied: float = 1.0
+    audio_auto_fit: bool = False
     # Per-scene narration mode (default 0 = off). Equal to the number
     # of scene_narrations slots that successfully synthesised + were
     # concatenated into ``audio_path``. The renderer surfaces this so
@@ -1395,6 +1445,94 @@ class _PerSceneSynthResult:
     # segment into the final audio.
     skipped: bool = False
     skip_reason: str = ""
+
+
+def _ffmpeg_atempo_audio_in_place(
+    audio_path: Path,
+    *,
+    tempo: float,
+    audio_format: Literal["mp3", "wav"],
+    timeout_s: float = 180.0,
+) -> tuple[bool, str]:
+    """Time-stretch ``audio_path`` in place by the given tempo factor.
+
+    Uses ffmpeg's ``atempo`` filter. ``tempo > 1.0`` shortens the audio,
+    ``tempo < 1.0`` lengthens it. atempo's per-filter range is 0.5–2.0;
+    callers should keep the requested factor in the 0.85–1.5 sweet spot
+    to preserve voice quality. We pass through the same codec the
+    source uses so the renderer's expectation about ``audio_format``
+    (mp3 for edge-tts / elevenlabs, wav for piper) stays intact.
+
+    Returns ``(ok, error_message)``. Never raises — callers add the
+    error message to their warnings list and surface a ``audio_path``
+    with un-stretched audio.
+    """
+    binary = _resolve_ffmpeg()
+    if not binary:
+        return False, "ffmpeg not on PATH and FFMPEG_PATH not set"
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        return False, f"audio file is missing or empty at {audio_path}"
+    if not (0.5 <= tempo <= 2.0):
+        return False, f"atempo factor {tempo:.3f} is outside ffmpeg's 0.5–2.0 range"
+
+    work_dir = audio_path.parent
+    suffix = audio_path.suffix or (".wav" if audio_format == "wav" else ".mp3")
+    tmp_path = work_dir / f"_atempo_{int(time.time() * 1000)}{suffix}"
+    codec_args = (
+        ["-c:a", "libmp3lame", "-b:a", "192k"]
+        if audio_format == "mp3"
+        else ["-c:a", "pcm_s16le"]
+    )
+    cmd = [
+        binary,
+        "-y",
+        "-loglevel", "error",
+        "-i", str(audio_path),
+        "-filter:a", f"atempo={tempo:.6f}",
+        *codec_args,
+        str(tmp_path),
+    ]
+    try:
+        proc = subprocess.run(  # noqa: S603 — controlled cmd, no shell=True.
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return False, f"ffmpeg atempo timed out after {timeout_s}s"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if proc.returncode != 0:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return False, (
+            f"ffmpeg atempo failed: rc={proc.returncode} "
+            f"stderr={(proc.stderr or '').strip()[:400]}"
+        )
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        return False, "ffmpeg atempo completed but output is empty"
+
+    try:
+        tmp_path.replace(audio_path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return False, f"could not promote atempo output: {exc}"
+    return True, ""
 
 
 def _ffmpeg_concat_audio_segments(
@@ -2137,7 +2275,75 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         )
 
     captions_scaled = False
+    audio_tempo_applied = 1.0
+    audio_auto_fit = False
     if not per_scene_active:
+        # HF-15 — auto-fit audio to the target duration via ffmpeg
+        # ``atempo`` BEFORE scaling captions, so the timestamps we
+        # write to the SRT match the (now-shortened) audio. We only
+        # speed up; slowing down a short narration to fill empty
+        # space would feel sluggish, and the assembler already
+        # silence-pads gaps anyway.
+        if (
+            req.auto_fit_audio
+            and audio_ok
+            and target_duration_s > 0
+            and duration_s > target_duration_s + 0.05
+        ):
+            raw_tempo = duration_s / target_duration_s
+            max_tempo = float(req.auto_fit_max_tempo or 1.5)
+            min_tempo = float(req.auto_fit_min_tempo or 0.85)
+            applied_tempo = max(min_tempo, min(raw_tempo, max_tempo))
+            ok, err = _ffmpeg_atempo_audio_in_place(
+                audio_path,
+                tempo=applied_tempo,
+                audio_format=(
+                    "wav" if audio_path.suffix.lower() == ".wav" else "mp3"
+                ),
+            )
+            if ok:
+                # ``duration_s`` was the natural audio length. After
+                # atempo the new length is ``duration_s / applied_tempo``.
+                # Captions need the same scaling; downstream
+                # ``scale_captions_to_duration`` will pin them to the
+                # target after, so we pre-scale by the audio shrink
+                # factor here to keep word-boundary captions aligned
+                # mid-clip.
+                new_duration_s = duration_s / applied_tempo
+                if captions:
+                    captions = [
+                        Caption(
+                            start_s=cap.start_s / applied_tempo,
+                            end_s=cap.end_s / applied_tempo,
+                            text=cap.text,
+                        )
+                        for cap in captions
+                    ]
+                duration_s = new_duration_s
+                audio_tempo_applied = applied_tempo
+                audio_auto_fit = True
+                if raw_tempo > max_tempo + 0.001:
+                    warnings.append(
+                        f"Narration was {duration_s * raw_tempo:.2f}s but "
+                        f"target is {target_duration_s:.2f}s — applied "
+                        f"atempo={applied_tempo:.3f}× (capped at "
+                        f"auto_fit_max_tempo={max_tempo:.2f}). The audio "
+                        f"is still ~{(duration_s - target_duration_s):.2f}s "
+                        "longer than the video; trim the script if you want "
+                        "a perfect fit."
+                    )
+                else:
+                    warnings.append(
+                        f"Audio auto-fit: applied atempo={applied_tempo:.3f}× "
+                        f"so {duration_s * applied_tempo:.2f}s narration fits "
+                        f"into {target_duration_s:.2f}s video."
+                    )
+            else:
+                warnings.append(
+                    f"Audio auto-fit skipped: {err} — final video may "
+                    "truncate the tail of the narration."
+                )
+
         if target_duration_s > 0 and captions:
             # Stretch / compress the existing captions linearly. If TTS
             # never produced timed captions but we have a script + target,
@@ -2158,11 +2364,17 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
                     f"Caption auto-fit fallback failed: {type(exc).__name__}: {exc}"
                 )
 
-        if target_duration_s > 0 and duration_s > target_duration_s + 0.05:
+        if (
+            not audio_auto_fit
+            and target_duration_s > 0
+            and duration_s > target_duration_s + 0.05
+        ):
             warnings.append(
                 f"Narration audio is {duration_s:.2f}s but target is "
                 f"{target_duration_s:.2f}s — captions were compressed to fit "
-                "the shorter video. Consider trimming the script."
+                "the shorter video. Consider trimming the script or "
+                "enabling ``auto_fit_audio`` so the audio is sped up to "
+                "match the visuals."
             )
 
     written_srt: Path | None = None
@@ -2190,6 +2402,8 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
         warnings=warnings,
         target_duration_s=round(target_duration_s, 3),
         captions_scaled=captions_scaled,
+        audio_tempo_applied=round(audio_tempo_applied, 4),
+        audio_auto_fit=audio_auto_fit,
         scenes_rendered=scenes_rendered,
         humanized_per_scene=humanized_per_scene,
     )
