@@ -963,6 +963,48 @@ def _sum_scene_video_duration(
     return float(sum(d for d in durations if d > 0))
 
 
+def _dedupe_per_scene_narrations(
+    narrations: list[str], *, warnings: list[str]
+) -> list[str]:
+    """Strip duplicate per-scene narrations before TTS.
+
+    Two scenes whose narrations are identical (case-insensitive and
+    whitespace-collapsed) get TTS-rendered as the same audio twice
+    and look like a "captions loop back to the beginning" bug at the
+    final-mp4 stage. This is the producer-route safety net that runs
+    AFTER the optional ``humanize_per_scene`` LLM rewrite, so it
+    catches duplicates from any source — DeepSeek's rewrite output,
+    a buggy upstream linear chunker, or a user who pasted the same
+    sentence twice.
+
+    For each duplicate slot we blank the entry (empty string), which
+    the per-scene synth handles by inserting silence the length of
+    that scene's video instead of re-speaking the line. The first
+    occurrence is kept verbatim. Each blanked scene is surfaced in
+    ``warnings`` so the renderer can show the user.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for i, narration in enumerate(narrations):
+        text = (narration or "").strip()
+        norm = " ".join(text.lower().split())
+        if not norm:
+            out.append(text)
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            out.append(text)
+            continue
+        warnings.append(
+            f"Scene {i + 1} narration duplicates an earlier scene — "
+            "blanking to silence to avoid a 'captions repeat at the "
+            "end of the video' bug. Edit the per-scene narrations to "
+            "use distinct lines if this scene should still have voice."
+        )
+        out.append("")
+    return out
+
+
 def _per_scene_video_durations(
     scene_videos: list[str], *, warnings: list[str]
 ) -> list[float]:
@@ -1779,6 +1821,16 @@ def compose_audio(req: AudioOnlyRequest) -> AudioOnlyResponse:
             )
 
     if per_scene_active:
+        # Defensive dedupe: even after the LLM rewrite (which now
+        # dedupes internally) a stale linear-chunker upstream or a
+        # user-supplied scene_narrations array can still hand us two
+        # scenes with identical text. Two TTS-rendered scenes with
+        # the same words look exactly like a "captions repeat at the
+        # end of the video" bug to the user. Strip duplicates here
+        # before synthesis and warn so the operator notices.
+        effective_scene_narrations = _dedupe_per_scene_narrations(
+            effective_scene_narrations, warnings=warnings
+        )
         scene_video_durations = _per_scene_video_durations(
             req.scene_videos, warnings=warnings
         )

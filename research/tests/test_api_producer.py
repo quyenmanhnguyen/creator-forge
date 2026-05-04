@@ -3340,3 +3340,129 @@ def test_audio_rate_defaults_to_plus_zero_percent_when_omitted(monkeypatch, tmp_
     )
     assert r.status_code == 200, r.text
     assert captured["rate_at_synth"] == "+0%"
+
+
+# ---------------------------------------------------------------------------
+# Producer-side dedupe of per-scene narrations (caption-repeat-at-end bug guard).
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_per_scene_narrations_strips_duplicates_and_warns() -> None:
+    """The producer-route safety net runs *after* the optional LLM
+    rewrite and catches duplicates from any source. Each duplicate
+    slot is blanked (so the per-scene synth pads silence rather than
+    re-rendering the same line) and a warning is emitted naming the
+    scene number."""
+    warnings: list[str] = []
+    out = producer_route._dedupe_per_scene_narrations(
+        [
+            "Late night grocery run. Just stretching.",
+            "She rides the escalator unaware.",
+            "Late night grocery run. Just stretching.",
+        ],
+        warnings=warnings,
+    )
+    assert out == [
+        "Late night grocery run. Just stretching.",
+        "She rides the escalator unaware.",
+        "",
+    ]
+    assert len(warnings) == 1
+    assert "Scene 3" in warnings[0]
+    assert "duplicates" in warnings[0]
+
+
+def test_dedupe_per_scene_narrations_passes_through_unique() -> None:
+    """No-op when all entries are distinct — the warning list stays
+    empty so the renderer doesn't show a misleading toast."""
+    warnings: list[str] = []
+    out = producer_route._dedupe_per_scene_narrations(
+        ["one", "two", "three"], warnings=warnings
+    )
+    assert out == ["one", "two", "three"]
+    assert warnings == []
+
+
+def test_dedupe_per_scene_narrations_passes_blank_through() -> None:
+    """Blank entries are silence-pad sentinels — they are not treated
+    as duplicates of one another even when several scenes are blank."""
+    warnings: list[str] = []
+    out = producer_route._dedupe_per_scene_narrations(
+        ["", "Real line.", "   ", ""], warnings=warnings
+    )
+    assert out == ["", "Real line.", "", ""]
+    assert warnings == []
+
+
+def test_audio_endpoint_dedupes_duplicate_scene_narrations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end through ``/producer/audio`` per-scene mode: when two
+    scenes have identical narrations the duplicate is blanked, only
+    the first scene is TTS-synthesised with that text, and the
+    response surfaces a warning naming the duplicate scene index."""
+    captured: dict[str, list[str]] = {"texts": []}
+
+    class FakeAdapter:
+        name = "edge-tts"
+        rate = "+0%"
+
+        def synthesize_with_timing(
+            self, text: str, *, output_path: Path, voice: str
+        ) -> TTSResult:
+            captured["texts"].append(text)
+            output_path = Path(output_path)
+            output_path.write_bytes(b"\x00" * 1024)
+            return TTSResult(
+                audio_path=output_path,
+                duration_seconds=1.0,
+                voice=voice,
+                engine=self.name,
+                word_boundaries=[],
+            )
+
+    monkeypatch.setattr(producer_route, "_resolve_tts_adapter", lambda _p: FakeAdapter())
+    # Skip the per-scene audio concat (mp3 stitching needs ffmpeg with
+    # encoders we don't always have in the test image). The dedupe
+    # path runs strictly before this so disabling the concat keeps
+    # the test focused on the dedupe contract.
+    monkeypatch.setattr(
+        producer_route,
+        "_ffmpeg_concat_audio_segments",
+        lambda *a, **kw: (False, "skipped"),
+    )
+
+    client = TestClient(create_app())
+    out = tmp_path / "audio-out-dedupe"
+    r = client.post(
+        "/producer/audio",
+        json={
+            "script": "anything",
+            "voice": "en-US-AriaNeural",
+            "output_dir": str(out),
+            "scene_narrations": [
+                "Late night grocery run. Just stretching.",
+                "She rides the escalator unaware.",
+                "Late night grocery run. Just stretching.",
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # Per-scene path saw exactly two TTS calls — the duplicate scene
+    # 3 was blanked so the synth padded silence instead of re-rendering
+    # the line. (A subsequent single-pass fallback may TTS the full
+    # script when the audio concat is stubbed out as in this test;
+    # it's the per-scene call sequence we care about here.)
+    per_scene_texts = captured["texts"][:2]
+    assert per_scene_texts == [
+        "Late night grocery run. Just stretching.",
+        "She rides the escalator unaware.",
+    ]
+    # The duplicate narration must NOT have been TTS-rendered a 2nd time
+    # in the per-scene path.
+    assert captured["texts"].count("Late night grocery run. Just stretching.") == 1
+    # Warning surfaces the duplicate scene index for renderer toast.
+    dedupe_warnings = [w for w in body["warnings"] if "Scene 3" in w and "duplicate" in w]
+    assert dedupe_warnings, body["warnings"]
