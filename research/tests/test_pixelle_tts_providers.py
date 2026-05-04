@@ -489,13 +489,27 @@ def test_elevenlabs_alignment_helper_groups_punctuation_with_word() -> None:
         # 401 free-tier-revoked — the exact bug report.
         "ElevenLabs 401: Free Tier usage disabled — Unusual activity detected",
         "ElevenLabs 401 Unauthorized: invalid_api_key",
+        # ``api_key`` property raises this BEFORE any HTTP call, so the
+        # status-code path never sees it — falls back to fragments.
         "ELEVENLABS_API_KEY not set",
-        # 403 region / quota.
+        # 403 region locked.
         "ElevenLabs 403 Forbidden: detected_unusual_activity",
+        # 404 voice id not found — HF-13a regression. The exact message
+        # from the production bug report (PR #91 follow-up).
+        "ElevenLabs 404: A voice with voice_id 'pNInz6obpgDQGBFOQs8c' was not found.",
+        "RuntimeError: ElevenLabs 404: A voice with voice_id 'XYZ' was not found.",
+        # 422 unprocessable.
         "ElevenLabs 422: voice_not_found",
-        "ElevenLabs 429: quota_exceeded — tier_quota_exceeded",
         "ElevenLabs 422 Unprocessable Entity: model_not_found",
-        "ElevenLabs 429: too_many_concurrent_requests",
+        # 400 bad request.
+        "ElevenLabs 400: max_character_limit_exceeded",
+        # 410 gone (deprecated voice).
+        "ElevenLabs 410: voice has been deprecated",
+        # Non-JSON body falls through ``_elevenlabs_error_message`` as
+        # ``"ElevenLabs HTTP <status>: <snippet>"``. Predicate must still
+        # catch the status code.
+        "ElevenLabs HTTP 401: <html>access denied</html>",
+        "ElevenLabs HTTP 403: cloudflare blocked",
     ],
 )
 def test_is_elevenlabs_fatal_error_detects_known_fatal_messages(msg: str) -> None:
@@ -517,7 +531,13 @@ def test_is_elevenlabs_fatal_error_detects_known_fatal_messages(msg: str) -> Non
         # Mentions ElevenLabs but is a transient network blip — keep
         # retrying the same provider, don't burn the fallback.
         "ElevenLabs 500: temporary server error",
+        "ElevenLabs 502: bad gateway",
         "ElevenLabs 503: service unavailable",
+        "ElevenLabs 504: gateway timeout",
+        # 429 = rate limit. Retrying after backoff resolves it; do NOT
+        # poach edge-tts permanently for this batch.
+        "ElevenLabs 429: too_many_concurrent_requests",
+        "ElevenLabs 429: rate limit exceeded — retry after 30s",
     ],
 )
 def test_is_elevenlabs_fatal_error_passes_through_recoverable_errors(msg: str) -> None:
@@ -525,6 +545,24 @@ def test_is_elevenlabs_fatal_error_passes_through_recoverable_errors(msg: str) -
     sticky fallback is meant to break the *fatal* loop, not poach
     edge-tts on a 500."""
     assert is_elevenlabs_fatal_error(msg) is False
+
+
+def test_is_elevenlabs_fatal_error_production_404_regression() -> None:
+    """HF-13a regression: the EXACT error string surfaced in the production
+    bug report (PR #91 follow-up screenshot) must trip the swap to edge-tts.
+
+    Before HF-13a the predicate was text-fragment driven and the literal
+    substring ``voice_not_found`` never appears in the upstream message,
+    so the swap silently no-op'd and the user got six "Scene N TTS failed"
+    warnings + a "Per-scene narration: every slot was skipped" final fallback
+    that ALSO failed on the same 404. Status-code matching catches it on
+    the first scene."""
+    real_world_error = (
+        "RuntimeError: ElevenLabs 404: A voice with voice_id "
+        "'pNInz6obpgDQGBFOQs8c' was not found."
+    )
+    assert is_elevenlabs_fatal_error(real_world_error) is True
+    assert is_elevenlabs_fatal_error(RuntimeError(real_world_error)) is True
 
 
 def test_is_elevenlabs_fatal_error_handles_none() -> None:
@@ -557,3 +595,35 @@ def test_elevenlabs_voice_map_values_look_like_edge_tts_short_names() -> None:
         assert elevenlabs_id, "blank ElevenLabs voice id in map"
         assert edge_voice.endswith("Neural"), f"{edge_voice!r} not a Neural voice"
         assert "-" in edge_voice, f"{edge_voice!r} missing locale prefix"
+
+
+# HF-13a — voices that the bing speech-platform endpoint stopped serving
+# audio for as of late 2025; they raise ``edge_tts.NoAudioReceived`` even
+# though they're listed in the catalog. Keep this list in sync with the
+# block comment on ``ELEVENLABS_TO_EDGE_VOICE_MAP`` so a refactor that
+# silently re-introduces one of these gets caught here.
+_EDGE_TTS_KNOWN_BROKEN_VOICES: frozenset[str] = frozenset({
+    "en-US-DavisNeural",
+    "en-US-SaraNeural",
+    "en-US-AmberNeural",
+})
+
+
+def test_elevenlabs_voice_map_does_not_use_broken_edge_voices() -> None:
+    """Regression: every value in the fallback map must be a voice that
+    edge-tts actually serves audio for. The original HF-13 map mapped
+    ElevenLabs Adam → en-US-DavisNeural, which turned the swap into a
+    silent no-op (``NoAudioReceived``) on the very first scene."""
+    broken = {
+        elevenlabs_id: edge_voice
+        for elevenlabs_id, edge_voice in ELEVENLABS_TO_EDGE_VOICE_MAP.items()
+        if edge_voice in _EDGE_TTS_KNOWN_BROKEN_VOICES
+    }
+    assert not broken, (
+        f"ELEVENLABS_TO_EDGE_VOICE_MAP contains broken edge-tts voices: {broken}. "
+        f"See block comment on the map for verified-working alternatives."
+    )
+    assert DEFAULT_EDGE_FALLBACK_VOICE not in _EDGE_TTS_KNOWN_BROKEN_VOICES, (
+        "DEFAULT_EDGE_FALLBACK_VOICE points at a known-broken voice — "
+        "the unknown-id branch would silently skip the fallback."
+    )

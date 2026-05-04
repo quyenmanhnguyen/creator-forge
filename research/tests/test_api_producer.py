@@ -3629,6 +3629,80 @@ def test_audio_per_scene_falls_back_once_then_uses_edge_for_remaining_scenes(
         if "ElevenLabs" in w and "edge-tts" in w
     ]
     assert len(swap_warnings) == 1, body["warnings"]
+    # HF-13a — response engine reflects the post-swap state. Pre-fix
+    # this was incorrectly reporting "elevenlabs" because engine_name
+    # in the route was set once at init and never updated when the
+    # per-scene path swapped adapters internally.
+    assert body["engine"] == "edge-tts", body
+
+
+def test_ffmpeg_concat_audio_segments_no_silence_pads_does_not_emit_dot_entries(
+    tmp_path,
+):
+    """HF-13a regression: ``_ffmpeg_concat_audio_segments`` must NOT
+    write ``file '.'`` lines into the concat list when a scene's
+    silence pad is zero. The pre-fix code appended ``Path("")`` which
+    silently became ``Path(".")`` (truthy) and slipped through the
+    ``if sil and str(sil)`` filter. ffmpeg then bailed on the directory
+    entry and only the first scene's audio survived in the final mp3 —
+    the bug that made every per-scene call lose scenes 2..N."""
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        # Capture the concat list contents on the second invocation
+        # (the first generates silence pads; we have none here).
+        if "-f" in cmd and "concat" in cmd:
+            list_idx = cmd.index("-i") + 1
+            list_path = Path(cmd[list_idx])
+            captured["list_contents"] = list_path.read_text(encoding="utf-8")
+            # Pretend ffmpeg succeeded so we can inspect the list.
+            output_path = Path(cmd[-1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00" * 64)
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    import subprocess as _sp
+    import research.api.routes.producer as _pr
+
+    real_run = _sp.run
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        # Only intercept ffmpeg calls; let real subprocess.run handle
+        # anything else (none expected in this test path).
+        if cmd and isinstance(cmd, list) and cmd[0].endswith("ffmpeg"):
+            return fake_run(cmd, *args, **kwargs)
+        return real_run(cmd, *args, **kwargs)
+
+    import unittest.mock
+
+    seg_a = tmp_path / "voice_scene_01.mp3"
+    seg_b = tmp_path / "voice_scene_02.mp3"
+    seg_c = tmp_path / "voice_scene_03.mp3"
+    for s in (seg_a, seg_b, seg_c):
+        s.write_bytes(b"\x00" * 32)
+
+    out = tmp_path / "concat-out.mp3"
+
+    with unittest.mock.patch.object(
+        _pr.subprocess, "run", side_effect=fake_subprocess_run
+    ):
+        ok, err = _pr._ffmpeg_concat_audio_segments(
+            [seg_a, seg_b, seg_c],
+            silence_pads_s=[0.0, 0.0, 0.0],
+            output_path=out,
+            audio_format="mp3",
+            timeout_s=10.0,
+        )
+    assert ok, err
+    contents = captured.get("list_contents", "")
+    assert contents, "concat list was never captured"
+    # Critical assertion: the list must contain only the three real
+    # segment files, nothing referencing the current directory.
+    assert "file '.'\n" not in contents, contents
+    assert "file '.'" not in contents, contents
+    # And every real segment is listed exactly once.
+    for seg in (seg_a, seg_b, seg_c):
+        assert str(seg) in contents, contents
 
 
 # ---------------------------------------------------------------------------

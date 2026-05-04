@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -174,11 +175,47 @@ def _probe_mp3_duration(path: Path) -> float:
 
     Returns 0.0 if no probe library is available (callers should treat 0.0
     as "unknown"). Avoids hard dependency on ffmpeg / mutagen for tests.
+
+    HF-13a — try mutagen first (cheapest, header-only) then fall back to
+    ``ffprobe``. The mutagen-only path silently returned 0.0 in fresh
+    environments where mutagen wasn't pinned, which broke per-scene
+    caption time-shifting and made every scene's subtitles render
+    starting at 00:00:00.
     """
     try:
         from mutagen.mp3 import MP3  # type: ignore[import-untyped]
 
         return float(MP3(str(path)).info.length)
+    except Exception:
+        pass
+
+    # ffprobe fallback. ``ffprobe`` ships with ffmpeg which is already a
+    # hard dependency for the renderer, so this path is reliable in
+    # production. Tests stub ``_probe_mp3_duration`` directly so they
+    # don't trip ffprobe.
+    try:
+        import shutil
+        import subprocess
+
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return 0.0
+        proc = subprocess.run(  # noqa: S603 — controlled cmd, no shell=True.
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0.0
+        return float((proc.stdout or "0").strip() or 0)
     except Exception:
         return 0.0
 
@@ -534,29 +571,46 @@ def _elevenlabs_error_message(resp) -> str:
 # Producer route can fall back to ``edge-tts`` automatically and still emit
 # *some* audio rather than an empty response.
 
+# Regex to extract the HTTP status from ``_elevenlabs_error_message`` output.
+# Matches both ``"ElevenLabs 401: ..."`` and ``"ElevenLabs HTTP 401: ..."``.
+_ELEVENLABS_STATUS_RE = re.compile(
+    r"elevenlabs(?:\s+http)?\s+(\d{3})\s*:",
+    re.IGNORECASE,
+)
+
+
+# Recoverable HTTP status codes — retrying the same request against the
+# same key/IP can succeed (rate-limit windows reopen, transient 5xx
+# resolves). We do NOT swap to edge-tts on these so the user keeps
+# their selected paid provider.
+ELEVENLABS_RECOVERABLE_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
+# Legacy/non-HTTP fatal fragments — kept so non-HTTP exceptions (e.g. the
+# ``RuntimeError("ELEVENLABS_API_KEY not set")`` raised by the api_key
+# property *before* any HTTP call) still trip the swap. HTTP errors take
+# the status-code path above and don't depend on this list.
 ELEVENLABS_FATAL_FRAGMENTS: tuple[str, ...] = (
-    # 401 — auth / free-tier-revoked
-    "401",
-    "unauthorized",
-    "invalid_api_key",
-    "missing_api_key",
     "elevenlabs_api_key not set",
+    "missing_api_key",
+    "invalid_api_key",
+    "unauthorized",
     "free tier usage disabled",
     "unusual activity",
     "detected_unusual_activity",
-    # 403 — forbidden / region locked
-    "403",
     "forbidden",
-    # 422 / 400 — model / voice / quota errors
     "voice_not_found",
     "voice id not found",
+    "voice with voice_id",
+    "model_not_found",
+    "model with model_id",
+    "was not found",
     "quota_exceeded",
     "quota exceeded",
+    "tier_quota_exceeded",
     "max_character_limit_exceeded",
     "concurrent_requests_exceeded",
     "too_many_concurrent_requests",
-    "model_not_found",
-    "tier_quota_exceeded",
 )
 
 
@@ -565,27 +619,66 @@ def is_elevenlabs_fatal_error(exc: BaseException | str) -> bool:
 
     "Fatal" means retrying the same call against the same key/IP/voice will
     keep failing — the safe move is to swap to a different provider rather
-    than burn N retries. We pattern-match on the error message because the
-    underlying ``requests.HTTPError`` subclasses don't carry a structured
-    ElevenLabs error code; the route emits ``"ElevenLabs <status>: <message>"``
-    via :func:`_elevenlabs_error_message` so the prefix + body fragments are
-    enough to disambiguate.
+    than burn N retries.
+
+    HF-13a — the predicate is now **status-code driven** rather than
+    message-text driven. ``_elevenlabs_error_message`` always emits
+    ``"ElevenLabs <status>: <message>"`` (or ``"ElevenLabs HTTP <status>: ..."``
+    for non-JSON bodies), so we extract the numeric status and treat any
+    4xx **except 429** as fatal. This catches the production 404 voice-not-found
+    case (``"ElevenLabs 404: A voice with voice_id 'X' was not found."``) that
+    the previous text-fragment matcher missed because the literal substring
+    ``voice_not_found`` never appears in the upstream message.
+
+    For non-HTTP exceptions (e.g. ``RuntimeError("ELEVENLABS_API_KEY not set")``
+    raised before any HTTP call) we fall back to the legacy fragment list.
 
     Accepts either an exception or a raw message string so callers can
     feed a captured warning line back through the same predicate.
     """
-    msg = str(exc).lower() if exc is not None else ""
+    if exc is None:
+        return False
+    msg = str(exc)
     if not msg:
         return False
-    if "elevenlabs" not in msg and "eleven_labs" not in msg and "elevenlabs_api_key" not in msg:
+    msg_lower = msg.lower()
+    if (
+        "elevenlabs" not in msg_lower
+        and "eleven_labs" not in msg_lower
+    ):
         return False
-    return any(frag in msg for frag in ELEVENLABS_FATAL_FRAGMENTS)
+
+    # HTTP status path — the most reliable signal because the route layer
+    # always emits "ElevenLabs <status>: <message>".
+    match = _ELEVENLABS_STATUS_RE.search(msg_lower)
+    if match is not None:
+        try:
+            status = int(match.group(1))
+        except ValueError:
+            status = 0
+        if 400 <= status < 500 and status not in ELEVENLABS_RECOVERABLE_STATUSES:
+            return True
+        # 5xx, 429, anything else → recoverable, do not swap.
+        return False
+
+    # Non-HTTP path — pre-flight RuntimeError or vendor SDK errors that
+    # don't carry the "ElevenLabs <status>:" prefix.
+    return any(frag in msg_lower for frag in ELEVENLABS_FATAL_FRAGMENTS)
 
 
 # Map an ElevenLabs voice id to an edge-tts voice short name with the same
 # locale + gender so the fallback narration still sounds reasonable. Keep
 # this in sync with the curated list in :mod:`core.pixelle.voices`. Falls
 # back to ``en-US-AriaNeural`` (calm female en-US) for unknown ids.
+#
+# HF-13a — voices in this map MUST be currently serving on the public
+# edge-tts speech-platform endpoint. ``en-US-DavisNeural``,
+# ``en-US-SaraNeural`` and ``en-US-AmberNeural`` were dropped from this
+# map after the bing speech-platform stopped returning audio for them
+# (``edge_tts.exceptions.NoAudioReceived``), which silently broke the
+# fallback for ElevenLabs Adam / Josh / Domi / Charlotte. Verified
+# working voices: Aria, Guy, Jenny, Michelle, Christopher, Eric, Roger,
+# Steffan, Ana, GB-Ryan, GB-Libby.
 ELEVENLABS_TO_EDGE_VOICE_MAP: dict[str, str] = {
     # Rachel · F · en-US (calm, narrator)
     "21m00Tcm4TlvDq8ikWAM": "en-US-AriaNeural",
@@ -593,20 +686,20 @@ ELEVENLABS_TO_EDGE_VOICE_MAP: dict[str, str] = {
     "ErXwobaYiN019PkySvjV": "en-US-GuyNeural",
     # Sarah · F · en-US (soft, news)
     "EXAVITQu4vr4xnSDxMaL": "en-US-JennyNeural",
-    # Domi · F · en-US (confident)
-    "AZnzlk1HvdrTNbZXh": "en-US-SaraNeural",
-    # Adam · M · en-US (deep, narrator)
-    "pNInz6obpgDQGBFOQs8c": "en-US-DavisNeural",
+    # Domi · F · en-US (confident) — was SaraNeural (dead).
+    "AZnzlk1HvdrTNbZXh": "en-US-MichelleNeural",
+    # Adam · M · en-US (deep, narrator) — was DavisNeural (dead).
+    "pNInz6obpgDQGBFOQs8c": "en-US-EricNeural",
     # Arnold · M · en-US (crisp)
     "VR6AewLTigWG4xSOukaG": "en-US-GuyNeural",
-    # Charlotte · F · en-US (seductive)
-    "XB0fDUnXU5powFXDhCwa": "en-US-AmberNeural",
+    # Charlotte · F · en-US (warm) — was AmberNeural (dead).
+    "XB0fDUnXU5powFXDhCwa": "en-US-AriaNeural",
     # Charlie · M · en-AU (casual)
     "IKne3meq5aSn9XLyUdCD": "en-GB-RyanNeural",
     # Matilda · F · en-US (warm)
     "XrExE9yKIg1WjnnlVkGX": "en-US-AriaNeural",
-    # Josh · M · en-US (deep)
-    "TxGEqnHWrfWFTfGW9XjX": "en-US-DavisNeural",
+    # Josh · M · en-US (deep) — was DavisNeural (dead).
+    "TxGEqnHWrfWFTfGW9XjX": "en-US-ChristopherNeural",
     # Dorothy · F · en-GB (pleasant)
     "ThT5KcBeYPX3keUQqHPh": "en-GB-LibbyNeural",
     # Grace · F · en-US (gentle)

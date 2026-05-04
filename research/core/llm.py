@@ -33,8 +33,20 @@ def chat(prompt: str, system: str | None = None, temperature: float = 0.7, model
     return resp.choices[0].message.content or ""
 
 
-def chat_json(prompt: str, system: str | None = None, model: str | None = None) -> str:
-    """Yêu cầu DeepSeek trả JSON (response_format)."""
+def chat_json(
+    prompt: str,
+    system: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.4,
+) -> str:
+    """Yêu cầu DeepSeek trả JSON (response_format).
+
+    Default ``temperature=0.4`` keeps the JSON shape predictable for
+    structured-extraction calls (titles, outlines, scene breakdowns).
+    Callers that need creative output (e.g. narration rewrites where a
+    low temp causes the model to echo the input) should bump it
+    explicitly — see ``refine_script_for_narration``.
+    """
     model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     msgs = []
     if system:
@@ -43,7 +55,7 @@ def chat_json(prompt: str, system: str | None = None, model: str | None = None) 
     resp = client().chat.completions.create(
         model=model,
         messages=msgs,
-        temperature=0.4,
+        temperature=temperature,
         response_format={"type": "json_object"},
     )
     return resp.choices[0].message.content or "{}"
@@ -173,6 +185,30 @@ _NATURAL_SPEECH_STYLE_BLOCK = (
     "- Don't announce the emotion — let the moment carry it. Bad:"
     " \"this was heartbreaking\". Good: show what made it"
     " heartbreaking and let the listener feel it.\n"
+    "- No mid-sentence em-dashes for dramatic effect (\"X — and that's\""
+    " is an LLM tic). Use a period or comma. Real people don't speak\n"
+    " in em-dashes.\n"
+    "- Avoid the \"It's not just X — it's Y\" / \"Không chỉ X — mà còn Y\""
+    " template entirely. It's the single biggest AI tell in long-form\n"
+    " spoken content.\n"
+    "- Don't open consecutive sentences with the same word (\"She...\""
+    " three times in a row). Mix subjects, drop the subject sometimes,\n"
+    " let a fragment land alone.\n"
+    "CONCRETE BAD → GOOD REWRITES (study these, then apply the pattern):\n"
+    "  BAD:  \"In this captivating journey, we delve into the timeless"
+    " tapestry of morning light, exploring how it meticulously sculpts"
+    " the human form.\"\n"
+    "  GOOD: \"Morning light. It catches her shoulders, the curve of"
+    " her hip, the small things first. You see her before she sees"
+    " you.\"\n"
+    "  BAD:  \"It's important to note that her gaze plays a pivotal"
+    " role in establishing the intimate atmosphere of the scene.\"\n"
+    "  GOOD: \"She looks straight at you. No flinch, no fix. Just"
+    " there.\"\n"
+    "  BAD:  \"Có thể nói rằng ánh sáng buổi sáng đóng vai trò quan"
+    " trọng trong việc khắc hoạ vẻ đẹp của nhân vật.\"\n"
+    "  GOOD: \"Nắng sớm rọi vào. Vai cô ấy. Hông. Lọn tóc rối. Cô"
+    " nhìn bạn — không né, không sửa.\"\n"
 )
 
 
@@ -546,7 +582,14 @@ def refine_script_for_narration(
         "TARGET_DURATION_S": round(dur_f, 2) if dur_f > 0 else None,
         "TARGET_WORDS": target_words or None,
     }
-    raw = chat_json(json.dumps(user_payload, ensure_ascii=False), system=sys)
+    # HF-13a — bump temperature so the rewrite actually rephrases instead
+    # of echoing the input verbatim. Low temperature on this prompt was
+    # the root cause of "refine output sounds like the input" reports.
+    raw = chat_json(
+        json.dumps(user_payload, ensure_ascii=False),
+        system=sys,
+        temperature=0.85,
+    )
     parsed = parse_llm_json(raw)
     out = parsed.get("narration")
     if isinstance(out, str):
