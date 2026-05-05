@@ -4,6 +4,11 @@ This skill documents the testing recipes for the creator-forge
 pipeline (Research → Studio → Storyboard → AutoGrok → Compose →
 Video Assembly). It covers what we've actually done and what works.
 
+---
+name: testing-app
+description: End-to-end testing recipes for creator-forge — Electron + Python sidecar + ffmpeg pipeline. Use when verifying Storyboard, Compose, or Assembly changes through the desktop UI or curl-able sidecar endpoints.
+---
+
 ## Architecture cheat-sheet
 
 - **Sidecar**: Python FastAPI on `127.0.0.1:5050`. Source under
@@ -43,7 +48,10 @@ least one of these. If the user wants to skip auth setup, prefer
 testing Compose Audio (`/producer/audio` uses edge-tts which is
 free) and `/producer/assemble` (which only needs ffmpeg) — those
 two cover the most recently merged load-bearing changes (PR-30,
-PR-31, PR-32).
+PR-31, PR-32). For **Storyboard renderer-only changes** (e.g. new
+column, new badge, pairing display), see the `Storyboard
+render-only testing (no Grok creds)` recipe below — that path
+needs **zero** secrets.
 
 ## Setting up a temporary accounts.json for Grok testing
 
@@ -100,6 +108,145 @@ curl -s -X POST http://127.0.0.1:5050/producer/audio \
 
 Returns `audio_path` (mp3) + `srt_path` (3 caption blocks for a
 3-sentence script) + `output_dir` (`~/.creator-forge/output/audio-<ts>/`).
+
+## Storyboard render-only testing (no Grok creds)
+
+When the change is **purely renderer** — a new column, badge,
+button state, thumbnail layout, sort order, etc. — you do NOT need
+Grok auth. The image/video pairing helpers (`pairImagePathsForI2V`,
+`sbbResolveUrls`, `sbbRenderTable`) all run client-side, so a
+DevTools harness with synthesized PNGs covers the full render path.
+
+### Step 1 — synthesize visually-distinct PNGs (one per variant)
+
+Use 4+ saturated colors so variant-aware pairing bugs are obvious
+at a glance — if `pairImagePathsForI2V` regresses to scene-only,
+you'll see two reds in one column instead of red+green.
+
+```bash
+mkdir -p /tmp/cf-test-images && cd /tmp/cf-test-images
+for c in red:s1v0 green:s1v1 blue:s2v0 yellow:s2v1; do
+  color="${c%:*}"; name="${c#*:}"
+  ffmpeg -y -hide_banner -loglevel error \
+    -f lavfi -i "color=c=${color}:s=512x512:d=0.04:r=1" \
+    -frames:v 1 "/tmp/cf-test-images/${name}.png"
+done
+```
+
+### Step 2 — temporarily expose sbbState + auto-open DevTools
+
+`F12` / `Ctrl+Shift+I` keystrokes do **not** reliably reach the
+Electron window through `xdotool` or the GUI input layer (observed
+on Devin VMs even with `devTools: isDev` enabled). The reliable
+workaround is two test-only patches that you revert before the
+final `git diff`:
+
+1. **`desktop/dist/creator-forge.js`** — right after the `sbbState`
+   declaration block ends (search for `proMode: false,\n    };`):
+
+   ```js
+   if (typeof window !== 'undefined') {
+       window.__sbbStateForTesting = sbbState;
+       window.__sbbRepaintAll = () => sbbRepaintAll();
+       window.__sbbResolveUrls = (rows, kind) => sbbResolveUrls(rows, kind);
+   }
+   ```
+
+2. **`desktop/electron/main.js`** — right after the
+   `mainWindow.loadFile(htmlPath).catch(...)` block:
+
+   ```js
+   mainWindow.webContents.once('did-finish-load', () => {
+       try { mainWindow.webContents.openDevTools({ mode: 'right' }); } catch (e) {}
+   });
+   ```
+
+Both are gated by user intent (the `__` prefix + a comment
+labelling them TEST-ONLY) and add zero behaviour to the production
+path. **Always `git diff HEAD` before posting test results to
+confirm both reverted.**
+
+### Step 3 — drive the harness from DevTools console
+
+Launch sidecar + Electron, switch to Storyboard tab, then paste a
+single-line IIFE in the DevTools console (newlines in `type`
+actions execute the line prematurely; semicolons keep it one
+statement):
+
+```js
+(async()=>{const S=window.__sbbStateForTesting,H=window.StoryboardBatchHelpers;
+ const scenes=[{scene_id:1,title:'Scene 1',duration_s:4,image_prompts:['p1a','p1b'],flow_video_prompts:['v1a','v1b']},
+               {scene_id:2,title:'Scene 2',duration_s:4,image_prompts:['p2a','p2b'],flow_video_prompts:['v2a','v2b']}];
+ S.imageRows=H.initImageRowsFromScenes(scenes,{imagesPerScene:2});
+ const paths=['/tmp/cf-test-images/s1v0.png','/tmp/cf-test-images/s1v1.png',
+              '/tmp/cf-test-images/s2v0.png','/tmp/cf-test-images/s2v1.png'];
+ S.imageRows=H.applyBatchResult(S.imageRows,'1#0',{status:'generated',image_path:paths[0]});
+ S.imageRows=H.applyBatchResult(S.imageRows,'1#1',{status:'generated',image_path:paths[1]});
+ S.imageRows=H.applyBatchResult(S.imageRows,'2#0',{status:'generated',image_path:paths[2]});
+ S.imageRows=H.applyBatchResult(S.imageRows,'2#1',{status:'generated',image_path:paths[3]});
+ S.videoRows=H.initVideoRowsFromScenes(scenes,{videosPerScene:2});
+ S.videoRows=H.pairImagePathsForI2V(S.videoRows,S.imageRows);
+ window.__sbbRepaintAll();
+ await window.__sbbResolveUrls(S.imageRows,'image');
+ await window.__sbbResolveUrls(S.videoRows,'video');
+ window.__sbbRepaintAll();})();
+```
+
+Then scroll the Storyboard panel — both Image batch and Video
+batch tables render against synthesized data. Variant 0 of scene
+N should match Variant 0 of scene N's image (red↔red, green↔green,
+blue↔blue, yellow↔yellow). Any mismatch is a pairing bug.
+
+### Step 4 — assert table structure from DevTools
+
+```js
+[...document.querySelectorAll('#sbb-video-result table thead th')].map(t=>t.innerText.trim())
+// Expect: ['', '#', 'SCENE', 'SOURCE', 'PROMPT', 'STATUS', 'OUTPUT', 'ACTIONS']
+//                            ^ post-PR-54 — Source column at position 4
+
+[...document.querySelectorAll('#sbb-image-result table thead th')].map(t=>t.innerText.trim())
+// Expect: ['', '#', 'SCENE', 'PROMPT', 'STATUS', 'OUTPUT', 'ACTIONS']
+//                            ^ no Source col on image table
+
+[...document.querySelectorAll('#sbb-video-result table tbody tr td:nth-child(4) img')]
+  .map(i=>i.getAttribute('src'))
+// Expect: 4× 'file:///tmp/cf-test-images/s*.png' URLs
+```
+
+### Step 5 — exercise stale-clear + fallback paths
+
+With the harness state still loaded:
+
+```js
+// Stale clear: delete ALL images of one scene
+(()=>{const S=window.__sbbStateForTesting,H=window.StoryboardBatchHelpers;
+  S.imageRows=S.imageRows.filter(r=>r.scene_id!==1);
+  S.videoRows=H.pairImagePathsForI2V(S.videoRows,S.imageRows);
+  window.__sbbRepaintAll();
+  return S.videoRows[0].source_image_url; })()
+// Expect null + cell text 'no image yet'
+
+// Fallback: delete only variant 0 of one scene
+(()=>{const S=window.__sbbStateForTesting,H=window.StoryboardBatchHelpers;
+  S.imageRows=S.imageRows.filter(r=>!(r.scene_id===1&&r.variant_idx===0));
+  S.videoRows=H.pairImagePathsForI2V(S.videoRows,S.imageRows);
+  window.__sbbRepaintAll();
+  return S.videoRows[0].source_image_url; })()
+// Expect 'file:///.../s1v1.png' — variant N missing → fall back to lowest available
+// variant of same scene (PR-23 hero behaviour preserved on top of variant pairing)
+```
+
+### Step 6 — revert + verify diff is empty
+
+```bash
+cd /home/ubuntu/repos/creator-forge && git diff HEAD
+# Empty output before posting test results.
+```
+
+This recipe was developed during PR-54 (Source column for video
+table). Reuse it for any future renderer-only Storyboard change —
+selection-state badges, per-row chips, prompt clamp behaviour,
+etc. — without burning Grok quota.
 
 ## Testing /producer/assemble — the three caption modes
 
@@ -263,6 +410,17 @@ think burn is broken.
 Maximize the Electron window before recording any screen test.
 `xdotool search --name 'Creator Forge' windowsize 1600 1140` works
 on the standard VM. The default 800x600 hides several panels.
+
+### DevTools won't open via F12 / Ctrl+Shift+I in the Devin desktop
+
+Observed on Devin VMs: `key: F12` and `key: ctrl+shift+i` actions
+do not open Electron's DevTools, even though `devTools: isDev` is
+true and `npm start` sets `app.isPackaged === false`. The
+workaround is to patch `desktop/electron/main.js` with a one-shot
+`mainWindow.webContents.openDevTools({ mode: 'right' })` after
+`did-finish-load` — see the `Storyboard render-only testing` recipe
+above for the exact snippet. **Always revert this patch before
+posting test results.**
 
 ### IPC client timeout on long LLM calls (and the 300s claim)
 
