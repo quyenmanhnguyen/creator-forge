@@ -61,6 +61,17 @@ export CREATOR_FORGE_ACCOUNTS_FILE=/tmp/cf-test/accounts.json
 cd desktop && npm start  # picks up env
 ```
 
+For multi-account fan-out testing (PR-47 image / PR-61 video / i2v
+/ refimg), pass an array with ≥2 entries. The IPC handlers
+(`image:generate`, `video:generate`, `i2v:generate`,
+`refimg:generate`) all share the work-stealing scheduler in
+`desktop/src/orchestration/multi_account_fan_out.js` — the
+distinguishing log lines are `work-stealing queue, up to
+<C>/account = up to <M*C> parallel` (start) and
+`AccN=<ok>/<taken>` per session (end). If you see
+`(K per acc)` instead, you're on `origin/main`'s static-slice
+code, not PR-47/PR-61.
+
 After `Auto-login (programmatic)` in the Grok accounts panel, the
 session persists in `<repo>/desktop/sessions/<email_safe>/`
 (or under `GROK_PROFILE_DIR` if set). If a launch fails midway and
@@ -278,6 +289,62 @@ in 30–60s. If you actually want to verify the long-running path
 more than 2 minutes deep, you'll need to bump that timeout in code
 for the test.
 
+### Cloudflare turnstile blocks Puppeteer Auto-login
+
+`accounts.x.ai/sign-in` (the Grok login flow Puppeteer drives)
+often surfaces a Cloudflare turnstile (`Verify you are human`
+checkbox) that headful Puppeteer cannot pass through on its own.
+Observed on Devin VMs with the puppeteer-managed Chrome 147. The
+log-feed signal is
+`Failed to setup account <email> — no headers captured` after the
+login times out, even though the email + password fields were
+filled correctly and the Login button was visible.
+
+**Workaround:** the headful Puppeteer browser is visible on the
+desktop, so click the turnstile checkbox manually as soon as it
+appears, then let Puppeteer's existing wait-for-redirect handler
+take over from there. It will catch the new cookies on success.
+For a 2-account batch, you'll need to do this twice (sequentially)
+— Auto-login processes accounts one at a time. If the first
+account times out before you get to it, click `Auto-login
+(programmatic)` again to reprocess that row; in-memory sessions
+for already-ready rows are preserved by `AuthService`.
+
+If even one of the sessions captured this way actually works at
+request time (proven by `[AccN]` lines appearing in the
+`video:generate` / `image:generate` log feed), you have valid
+in-memory state regardless of the `Auto-login OK — N/M session
+captured` banner number — that banner only counts the latest
+caller's success path, not the cumulative live-session count.
+
+### DevTools may not open via F12 / Ctrl+Shift+I
+
+In some packaged-mode Electron builds, neither `F12` nor
+`Ctrl+Shift+I` open DevTools, leaving you with no obvious way to
+run `await window.electronAPI.x.y(...)` from the renderer console
+to inspect IPC return shapes. Two fallbacks that don't require
+DevTools:
+
+1. **Read the handler.** IPC return objects in
+   `desktop/electron/main.js` are constructed inline immediately
+   before `return { ... }`. If a log line emitted right before
+   the return is mechanically derived from a field on the
+   returned object (e.g. PR-61's
+   `Acc1=<ok>/<taken>` is built from
+   `fanOut.stats.perSession.map(...)` then `stats: fanOut.stats`
+   is returned on the next line), the log line is direct
+   empirical proof that the field is populated.
+2. **Add a temporary `console.log(JSON.stringify(...))` at the
+   handler tail** — runs in the main process, output goes to the
+   `cd desktop && npm start` stdout (your `/tmp/electron.log` if
+   you redirected). Revert before committing.
+
+If you actually need DevTools open to drive the test, restart
+Electron with `--remote-debugging-port=9222` so you can attach
+from Chrome at `chrome://inspect`. This requires editing
+`desktop/package.json`'s `start` script or invoking `electron .`
+directly.
+
 ### Puppeteer-from-Electron silent launch failure on sandboxed VMs
 
 On some sandboxed VMs (observed on a Devin runner), Puppeteer's
@@ -300,6 +367,13 @@ Mitigations to try, in order:
 3. As a last resort, run the full Electron app on a workstation
    where Puppeteer can launch system Chrome successfully — the
    silent-failure mode hasn't reproduced outside this sandbox.
+4. If the failure log says
+   `Opening in existing browser session` (rather than
+   `Code: 0`), an earlier Auto-login left a Chrome process
+   holding the userDataDir; the Electron banner will still show
+   the previously-captured sessions as ready, so you can usually
+   proceed with the test using the in-memory state. Otherwise
+   `pkill -f puppeteer/chrome` and retry.
 
 The pure helper `countSettledImageRows` is unit-tested
 (`desktop/tests/test_storyboard_batch_helpers.js`), so you can
